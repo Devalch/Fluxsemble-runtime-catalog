@@ -1,11 +1,15 @@
 use std::{error::Error, fmt, path::Path};
 
+mod isolation;
 mod key;
 mod signing;
 
 #[cfg(feature = "fixture-tools")]
 pub use signing::generate_fixture_envelope;
 
+pub use isolation::{
+    IsolationAttestationV1, IsolationMode, emit_reverse_transfer_manifest, enter_signer_isolation,
+};
 pub use signing::{
     SignReleaseRequest, SignedReleaseBundleV1, UnsignedBundleEntryV1, UnsignedReleaseCandidateV1,
     VerifiedTransferredBundle, assemble_release_intent, assemble_release_intent_from_path,
@@ -16,6 +20,7 @@ pub use signing::{
 /// Closed, non-echoing failures from the offline signer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignError {
+    IsolationRejected,
     ArgumentRejected,
     TransferredBundleRejected,
     CandidateRejected,
@@ -40,6 +45,47 @@ pub fn summary() -> String {
 
 pub fn run_cli(args: &[String]) -> Result<String, SignError> {
     signing::run_cli(args)
+}
+
+pub fn run_isolated_cli(
+    isolation: &IsolationAttestationV1,
+    args: &[String],
+) -> Result<String, SignError> {
+    let expected = match isolation.mode() {
+        IsolationMode::AssembleIntent => &[
+            "assemble-intent",
+            "--input",
+            "/input",
+            "--output",
+            "/output/candidate.json",
+        ][..],
+        IsolationMode::Finalize => &[
+            "finalize",
+            "--input",
+            "/input",
+            "--output",
+            "/output/candidate.json",
+        ][..],
+        IsolationMode::Sign => &[
+            "sign",
+            "--input",
+            "/input",
+            "--key",
+            "/key/runtime-catalog-private.pem",
+            "--output",
+            "/output/signed-release-bundle",
+        ][..],
+        IsolationMode::IsolationProbe => &["__isolation-probe"][..],
+    };
+    if args.iter().map(String::as_str).ne(expected.iter().copied()) {
+        return Err(SignError::ArgumentRejected);
+    }
+    if isolation.mode() == IsolationMode::IsolationProbe {
+        isolation::run_isolation_probe(isolation)?;
+        Ok("isolation probe complete".to_owned())
+    } else {
+        signing::run_cli(args)
+    }
 }
 
 #[must_use]

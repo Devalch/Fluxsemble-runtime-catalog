@@ -670,3 +670,171 @@ for label, snippet, _expected_count in key_instrumentation_policies:
         print(f"evidence scanner accepted removed key policy: {label}", file=sys.stderr)
         sys.exit(1)
 PY
+
+python3 - <<'PY'
+from pathlib import Path
+import re
+import sys
+
+main = Path("crates/catalog-sign/src/main.rs").read_text(encoding="utf-8")
+inner = Path("crates/catalog-sign/src/isolation.rs").read_text(encoding="utf-8")
+signing = Path("crates/catalog-sign/src/signing.rs").read_text(encoding="utf-8")
+launcher = Path("crates/catalog-sign/src/bin/catalog-sign-launcher.rs").read_text(encoding="utf-8")
+lib = Path("crates/catalog-sign/src/lib.rs").read_text(encoding="utf-8")
+
+
+def isolation_boundary_errors(sources):
+    main, inner, signing, launcher, lib = sources
+    errors = []
+    main_body = main.split("fn main() {", 1)[-1]
+    first = next((line.strip() for line in main_body.splitlines() if line.strip()), "")
+    if first != "let isolation = match catalog_sign::enter_signer_isolation() {":
+        errors.append("inner isolation is not the first operation in main")
+    isolation_call = main.find("catalog_sign::enter_signer_isolation()")
+    for later in ["production_key_identity()", "std::env::args()"]:
+        if isolation_call < 0 or main.find(later, isolation_call) < isolation_call:
+            errors.append(f"inner isolation does not precede {later}")
+    if main.count("catalog_sign::enter_signer_isolation()") != 1:
+        errors.append("inner main isolation entry count changed")
+    if "catalog_sign::emit_reverse_transfer_manifest(&isolation)?;" not in main:
+        errors.append("reverse transfer manifest is not mandatory after inner success")
+
+    inner_sources = main + inner + signing + lib
+    for forbidden in ["std::process::Command", "Command::new(", "std::net::", "TcpStream", "UdpSocket"]:
+        if forbidden in inner_sources:
+            errors.append(f"inner signer gained network/process capability: {forbidden}")
+    if launcher.count("std::process::Command::new(&bwrap_exec)") != 1:
+        errors.append("launcher is not the sole exact process launch capability")
+    for forbidden in ["/bin/sh", "sh -c", "Command::new(&request", "command.args(&request"]:
+        if forbidden in launcher:
+            errors.append(f"launcher gained shell/arbitrary argv capability: {forbidden}")
+
+    inner_required = [
+        "libc::PR_SET_NO_NEW_PRIVS",
+        "libc::PR_GET_NO_NEW_PRIVS",
+        "libc::PR_GET_SECCOMP",
+        "libc::SYS_socket",
+        "libc::SYS_connect",
+        "libc::SYS_fork",
+        "libc::SYS_vfork",
+        "libc::SYS_clone",
+        "libc::SYS_clone3",
+        "libc::SYS_ptrace",
+        "libc::SYS_execve",
+        "libc::SYS_execveat",
+        "libc::SYS_unshare",
+        "libc::SYS_setns",
+        "libc::SYS_mount",
+        "libc::SYS_umount2",
+        "AUDIT_ARCH_X86_64",
+        "X32_SYSCALL_BIT",
+        "SECCOMP_RET_ERRNO | libc::EPERM as u32",
+        "verify_open_descriptors()?;",
+    ]
+    for required in inner_required:
+        if required not in inner:
+            errors.append(f"missing inner isolation/seccomp enforcement: {required}")
+    if inner.count("libc::SYS_execve,") != 2:
+        errors.append("inner exec denial and post-isolation probe are not both exact")
+    launcher_required = [
+        "fn create_launcher_seccomp()",
+        "libc::SYS_socket",
+        "libc::SYS_connect",
+        "libc::SYS_fork",
+        "libc::SYS_clone3",
+        "libc::SYS_ptrace",
+        "libc::SYS_unshare",
+        "libc::SYS_mount",
+        "0xc000_003e",
+        "0x4000_0000",
+        "0x0005_0000 | libc::EPERM as u32",
+    ]
+    for required in launcher_required:
+        if required not in launcher:
+            errors.append(f"missing launcher seccomp enforcement: {required}")
+
+    for required in [
+        '"--unshare-all"', '"--unshare-net"', '"--die-with-parent"',
+        '"--new-session"', '"--clearenv"', '"--cap-drop"', '"--seccomp"',
+        '"--ro-bind-fd"', '"--bind-fd"', '"/home/signer"', '"/input"',
+        '"/output"', '"/key/runtime-catalog-private.pem"',
+    ]:
+        if required not in launcher:
+            errors.append(f"missing fixed Bubblewrap boundary: {required}")
+    for required in [
+        '"CATALOG_SIGN_ISOLATION"', '"CATALOG_SIGN_INPUT_SHA256"',
+        '"CATALOG_SIGN_HOST_PID_NS"', '"CATALOG_SIGN_HOST_USER_NS"',
+        '"CATALOG_SIGN_HOST_MOUNT_NS"', '"CATALOG_SIGN_HOST_NETWORK_NS"',
+        '"HTTP_PROXY"', '"GITHUB_TOKEN"', '"SSH_AUTH_SOCK"',
+    ]:
+        if required not in (inner + launcher + Path("crates/catalog-sign/tests/isolation_contract.rs").read_text(encoding="utf-8")):
+            errors.append(f"missing exact environment boundary evidence: {required}")
+    if "let expected = BTreeSet::from([" not in inner or "mounts.keys()" not in inner:
+        errors.append("exact bounded mount inventory enforcement is missing")
+    if "verify_empty_directory(Path::new(\"/home/signer\"))?;" not in inner or "verify_empty_directory(Path::new(\"/tmp\"))?;" not in inner:
+        errors.append("private empty home/tmp enforcement is missing")
+
+    for required in [
+        "verify_transferred_bundle(&input_path)?",
+        "verified_input.isolated_launch_capability()?",
+        "hash_descriptor(&file, metadata.len())? != config.signer_sha256",
+        "hash_descriptor(&file, metadata.len())? != config.bwrap_sha256",
+        "matches!(kind, 2 | 3)",
+        "set_close_on_exec(descriptor, false)?",
+        'format!("/proc/self/fd/{}", bwrap.file.as_raw_fd())',
+    ]:
+        if required not in launcher:
+            errors.append(f"missing descriptor/hash/static signer boundary: {required}")
+    if launcher.count("rebind_executable(&signer, FilePolicy::Signer)?;") != 4:
+        errors.append("signer replacement checkpoints are not exact")
+    if launcher.count("rebind_executable(&bwrap, FilePolicy::Bwrap)?;") != 3:
+        errors.append("bwrap replacement checkpoints are not exact")
+    if "if (request.ceremony == Ceremony::Sign) != key.is_some()" not in launcher:
+        errors.append("key mount ceremony matrix is not enforced")
+    if 'Ceremony::AssembleIntent | Ceremony::Finalize' not in launcher:
+        errors.append("assemble/finalize no-key command matrix is missing")
+    if "let output = OutputPreflight::new(request.output)?;\n    let signing_key = read_production_signing_key(request.key_path)?;" not in signing:
+        errors.append("output preflight no-clobber ordering before key open changed")
+
+    for required in [
+        "pub fn emit_reverse_transfer_manifest(",
+        'kind: "signer_output"',
+        "input_transfer_sha256: attestation.input_transfer_sha256()",
+        "isolation_attestation: attestation",
+        'mode: "0400".to_owned()',
+        "write_fresh_public_file(Path::new(OUTPUT_MANIFEST), &bytes)?",
+    ]:
+        if required not in inner:
+            errors.append(f"missing reverse authenticated transfer boundary: {required}")
+    if "catalog-test-key-v1" in main + inner + launcher:
+        errors.append("fixture authority crossed into signer isolation/launcher")
+    return errors
+
+sources = (main, inner, signing, launcher, lib)
+errors = isolation_boundary_errors(sources)
+if errors:
+    print(errors[0], file=sys.stderr)
+    sys.exit(1)
+
+mutations = [
+    (0, "catalog_sign::enter_signer_isolation()", "catalog_sign::enter_signer_isolation_removed()", "first-operation isolation"),
+    (0, "catalog_sign::emit_reverse_transfer_manifest(&isolation)?;", "", "reverse transfer emission"),
+    (1, "libc::SYS_execve,", "", "inner exec denial"),
+    (1, 'verify_empty_directory(Path::new("/home/signer"))?;', "", "empty private home"),
+    (1, "verify_open_descriptors()?;", "", "ambient descriptor rejection"),
+    (3, "hash_descriptor(&file, metadata.len())? != config.signer_sha256", "false", "signer descriptor hash"),
+    (3, "matches!(kind, 2 | 3)", "false", "static ELF dynamic/interpreter rejection"),
+    (3, "rebind_executable(&signer, FilePolicy::Signer)?;", "", "first signer replacement checkpoint"),
+    (3, "if (request.ceremony == Ceremony::Sign) != key.is_some()", "if false", "key ceremony matrix"),
+    (3, "std::process::Command::new(&bwrap_exec)", "std::process::Command::new(\"/bin/sh\")", "retained exact bwrap execution"),
+]
+for index, old, new, label in mutations:
+    mutated = list(sources)
+    mutated[index] = mutated[index].replace(old, new, 1)
+    if mutated[index] == sources[index]:
+        print(f"isolation policy mutation could not be applied: {label}", file=sys.stderr)
+        sys.exit(1)
+    if not isolation_boundary_errors(tuple(mutated)):
+        print(f"isolation boundary scanner accepted removed enforcement: {label}", file=sys.stderr)
+        sys.exit(1)
+PY

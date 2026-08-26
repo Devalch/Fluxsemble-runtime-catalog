@@ -1,0 +1,806 @@
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    ffi::CString,
+    fs::{self, OpenOptions},
+    io::{Read, Seek, SeekFrom, Write},
+    os::{
+        fd::FromRawFd,
+        unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    },
+    path::{Path, PathBuf},
+};
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::SignError;
+
+const MARKER: &str = "launcher-v1";
+const INPUT_MANIFEST: &str = "/input/transfer-manifest-v1.json";
+const OUTPUT_MANIFEST: &str = "/output/transfer-manifest-v1.json";
+const MAX_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_OUTPUT_ENTRIES: usize = 64;
+const MAX_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum IsolationMode {
+    AssembleIntent,
+    Finalize,
+    Sign,
+    IsolationProbe,
+}
+
+impl IsolationMode {
+    fn parse(value: &str) -> Result<Self, SignError> {
+        match value {
+            "assemble-intent" => Ok(Self::AssembleIntent),
+            "finalize" => Ok(Self::Finalize),
+            "sign" => Ok(Self::Sign),
+            "isolation-probe" => Ok(Self::IsolationProbe),
+            _ => Err(rejected()),
+        }
+    }
+
+    fn requires_key(self) -> bool {
+        self == Self::Sign
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IsolationAttestationV1 {
+    schema_version: u16,
+    mode: IsolationMode,
+    input_transfer_sha256: String,
+    no_new_privileges: bool,
+    launcher_seccomp_filter: bool,
+    inner_seccomp_filter: bool,
+    pid_namespace: String,
+    user_namespace: String,
+    mount_namespace: String,
+    network_namespace: String,
+    mount_points: Vec<String>,
+    environment_names: Vec<String>,
+}
+
+impl IsolationAttestationV1 {
+    #[must_use]
+    pub const fn mode(&self) -> IsolationMode {
+        self.mode
+    }
+
+    #[must_use]
+    pub fn input_transfer_sha256(&self) -> &str {
+        &self.input_transfer_sha256
+    }
+}
+
+/// Verifies every launcher-established fact and installs the final signer seccomp policy.
+///
+/// This function is intentionally the first operation in the inner binary. It performs no
+/// argument parsing, production-identity lookup, output preflight, or signing-key access.
+pub fn enter_signer_isolation() -> Result<IsolationAttestationV1, SignError> {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return Err(rejected());
+    }
+
+    let environment = exact_environment()?;
+    let mode = IsolationMode::parse(value(&environment, "CATALOG_SIGN_MODE")?)?;
+    let expected_input_digest = value(&environment, "CATALOG_SIGN_INPUT_SHA256")?;
+    if !valid_sha256(expected_input_digest) {
+        return Err(rejected());
+    }
+
+    // SAFETY: PR_SET_NO_NEW_PRIVS has no pointer argument and is process-local.
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+        return Err(rejected());
+    }
+    // SAFETY: both prctl reads have no pointer argument.
+    let no_new_privileges = unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) } == 1;
+    // SAFETY: PR_GET_SECCOMP has no pointer argument.
+    let launcher_seccomp_filter = unsafe { libc::prctl(libc::PR_GET_SECCOMP, 0, 0, 0, 0) }
+        == libc::SECCOMP_MODE_FILTER as i32;
+    if !no_new_privileges || !launcher_seccomp_filter {
+        return Err(rejected());
+    }
+
+    let namespaces = verify_namespaces(&environment)?;
+    let mount_points = verify_mounts(mode)?;
+    verify_empty_directory(Path::new("/home/signer"))?;
+    verify_empty_directory(Path::new("/tmp"))?;
+    verify_network_namespace()?;
+    verify_capabilities_and_kernel_status()?;
+    verify_open_descriptors()?;
+    let input_transfer_sha256 = hash_isolated_input_manifest()?;
+    if input_transfer_sha256 != expected_input_digest {
+        return Err(rejected());
+    }
+
+    install_inner_seccomp_filter()?;
+    // SAFETY: PR_GET_SECCOMP has no pointer argument.
+    let inner_seccomp_filter = unsafe { libc::prctl(libc::PR_GET_SECCOMP, 0, 0, 0, 0) }
+        == libc::SECCOMP_MODE_FILTER as i32;
+    if !inner_seccomp_filter {
+        return Err(rejected());
+    }
+
+    Ok(IsolationAttestationV1 {
+        schema_version: 1,
+        mode,
+        input_transfer_sha256,
+        no_new_privileges,
+        launcher_seccomp_filter,
+        inner_seccomp_filter,
+        pid_namespace: namespaces[0].clone(),
+        user_namespace: namespaces[1].clone(),
+        mount_namespace: namespaces[2].clone(),
+        network_namespace: namespaces[3].clone(),
+        mount_points,
+        environment_names: environment.keys().cloned().collect(),
+    })
+}
+
+fn exact_environment() -> Result<BTreeMap<String, String>, SignError> {
+    let environment = std::env::vars().collect::<BTreeMap<_, _>>();
+    let expected = BTreeSet::from([
+        "CATALOG_SIGN_EGID",
+        "CATALOG_SIGN_EUID",
+        "CATALOG_SIGN_HOST_MOUNT_NS",
+        "CATALOG_SIGN_HOST_NETWORK_NS",
+        "CATALOG_SIGN_HOST_PID_NS",
+        "CATALOG_SIGN_HOST_USER_NS",
+        "CATALOG_SIGN_INPUT_SHA256",
+        "CATALOG_SIGN_ISOLATION",
+        "CATALOG_SIGN_MODE",
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "PATH",
+        "PWD",
+        "TZ",
+    ]);
+    if environment
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>()
+        != expected
+        || value(&environment, "CATALOG_SIGN_ISOLATION")? != MARKER
+        || value(&environment, "HOME")? != "/home/signer"
+        || value(&environment, "PATH")? != "/bin"
+        || value(&environment, "PWD")? != "/home/signer"
+        || value(&environment, "LANG")? != "C"
+        || value(&environment, "LC_ALL")? != "C"
+        || value(&environment, "TZ")? != "UTC"
+        || value(&environment, "CATALOG_SIGN_EUID")?
+            .parse::<u32>()
+            .ok()
+            != Some(current_euid())
+        || value(&environment, "CATALOG_SIGN_EGID")?
+            .parse::<u32>()
+            .ok()
+            != Some(current_egid())
+        || environment
+            .keys()
+            .any(|name| sensitive_environment_name(name))
+    {
+        return Err(rejected());
+    }
+    Ok(environment)
+}
+
+fn value<'a>(environment: &'a BTreeMap<String, String>, name: &str) -> Result<&'a str, SignError> {
+    environment
+        .get(name)
+        .map(String::as_str)
+        .ok_or_else(rejected)
+}
+
+fn sensitive_environment_name(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    [
+        "PROXY",
+        "GITHUB",
+        "GH_",
+        "TOKEN",
+        "CREDENTIAL",
+        "SSH",
+        "AGENT",
+        "REPOSITORY",
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+        "XDG_",
+    ]
+    .iter()
+    .any(|needle| upper.contains(needle))
+}
+
+fn verify_namespaces(environment: &BTreeMap<String, String>) -> Result<[String; 4], SignError> {
+    if std::process::id() != 1 {
+        return Err(rejected());
+    }
+    let names = ["pid", "user", "mnt", "net"];
+    let host_names = [
+        "CATALOG_SIGN_HOST_PID_NS",
+        "CATALOG_SIGN_HOST_USER_NS",
+        "CATALOG_SIGN_HOST_MOUNT_NS",
+        "CATALOG_SIGN_HOST_NETWORK_NS",
+    ];
+    let mut isolated = Vec::with_capacity(4);
+    for (name, host_name) in names.into_iter().zip(host_names) {
+        let namespace = fs::read_link(format!("/proc/self/ns/{name}"))
+            .map_err(|_| rejected())?
+            .to_string_lossy()
+            .into_owned();
+        if !valid_namespace_identity(&namespace)
+            || namespace == value(environment, host_name)?
+            || !valid_namespace_identity(value(environment, host_name)?)
+        {
+            return Err(rejected());
+        }
+        isolated.push(namespace);
+    }
+    isolated.try_into().map_err(|_| rejected())
+}
+
+fn valid_namespace_identity(value: &str) -> bool {
+    value
+        .split_once(":[")
+        .and_then(|(kind, inode)| inode.strip_suffix(']').map(|inode| (kind, inode)))
+        .is_some_and(|(kind, inode)| {
+            matches!(kind, "pid" | "user" | "mnt" | "net")
+                && !inode.is_empty()
+                && inode.bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
+
+fn verify_mounts(mode: IsolationMode) -> Result<Vec<String>, SignError> {
+    let bytes = fs::read_to_string("/proc/self/mountinfo").map_err(|_| rejected())?;
+    if bytes.len() > 64 * 1024 || bytes.is_empty() {
+        return Err(rejected());
+    }
+    let mut mounts = BTreeMap::new();
+    for line in bytes.lines() {
+        let (left, right) = line.split_once(" - ").ok_or_else(rejected)?;
+        let fields = left.split_ascii_whitespace().collect::<Vec<_>>();
+        let filesystem = right.split_ascii_whitespace().next().ok_or_else(rejected)?;
+        if fields.len() < 6 {
+            return Err(rejected());
+        }
+        let point = decode_mount_field(fields[4])?;
+        if mounts
+            .insert(point, (fields[5].to_owned(), filesystem.to_owned()))
+            .is_some()
+        {
+            return Err(rejected());
+        }
+    }
+    let mut expected = BTreeSet::from([
+        "/",
+        "/bin/catalog-sign",
+        "/dev",
+        "/dev/full",
+        "/dev/null",
+        "/dev/pts",
+        "/dev/random",
+        "/dev/tty",
+        "/dev/urandom",
+        "/dev/zero",
+        "/input",
+        "/output",
+        "/proc",
+        "/tmp",
+    ]);
+    if mode.requires_key() {
+        expected.insert("/key/runtime-catalog-private.pem");
+    }
+    if mounts.keys().map(String::as_str).collect::<BTreeSet<_>>() != expected {
+        return Err(rejected());
+    }
+    for path in ["/bin/catalog-sign", "/input"] {
+        if !mount_is_read_only(&mounts, path) {
+            return Err(rejected());
+        }
+    }
+    if mode.requires_key() && !mount_is_read_only(&mounts, "/key/runtime-catalog-private.pem") {
+        return Err(rejected());
+    }
+    if mount_is_read_only(&mounts, "/output")
+        || mounts.get("/proc").is_none_or(|(_, fs)| fs != "proc")
+        || mounts.get("/dev").is_none_or(|(_, fs)| fs != "tmpfs")
+        || mounts.get("/dev/pts").is_none_or(|(_, fs)| fs != "devpts")
+        || mounts.get("/tmp").is_none_or(|(_, fs)| fs != "tmpfs")
+    {
+        return Err(rejected());
+    }
+    Ok(mounts.into_keys().collect())
+}
+
+fn decode_mount_field(value: &str) -> Result<String, SignError> {
+    let mut output = Vec::with_capacity(value.len());
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            if index + 3 >= bytes.len() {
+                return Err(rejected());
+            }
+            let octal = &bytes[index + 1..index + 4];
+            if !octal.iter().all(|byte| matches!(byte, b'0'..=b'7')) {
+                return Err(rejected());
+            }
+            output.push((octal[0] - b'0') * 64 + (octal[1] - b'0') * 8 + (octal[2] - b'0'));
+            index += 4;
+        } else {
+            output.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(output).map_err(|_| rejected())
+}
+
+fn mount_is_read_only(mounts: &BTreeMap<String, (String, String)>, path: &str) -> bool {
+    mounts
+        .get(path)
+        .is_some_and(|(options, _)| options.split(',').any(|option| option == "ro"))
+}
+
+fn verify_empty_directory(path: &Path) -> Result<(), SignError> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| rejected())?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.permissions().mode() & 0o7777 != 0o700
+        || fs::read_dir(path).map_err(|_| rejected())?.next().is_some()
+    {
+        return Err(rejected());
+    }
+    Ok(())
+}
+
+fn verify_network_namespace() -> Result<(), SignError> {
+    let devices = fs::read_to_string("/proc/net/dev").map_err(|_| rejected())?;
+    let interfaces = devices
+        .lines()
+        .skip(2)
+        .map(|line| line.split_once(':').map(|(name, _)| name.trim()))
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(rejected)?;
+    let routes = fs::read_to_string("/proc/net/route").map_err(|_| rejected())?;
+    if interfaces != ["lo"] || routes.lines().skip(1).any(|line| !line.trim().is_empty()) {
+        return Err(rejected());
+    }
+    Ok(())
+}
+
+fn verify_capabilities_and_kernel_status() -> Result<(), SignError> {
+    let status = fs::read_to_string("/proc/self/status").map_err(|_| rejected())?;
+    let fields = status
+        .lines()
+        .filter_map(|line| {
+            line.split_once(':')
+                .map(|(name, value)| (name, value.trim()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    for field in ["CapInh", "CapPrm", "CapEff", "CapAmb"] {
+        if fields.get(field).copied() != Some("0000000000000000") {
+            return Err(rejected());
+        }
+    }
+    if fields.get("NoNewPrivs").copied() != Some("1") || fields.get("Seccomp").copied() != Some("2")
+    {
+        return Err(rejected());
+    }
+    Ok(())
+}
+
+fn verify_open_descriptors() -> Result<(), SignError> {
+    let directory = fs::read_dir("/proc/self/fd").map_err(|_| rejected())?;
+    let mut descriptors = BTreeSet::new();
+    for entry in directory {
+        let entry = entry.map_err(|_| rejected())?;
+        let descriptor = entry
+            .file_name()
+            .into_string()
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+            .ok_or_else(rejected)?;
+        descriptors.insert(descriptor);
+    }
+    if descriptors.len() != 4 || ![0, 1, 2].iter().all(|fd| descriptors.contains(fd)) {
+        return Err(rejected());
+    }
+    Ok(())
+}
+
+fn hash_isolated_input_manifest() -> Result<String, SignError> {
+    let path = CString::new(INPUT_MANIFEST).expect("fixed input manifest path");
+    // SAFETY: the path is fixed, NUL-terminated, and open receives no variadic mode without create.
+    let descriptor = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )
+    };
+    if descriptor < 0 {
+        return Err(rejected());
+    }
+    // SAFETY: open returned one owned descriptor.
+    let file = unsafe { fs::File::from_raw_fd(descriptor) };
+    let metadata = file.metadata().map_err(|_| rejected())?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != current_euid()
+        || metadata.nlink() != 1
+        || metadata.permissions().mode() & 0o7777 != 0o400
+        || metadata.len() == 0
+        || metadata.len() > MAX_MANIFEST_BYTES
+    {
+        return Err(rejected());
+    }
+    hash_descriptor(&file, metadata.len())
+}
+
+fn install_inner_seccomp_filter() -> Result<(), SignError> {
+    let denied = inner_denied_syscalls();
+    let mut filters = seccomp_filter(&denied);
+    let program = libc::sock_fprog {
+        len: u16::try_from(filters.len()).map_err(|_| rejected())?,
+        filter: filters.as_mut_ptr(),
+    };
+    // SAFETY: program points to initialized classic-BPF instructions for the syscall duration.
+    if unsafe {
+        libc::prctl(
+            libc::PR_SET_SECCOMP,
+            libc::SECCOMP_MODE_FILTER,
+            &raw const program,
+            0,
+            0,
+        )
+    } != 0
+    {
+        return Err(rejected());
+    }
+    Ok(())
+}
+
+fn inner_denied_syscalls() -> Vec<i64> {
+    vec![
+        libc::SYS_socket,
+        libc::SYS_socketpair,
+        libc::SYS_connect,
+        libc::SYS_bind,
+        libc::SYS_listen,
+        libc::SYS_accept,
+        libc::SYS_accept4,
+        libc::SYS_sendto,
+        libc::SYS_sendmsg,
+        libc::SYS_sendmmsg,
+        libc::SYS_recvfrom,
+        libc::SYS_recvmsg,
+        libc::SYS_recvmmsg,
+        libc::SYS_shutdown,
+        libc::SYS_getsockname,
+        libc::SYS_getpeername,
+        libc::SYS_setsockopt,
+        libc::SYS_getsockopt,
+        libc::SYS_fork,
+        libc::SYS_vfork,
+        libc::SYS_clone,
+        libc::SYS_clone3,
+        libc::SYS_ptrace,
+        libc::SYS_execve,
+        libc::SYS_execveat,
+        libc::SYS_unshare,
+        libc::SYS_setns,
+        libc::SYS_mount,
+        libc::SYS_umount2,
+        libc::SYS_pivot_root,
+        libc::SYS_move_mount,
+        libc::SYS_open_tree,
+        libc::SYS_fsopen,
+        libc::SYS_fsconfig,
+        libc::SYS_fsmount,
+        libc::SYS_mount_setattr,
+    ]
+}
+
+fn seccomp_filter(denied: &[i64]) -> Vec<libc::sock_filter> {
+    const BPF_LD_W_ABS: u16 = 0x20;
+    const BPF_JMP_JEQ_K: u16 = 0x15;
+    const BPF_JMP_JGE_K: u16 = 0x35;
+    const BPF_RET_K: u16 = 0x06;
+    const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
+    const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
+    const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+    const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
+    const X32_SYSCALL_BIT: u32 = 0x4000_0000;
+
+    let statement = |code, k| libc::sock_filter {
+        code,
+        jt: 0,
+        jf: 0,
+        k,
+    };
+    let jump = |code, k, jt, jf| libc::sock_filter { code, jt, jf, k };
+    let mut filters = vec![
+        statement(BPF_LD_W_ABS, 4),
+        jump(BPF_JMP_JEQ_K, AUDIT_ARCH_X86_64, 1, 0),
+        statement(BPF_RET_K, SECCOMP_RET_KILL_PROCESS),
+        statement(BPF_LD_W_ABS, 0),
+        jump(BPF_JMP_JGE_K, X32_SYSCALL_BIT, 0, 1),
+        statement(BPF_RET_K, SECCOMP_RET_KILL_PROCESS),
+    ];
+    for syscall in denied {
+        filters.push(jump(BPF_JMP_JEQ_K, *syscall as u32, 0, 1));
+        filters.push(statement(BPF_RET_K, SECCOMP_RET_ERRNO | libc::EPERM as u32));
+    }
+    filters.push(statement(BPF_RET_K, SECCOMP_RET_ALLOW));
+    filters
+}
+
+#[derive(Debug, Serialize)]
+struct ProbeReportV1 {
+    schema_version: u16,
+    denied_errno: BTreeMap<String, i32>,
+    environment_names: Vec<String>,
+    mount_points: Vec<String>,
+}
+
+/// Exercises denied raw syscalls only after successful isolation. The audited launcher has no
+/// probe ceremony, so this cannot authorize normal signing behavior.
+pub fn run_isolation_probe(attestation: &IsolationAttestationV1) -> Result<(), SignError> {
+    if attestation.mode != IsolationMode::IsolationProbe {
+        return Err(rejected());
+    }
+    let mut denied_errno = BTreeMap::new();
+    let probes: [(&str, i64, [usize; 3]); 13] = [
+        (
+            "socket",
+            libc::SYS_socket,
+            [libc::AF_INET as usize, libc::SOCK_STREAM as usize, 0],
+        ),
+        ("connect", libc::SYS_connect, [usize::MAX, 0, 0]),
+        ("fork", libc::SYS_fork, [0, 0, 0]),
+        ("vfork", libc::SYS_vfork, [0, 0, 0]),
+        ("clone", libc::SYS_clone, [libc::SIGCHLD as usize, 0, 0]),
+        ("clone3", libc::SYS_clone3, [0, 0, 0]),
+        ("ptrace", libc::SYS_ptrace, [0, 0, 0]),
+        ("execve", libc::SYS_execve, [0, 0, 0]),
+        ("execveat", libc::SYS_execveat, [0, 0, 0]),
+        (
+            "unshare",
+            libc::SYS_unshare,
+            [libc::CLONE_NEWNS as usize, 0, 0],
+        ),
+        (
+            "setns",
+            libc::SYS_setns,
+            [usize::MAX, libc::CLONE_NEWNS as usize, 0],
+        ),
+        ("mount", libc::SYS_mount, [0, 0, 0]),
+        ("umount2", libc::SYS_umount2, [0, 0, 0]),
+    ];
+    for (name, syscall, arguments) in probes {
+        // SAFETY: the denied filter resolves before pointer arguments are dereferenced.
+        let result = unsafe { libc::syscall(syscall, arguments[0], arguments[1], arguments[2]) };
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        if result != -1 || errno != libc::EPERM {
+            return Err(rejected());
+        }
+        denied_errno.insert(name.to_owned(), errno);
+    }
+    let report = ProbeReportV1 {
+        schema_version: 1,
+        denied_errno,
+        environment_names: attestation.environment_names.clone(),
+        mount_points: attestation.mount_points.clone(),
+    };
+    let bytes = serde_jcs::to_vec(&report).map_err(|_| rejected())?;
+    write_fresh_public_file(Path::new("/output/isolation-probe-v1.json"), &bytes)
+}
+
+#[derive(Debug, Serialize)]
+struct ReverseTransferManifestV1<'a> {
+    schema_version: u16,
+    kind: &'static str,
+    input_transfer_sha256: &'a str,
+    isolation_attestation: &'a IsolationAttestationV1,
+    entries: Vec<ReverseTransferEntryV1>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReverseTransferEntryV1 {
+    relative_path: String,
+    mode: String,
+    size: u64,
+    sha256: String,
+}
+
+pub fn emit_reverse_transfer_manifest(
+    attestation: &IsolationAttestationV1,
+) -> Result<(), SignError> {
+    let expected_top = match attestation.mode {
+        IsolationMode::AssembleIntent | IsolationMode::Finalize => "candidate.json",
+        IsolationMode::Sign => "signed-release-bundle",
+        IsolationMode::IsolationProbe => "isolation-probe-v1.json",
+    };
+    let output = Path::new("/output");
+    let names = directory_names(output)?;
+    if names != BTreeSet::from([expected_top.to_owned()]) {
+        return Err(rejected());
+    }
+    let mut paths = Vec::new();
+    collect_output_paths(output, Path::new(expected_top), &mut paths)?;
+    if paths.is_empty() || paths.len() > MAX_OUTPUT_ENTRIES {
+        return Err(rejected());
+    }
+    paths.sort();
+    let mut total = 0_u64;
+    let mut entries = Vec::with_capacity(paths.len());
+    for relative in paths {
+        let path = output.join(&relative);
+        let metadata = fs::symlink_metadata(&path).map_err(|_| rejected())?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != current_euid()
+            || metadata.nlink() != 1
+            || metadata.permissions().mode() & 0o7777 != 0o400
+            || metadata.len() == 0
+            || metadata.len() > MAX_OUTPUT_BYTES
+        {
+            return Err(rejected());
+        }
+        total = total.checked_add(metadata.len()).ok_or_else(rejected)?;
+        if total > MAX_OUTPUT_BYTES {
+            return Err(rejected());
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)
+            .map_err(|_| rejected())?;
+        entries.push(ReverseTransferEntryV1 {
+            relative_path: relative.to_string_lossy().into_owned(),
+            mode: "0400".to_owned(),
+            size: metadata.len(),
+            sha256: hash_descriptor(&file, metadata.len())?,
+        });
+    }
+    let manifest = ReverseTransferManifestV1 {
+        schema_version: 1,
+        kind: "signer_output",
+        input_transfer_sha256: attestation.input_transfer_sha256(),
+        isolation_attestation: attestation,
+        entries,
+    };
+    let bytes = serde_jcs::to_vec(&manifest).map_err(|_| rejected())?;
+    write_fresh_public_file(Path::new(OUTPUT_MANIFEST), &bytes)?;
+    fs::File::open(output)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| rejected())
+}
+
+fn collect_output_paths(
+    root: &Path,
+    relative: &Path,
+    output: &mut Vec<PathBuf>,
+) -> Result<(), SignError> {
+    let path = root.join(relative);
+    let metadata = fs::symlink_metadata(&path).map_err(|_| rejected())?;
+    if metadata.file_type().is_symlink() || metadata.uid() != current_euid() {
+        return Err(rejected());
+    }
+    if metadata.is_file() {
+        output.push(relative.to_owned());
+        return Ok(());
+    }
+    if !metadata.is_dir()
+        || metadata.permissions().mode() & 0o7777 != 0o700
+        || metadata.nlink() != 2
+    {
+        return Err(rejected());
+    }
+    for name in directory_names(&path)? {
+        collect_output_paths(root, &relative.join(name), output)?;
+    }
+    Ok(())
+}
+
+fn directory_names(path: &Path) -> Result<BTreeSet<String>, SignError> {
+    let mut names = BTreeSet::new();
+    for entry in fs::read_dir(path).map_err(|_| rejected())? {
+        let entry = entry.map_err(|_| rejected())?;
+        let name = entry.file_name().into_string().map_err(|_| rejected())?;
+        if !safe_component(&name) || !names.insert(name) {
+            return Err(rejected());
+        }
+    }
+    Ok(names)
+}
+
+fn write_fresh_public_file(path: &Path, bytes: &[u8]) -> Result<(), SignError> {
+    if bytes.is_empty() || bytes.len() as u64 > MAX_MANIFEST_BYTES {
+        return Err(rejected());
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|_| rejected())?;
+    file.write_all(bytes).map_err(|_| rejected())?;
+    file.flush().map_err(|_| rejected())?;
+    file.set_permissions(fs::Permissions::from_mode(0o400))
+        .map_err(|_| rejected())?;
+    file.sync_all().map_err(|_| rejected())?;
+    let metadata = file.metadata().map_err(|_| rejected())?;
+    if metadata.len() != bytes.len() as u64
+        || metadata.uid() != current_euid()
+        || metadata.nlink() != 1
+        || metadata.permissions().mode() & 0o7777 != 0o400
+        || hash_descriptor(&file, metadata.len())? != sha256(bytes)
+    {
+        return Err(rejected());
+    }
+    Ok(())
+}
+
+fn hash_descriptor(file: &fs::File, expected_size: u64) -> Result<String, SignError> {
+    let mut file = file.try_clone().map_err(|_| rejected())?;
+    file.seek(SeekFrom::Start(0)).map_err(|_| rejected())?;
+    let mut hasher = Sha256::new();
+    let mut total = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|_| rejected())?;
+        if read == 0 {
+            break;
+        }
+        total = total.checked_add(read as u64).ok_or_else(rejected)?;
+        if total > expected_size {
+            return Err(rejected());
+        }
+        hasher.update(&buffer[..read]);
+    }
+    if total != expected_size {
+        return Err(rejected());
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn safe_component(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 255
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && byte != b'/')
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn current_euid() -> u32 {
+    // SAFETY: geteuid has no preconditions.
+    unsafe { libc::geteuid() }
+}
+
+fn current_egid() -> u32 {
+    // SAFETY: getegid has no preconditions.
+    unsafe { libc::getegid() }
+}
+
+const fn rejected() -> SignError {
+    SignError::IsolationRejected
+}

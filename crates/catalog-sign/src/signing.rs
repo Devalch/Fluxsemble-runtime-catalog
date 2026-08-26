@@ -188,6 +188,24 @@ impl VerifiedTransferredBundle {
         self.manifest.source_tree_sha256.as_deref()
     }
 
+    /// Revalidates the retained transfer and duplicates its exact root for the audited launcher.
+    pub fn isolated_launch_capability(&self) -> Result<(fs::File, String), SignError> {
+        self.reverify_all()?;
+        // SAFETY: fcntl duplicates the retained root and keeps it close-on-exec until the launcher
+        // has completed every substitution checkpoint.
+        let descriptor = unsafe { libc::fcntl(self.root.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+        if descriptor < 0 {
+            return Err(bundle_rejected());
+        }
+        // SAFETY: F_DUPFD_CLOEXEC returned one newly owned descriptor.
+        let root = unsafe { fs::File::from_raw_fd(descriptor) };
+        let manifest = self
+            .files
+            .get(TRANSFER_MANIFEST_NAME)
+            .ok_or_else(bundle_rejected)?;
+        Ok((root, manifest.entry.sha256.clone()))
+    }
+
     fn record_bytes(&self, role: &str) -> Result<Vec<u8>, SignError> {
         let record = self
             .manifest
@@ -2191,6 +2209,20 @@ impl StagedOutput {
             return Err(output_rejected());
         }
         self.published = true;
+        self.parent.sync_all().map_err(|_| output_rejected())?;
+        // A successful isolated transfer must have no unmanifested staging namespace. The payload
+        // rename leaves this exact retained container empty, so remove only that directory name
+        // after the published payload is durable and sync the parent again.
+        if unsafe {
+            libc::unlinkat(
+                self.parent.as_raw_fd(),
+                self.container_name.as_ptr(),
+                libc::AT_REMOVEDIR,
+            )
+        } != 0
+        {
+            return Err(output_rejected());
+        }
         self.parent.sync_all().map_err(|_| output_rejected())
     }
 }
