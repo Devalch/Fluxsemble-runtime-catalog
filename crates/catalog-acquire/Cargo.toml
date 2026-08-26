@@ -8,10 +8,15 @@ rust-version.workspace = true
 [dependencies]
 base64 = "0.22"
 catalog-core = { path = "../catalog-core" }
+flate2 = "1"
 libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+serde.workspace = true
+serde_jcs.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+xz2 = "0.1"
 
 [lib]
 path = "src/lib.rs"

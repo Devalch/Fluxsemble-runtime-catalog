@@ -145,6 +145,27 @@ impl FetchRequest {
         }
     }
 
+    /// Builds the bounded public-object request used by the fixed CLI mode.
+    pub fn for_public_object(url: &str, size: u64, sha256: &str) -> Result<Self, AcquireError> {
+        if size == 0 || size > 8 * 1024 * 1024 * 1024 || !is_lower_sha256(sha256) {
+            return Err(AcquireError::InvalidPolicy);
+        }
+        let parsed = Url::parse(url).map_err(|_| AcquireError::InvalidPolicy)?;
+        validate_common_url(&parsed, TransportMode::Production, true)?;
+        if parsed.query().is_some() {
+            return Err(AcquireError::InvalidPolicy);
+        }
+        let origin = parsed.origin().ascii_serialization();
+        Ok(Self {
+            url: HttpsUrl(url.to_owned()),
+            allowed_origins: BTreeSet::from([HttpsOrigin(origin)]),
+            expected_size: Some(size),
+            maximum_size: NonZeroU64::new(size).ok_or(AcquireError::InvalidPolicy)?,
+            sha256: Sha256Hex(sha256.to_owned()),
+            sri: None,
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(
         url: &str,
@@ -207,7 +228,7 @@ impl AcquisitionCancellation {
         self.inner.cancelled.load(Ordering::Acquire)
     }
 
-    async fn cancelled(&self) {
+    pub(crate) async fn cancelled(&self) {
         loop {
             let notified = self.inner.notify.notified();
             if self.is_cancelled() {
@@ -235,6 +256,10 @@ pub enum AcquireError {
     TemporaryFile,
     CacheInvalid,
     Publication,
+    Archive,
+    Graph,
+    Bundle,
+    Input,
 }
 
 impl fmt::Display for AcquireError {
@@ -254,6 +279,10 @@ impl fmt::Display for AcquireError {
             Self::TemporaryFile => "acquisition temporary file rejected",
             Self::CacheInvalid => "acquisition cache object rejected",
             Self::Publication => "acquisition publication failed",
+            Self::Archive => "acquisition archive rejected",
+            Self::Graph => "acquisition graph rejected",
+            Self::Bundle => "acquisition bundle rejected",
+            Self::Input => "acquisition input rejected",
         })
     }
 }
