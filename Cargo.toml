@@ -15,10 +15,14 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+ed25519-dalek = { version = "2", features = ["zeroize"] }
 hex = "0.4"
+libc = "0.2"
 semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_jcs = "0.1"
 serde_json = "1"
 sha2 = "0.10"
+subtle = "2"
 url = "2"
+zeroize = "1"

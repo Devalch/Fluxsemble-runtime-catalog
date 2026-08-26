@@ -8,8 +8,13 @@ rust-version.workspace = true
 [lib]
 path = "src/lib.rs"
 
+[features]
+default = []
+fixture-tools = []
+
 [dependencies]
 chrono.workspace = true
+ed25519-dalek.workspace = true
 semver.workspace = true
 serde.workspace = true
 serde_jcs.workspace = true

@@ -5,8 +5,20 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+fixture-tools = ["catalog-core/fixture-tools"]
+
 [dependencies]
 catalog-core = { path = "../catalog-core" }
+ed25519-dalek.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_jcs.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+zeroize.workspace = true
 
 [lib]
 path = "src/lib.rs"
@@ -14,3 +26,8 @@ path = "src/lib.rs"
 [[bin]]
 name = "catalog-sign"
 path = "src/main.rs"
+
+[[example]]
+name = "sign-fixture"
+path = "examples/sign-fixture.rs"
+required-features = ["fixture-tools"]

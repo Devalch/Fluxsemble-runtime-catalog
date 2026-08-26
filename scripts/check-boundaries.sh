@@ -32,6 +32,7 @@ expected_internal_deps = {
 expected_external_deps = {
     "catalog-core": [
         ("chrono", "normal"),
+        ("ed25519-dalek", "normal"),
         ("hex", "dev"),
         ("semver", "normal"),
         ("serde", "normal"),
@@ -52,7 +53,16 @@ expected_external_deps = {
         ("tokio", "normal"),
         ("xz2", "normal"),
     ],
-    "catalog-sign": [],
+    "catalog-sign": [
+        ("ed25519-dalek", "normal"),
+        ("libc", "normal"),
+        ("serde", "normal"),
+        ("serde_jcs", "normal"),
+        ("serde_json", "normal"),
+        ("sha2", "normal"),
+        ("subtle", "normal"),
+        ("zeroize", "normal"),
+    ],
     "catalog-publish": [],
 }
 
@@ -112,5 +122,32 @@ for path in sorted(acquire_root.rglob("*")):
         sys.exit(1)
     if direct_verifier.search(source):
         print(f"catalog-acquire must use catalog-core public verification in {path}", file=sys.stderr)
+        sys.exit(1)
+PY
+
+python3 - <<'PY'
+from pathlib import Path
+import sys
+
+sign_manifest = Path("crates/catalog-sign/Cargo.toml").read_text(encoding="utf-8")
+for forbidden in ["catalog-acquire", "catalog-publish", "reqwest", "tokio"]:
+    if forbidden in sign_manifest:
+        print(f"forbidden signer dependency/capability: {forbidden}", file=sys.stderr)
+        sys.exit(1)
+
+main_source = Path("crates/catalog-sign/src/main.rs").read_text(encoding="utf-8")
+lib_source = Path("crates/catalog-sign/src/lib.rs").read_text(encoding="utf-8")
+for forbidden in ["catalog-test-key-v1", "nonproduction-ed25519-pkcs8.pem"]:
+    if forbidden in main_source or forbidden in lib_source:
+        print(f"fixture authority in production signer surface: {forbidden}", file=sys.stderr)
+        sys.exit(1)
+if "fixture-tools" in main_source:
+    print("fixture CLI feature in production signer", file=sys.stderr)
+    sys.exit(1)
+
+core_source = Path("crates/catalog-core/src/signature.rs").read_text(encoding="utf-8")
+for forbidden in ["PRIVATE KEY", "DecodePrivateKey", "from_pkcs8", "read_signing_key"]:
+    if forbidden in core_source:
+        print(f"private-key parser in catalog-core: {forbidden}", file=sys.stderr)
         sys.exit(1)
 PY
