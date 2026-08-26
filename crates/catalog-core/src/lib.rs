@@ -1,9 +1,15 @@
 use std::{error::Error, fmt};
 
+mod bundle;
 mod canonical;
+mod qualification;
+mod source;
 mod wire;
 
+pub use bundle::*;
 pub use canonical::{canonical_catalog_payload, catalog_payload_sha256};
+pub use qualification::*;
+pub use source::*;
 pub use wire::*;
 
 /// Closed, non-echoing failures from the data-only catalog core.

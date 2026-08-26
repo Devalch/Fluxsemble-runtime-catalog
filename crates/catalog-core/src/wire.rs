@@ -733,7 +733,7 @@ impl LockedPackageRecord {
 pub struct CatalogTimestamp(String);
 
 impl CatalogTimestamp {
-    fn parse(value: String) -> Result<Self, CoreError> {
+    pub(crate) fn parse(value: String) -> Result<Self, CoreError> {
         require(value.len() == CATALOG_TIMESTAMP_BYTES)?;
         let parsed = DateTime::parse_from_rfc3339(&value).map_err(|_| invalid())?;
         require(parsed.offset().local_minus_utc() == 0)?;
@@ -803,7 +803,7 @@ validated_string!(InventoryPath, |value: &str| { valid_inventory_path(value) });
 pub struct ExactVersion(String);
 
 impl ExactVersion {
-    fn parse(value: String) -> Result<Self, CoreError> {
+    pub(crate) fn parse(value: String) -> Result<Self, CoreError> {
         require(valid_exact_version(&value))?;
         Ok(Self(value))
     }
@@ -873,7 +873,7 @@ impl AllowedOrigin {
 pub struct HttpsArtifactUrl(String);
 
 impl HttpsArtifactUrl {
-    fn parse(value: String) -> Result<Self, CoreError> {
+    pub(crate) fn parse(value: String) -> Result<Self, CoreError> {
         require(value.len() <= MAX_ARTIFACT_URL_BYTES)?;
         require_url_input(&value)?;
         parse_https_url(&value)?;
@@ -922,7 +922,7 @@ pub enum CatalogTarget {
 }
 
 impl CatalogTarget {
-    fn parse(value: &str) -> Result<Self, CoreError> {
+    pub(crate) fn parse(value: &str) -> Result<Self, CoreError> {
         match value {
             "linux_x86_64" => Ok(Self::LinuxX86_64),
             _ => Err(invalid()),
@@ -1220,7 +1220,7 @@ const fn invalid() -> CoreError {
     CoreError::InvalidCatalog
 }
 
-fn reject_duplicate_json(bytes: &[u8]) -> Result<(), CoreError> {
+pub(crate) fn reject_duplicate_json(bytes: &[u8]) -> Result<(), CoreError> {
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     DuplicateChecked::deserialize(&mut deserializer).map_err(|_| invalid())?;
     deserializer.end().map_err(|_| invalid())
