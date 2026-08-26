@@ -40,7 +40,13 @@ expected_external_deps = {
         ("sha2", "normal"),
         ("url", "normal"),
     ],
-    "catalog-acquire": [],
+    "catalog-acquire": [
+        ("base64", "normal"),
+        ("libc", "normal"),
+        ("reqwest", "normal"),
+        ("sha2", "normal"),
+        ("tokio", "normal"),
+    ],
     "catalog-sign": [],
     "catalog-publish": [],
 }
@@ -65,5 +71,41 @@ for name in expected_names:
         sys.exit(1)
     if external != expected_external_deps[name]:
         print(f"unexpected external dependencies for {name}: {external}", file=sys.stderr)
+        sys.exit(1)
+PY
+
+python3 - <<'PY'
+from pathlib import Path
+import re
+import sys
+
+acquire_root = Path("crates/catalog-acquire")
+forbidden_literals = [
+    "SigningKey",
+    "DecodePrivateKey",
+    "pkcs8",
+    "private.pem",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "gh auth",
+]
+key_flag = re.compile(r"--(?:[a-z0-9]+-)*(?:private-|signing-)?key(?:[= ]|\b)", re.IGNORECASE)
+direct_verifier = re.compile(r"(?:ed25519[_-]dalek|VerifyingKey)")
+
+for path in sorted(acquire_root.rglob("*")):
+    if not path.is_file():
+        continue
+    try:
+        source = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        continue
+    if any(value in source for value in forbidden_literals):
+        print(f"forbidden signing or GitHub credential interface in {path}", file=sys.stderr)
+        sys.exit(1)
+    if key_flag.search(source):
+        print(f"forbidden key-related CLI flag in {path}", file=sys.stderr)
+        sys.exit(1)
+    if direct_verifier.search(source):
+        print(f"catalog-acquire must use catalog-core public verification in {path}", file=sys.stderr)
         sys.exit(1)
 PY

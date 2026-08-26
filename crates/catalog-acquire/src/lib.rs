@@ -1,3 +1,7 @@
+mod http;
+
+pub use http::*;
+
 pub fn summary() -> String {
     format!("bootstrap:{}", catalog_core::package_count())
 }
