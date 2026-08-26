@@ -427,6 +427,17 @@ impl PublicationControl {
         }
     }
 
+    #[cfg(test)]
+    async fn wait_until_aborted_for_test(&self) {
+        loop {
+            let notified = self.inner.notify.notified();
+            if self.inner.state.load(Ordering::Acquire) == PUBLICATION_ABORT {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     fn wait_for_authorization(&self) -> bool {
         if !self.transition(PUBLICATION_WORKING, PUBLICATION_READY) {
             return false;
@@ -984,39 +995,51 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_after_authorization_but_before_worker_claim_aborts_publication() {
-        let parent = TempDirectory::new();
-        let output = parent.path.join("discovery");
-        let operation_output = output.clone();
-        let cancellation = AcquisitionCancellation::new();
-        let operation_cancellation = cancellation.clone();
-        let (authorized_tx, authorized_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let task = tokio::spawn(async move {
-            run_publication_blocking(&operation_cancellation, move |control| {
-                write_discovery(
-                    &operation_output,
-                    &manifest(),
-                    || {
-                        let authorized = control.wait_for_authorization();
-                        if authorized {
-                            let _ = authorized_tx.send(());
-                            release_rx.recv().unwrap();
-                        }
-                        authorized
-                    },
-                    || control.claim_publication(),
-                )
-            })
+        for attempt in 0..32 {
+            let parent = TempDirectory::new();
+            let output = parent.path.join("discovery");
+            let operation_output = output.clone();
+            let cancellation = AcquisitionCancellation::new();
+            let operation_cancellation = cancellation.clone();
+            let (authorized_tx, authorized_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let task = tokio::spawn(async move {
+                run_publication_blocking(&operation_cancellation, move |control| {
+                    write_discovery(
+                        &operation_output,
+                        &manifest(),
+                        || {
+                            let authorized = control.wait_for_authorization();
+                            if authorized {
+                                let _ = authorized_tx.send(control.clone());
+                                release_rx.recv().unwrap();
+                            }
+                            authorized
+                        },
+                        || control.claim_publication(),
+                    )
+                })
+                .await
+            });
+            let control = authorized_rx.await.unwrap();
+            assert!(!output.exists(), "attempt {attempt}");
+
+            cancellation.cancel();
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                control.wait_until_aborted_for_test(),
+            )
             .await
-        });
-        authorized_rx.await.unwrap();
-        assert!(!output.exists());
+            .unwrap();
+            release_tx.send(()).unwrap();
 
-        cancellation.cancel();
-        release_tx.send(()).unwrap();
-
-        assert_eq!(task.await.unwrap(), Err(AcquireError::Cancelled));
-        assert!(!output.exists());
+            assert_eq!(
+                task.await.unwrap(),
+                Err(AcquireError::Cancelled),
+                "attempt {attempt}"
+            );
+            assert!(!output.exists(), "attempt {attempt}");
+        }
     }
 
     #[tokio::test]

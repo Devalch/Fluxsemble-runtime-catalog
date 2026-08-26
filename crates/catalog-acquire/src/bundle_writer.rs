@@ -346,13 +346,26 @@ impl OutputRoot {
             .seek(SeekFrom::Start(0))
             .map_err(|_| AcquireError::Bundle)?;
         let (mut target, identity) = self.create_file(relative)?;
-        let copied = std::io::copy(source, &mut target).map_err(|_| AcquireError::Bundle)?;
-        source
+        let copy_result = (|| {
+            let copied = {
+                let mut bounded = Read::take(&mut *source, size);
+                std::io::copy(&mut bounded, &mut target).map_err(|_| AcquireError::Bundle)?
+            };
+            if copied != size {
+                return Err(AcquireError::Bundle);
+            }
+            let mut probe = [0_u8; 1];
+            if source.read(&mut probe).map_err(|_| AcquireError::Bundle)? != 0 {
+                return Err(AcquireError::Bundle);
+            }
+            Ok(())
+        })();
+        let rewind_result = source
             .seek(SeekFrom::Start(0))
-            .map_err(|_| AcquireError::Bundle)?;
-        if copied != size {
-            return Err(AcquireError::Bundle);
-        }
+            .map(|_| ())
+            .map_err(|_| AcquireError::Bundle);
+        rewind_result?;
+        copy_result?;
         self.settle_file(relative, target, identity, size, digest)
     }
 
@@ -617,6 +630,26 @@ pub(crate) fn write_verified_bundle_with_publication(
     claim_publication: impl FnOnce() -> bool,
 ) -> Result<VerifiedInputBundleV1, AcquireError> {
     let preflight = preflight_verified_bundle(request)?;
+    write_preflight_bundle(preflight, output, authorize_publication, claim_publication)
+}
+
+#[cfg(test)]
+fn write_verified_bundle_after_preflight_for_test(
+    request: VerifiedBundleWriteRequest,
+    output: &Path,
+    after_preflight: impl FnOnce(),
+) -> Result<VerifiedInputBundleV1, AcquireError> {
+    let preflight = preflight_verified_bundle(request)?;
+    after_preflight();
+    write_preflight_bundle(preflight, output, || true, || true)
+}
+
+fn write_preflight_bundle(
+    preflight: VerifiedBundlePreflight,
+    output: &Path,
+    authorize_publication: impl FnOnce() -> bool,
+    claim_publication: impl FnOnce() -> bool,
+) -> Result<VerifiedInputBundleV1, AcquireError> {
     let mut output_root = OutputRoot::create(output)?;
     output_root.create_directory("objects")?;
     output_root.create_directory("records")?;
@@ -951,7 +984,25 @@ pub fn export_transfer_bundle(
     bundle: &Path,
     output: &Path,
 ) -> Result<VerifiedTransferredBundle, AcquireError> {
-    let mut verified = verify_transferred_bundle(bundle)?;
+    let verified = verify_transferred_bundle(bundle)?;
+    export_preflight_bundle(verified, output)
+}
+
+#[cfg(test)]
+fn export_transfer_bundle_after_preflight_for_test(
+    bundle: &Path,
+    output: &Path,
+    after_preflight: impl FnOnce(),
+) -> Result<VerifiedTransferredBundle, AcquireError> {
+    let verified = verify_transferred_bundle(bundle)?;
+    after_preflight();
+    export_preflight_bundle(verified, output)
+}
+
+fn export_preflight_bundle(
+    mut verified: VerifiedTransferredBundle,
+    output: &Path,
+) -> Result<VerifiedTransferredBundle, AcquireError> {
     let mut output_root = OutputRoot::create(output)?;
     output_root.create_directory("objects")?;
     output_root.create_directory("records")?;
@@ -1567,6 +1618,7 @@ mod tests {
     use std::{
         ffi::OsStr,
         fs,
+        io::{Seek, SeekFrom, Write},
         os::unix::{
             ffi::OsStrExt,
             fs::{DirBuilderExt, PermissionsExt, symlink},
@@ -1578,8 +1630,9 @@ mod tests {
     use catalog_core::InputSourceKind;
 
     use super::{
-        BundleRecord, MAX_ENTRIES, MAX_ENTRY_BYTES, OutputRoot, PublicBundleObject,
-        VerifiedBundleWriteRequest, write_verified_bundle,
+        AcquireError, BundleRecord, MAX_ENTRIES, MAX_ENTRY_BYTES, OutputRoot, PublicBundleObject,
+        VerifiedBundleWriteRequest, export_transfer_bundle_after_preflight_for_test,
+        write_verified_bundle, write_verified_bundle_after_preflight_for_test,
     };
 
     #[test]
@@ -1680,6 +1733,51 @@ mod tests {
 
         assert!(write_verified_bundle(request, &output).is_err());
         assert_no_output_or_stage(&parent.path, &output);
+    }
+
+    #[test]
+    fn bundle_source_growth_after_preflight_never_exceeds_the_declared_stage_bound() {
+        let parent = TempDirectory::new();
+        let output = parent.path.join("bundle");
+        let (source, mut retained_writer) = retained_writable_source(&parent.path);
+        let request = fixture_request(source);
+
+        let result = write_verified_bundle_after_preflight_for_test(request, &output, move || {
+            append_arbitrary_growth(&mut retained_writer);
+        });
+
+        assert_eq!(result, Err(AcquireError::Bundle));
+        assert!(!output.exists());
+        assert_staged_objects_are_bounded(&parent.path, 6);
+    }
+
+    #[test]
+    fn export_source_growth_after_preflight_never_exceeds_the_declared_stage_bound() {
+        let parent = TempDirectory::new();
+        let bundle = parent.path.join("bundle");
+        write_verified_bundle(fixture_request(source_file(&parent.path)), &bundle).unwrap();
+        let object = fs::read_dir(bundle.join("objects"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        fs::set_permissions(&object, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut retained_writer = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&object)
+            .unwrap();
+        fs::set_permissions(&object, fs::Permissions::from_mode(0o400)).unwrap();
+        let output = parent.path.join("exported");
+
+        let result = export_transfer_bundle_after_preflight_for_test(&bundle, &output, move || {
+            append_arbitrary_growth(&mut retained_writer)
+        });
+
+        assert!(result.is_err());
+        assert!(!output.exists());
+        assert_staged_objects_are_bounded(&parent.path, 6);
     }
 
     #[test]
@@ -1927,6 +2025,72 @@ mod tests {
         fs::write(&path, b"object").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
         fs::File::open(path).unwrap()
+    }
+
+    fn retained_writable_source(parent: &Path) -> (fs::File, fs::File) {
+        let path = parent.join("retained-writable-source");
+        let mut writer = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        writer.write_all(b"object").unwrap();
+        writer.seek(SeekFrom::Start(0)).unwrap();
+        let source = writer.try_clone().unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o400)).unwrap();
+        (source, writer)
+    }
+
+    fn fixture_request(source: fs::File) -> VerifiedBundleWriteRequest {
+        VerifiedBundleWriteRequest {
+            source_kind: InputSourceKind::ReleaseIntent,
+            source_sha256: "11".repeat(32),
+            compatibility_input_sha256: "22".repeat(32),
+            source_commit: None,
+            source_tree_sha256: None,
+            records: vec![BundleRecord {
+                role: "record".to_owned(),
+                bytes: b"record".to_vec(),
+            }],
+            objects: vec![PublicBundleObject {
+                file: source,
+                source_url: "https://registry.npmjs.org/object/-/object-1.0.0.tgz".to_owned(),
+                size: 6,
+                sha256: super::sha256(b"object"),
+            }],
+        }
+    }
+
+    fn append_arbitrary_growth(writer: &mut fs::File) {
+        writer.seek(SeekFrom::End(0)).unwrap();
+        writer.write_all(&vec![b'x'; 2 * 1024 * 1024]).unwrap();
+        writer.flush().unwrap();
+    }
+
+    fn assert_staged_objects_are_bounded(parent: &Path, declared_size: u64) {
+        let mut staged_objects = 0;
+        for stage in fs::read_dir(parent).unwrap().filter_map(Result::ok) {
+            if !stage
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".catalog-acquire-stage-")
+            {
+                continue;
+            }
+            let objects = stage.path().join("payload/objects");
+            let Ok(entries) = fs::read_dir(objects) else {
+                continue;
+            };
+            for object in entries.filter_map(Result::ok) {
+                staged_objects += 1;
+                assert!(
+                    object.metadata().unwrap().len() <= declared_size,
+                    "staged object exceeded its declared size"
+                );
+            }
+        }
+        assert!(staged_objects > 0, "growth test did not reach stage copy");
     }
 
     fn assert_no_output_or_stage(parent: &Path, output: &Path) {
