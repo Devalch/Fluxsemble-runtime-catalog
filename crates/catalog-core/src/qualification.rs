@@ -15,19 +15,26 @@ pub const MAX_QUALIFICATION_TEXT_BYTES: usize = 1_024;
 const QUALIFICATION_DOMAIN: &[u8] = b"fluxsemble:runtime-catalog-qualification:v1\0";
 
 /// Public evidence record bound to one exact runtime semantic input and final build/profile.
+///
+/// ```compile_fail
+/// use catalog_core::CompatibilityQualificationV1;
+/// fn clear_risks(record: &mut CompatibilityQualificationV1) {
+///     record.residual_risks.clear();
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CompatibilityQualificationV1 {
-    pub schema_version: u16,
-    pub compatibility_input_sha256: Sha256Hex,
-    pub fluxsemble: FluxsembleBuildBindingV1,
-    pub provider: BoundedId,
-    pub target: CatalogTarget,
-    pub pi_version: ExactVersion,
-    pub node_version: ExactVersion,
-    pub checks: QualificationChecksV1,
-    pub reviewer: BoundedPlainText,
-    pub release_owner_approved_at: CatalogTimestamp,
-    pub residual_risks: Vec<BoundedPlainText>,
+    schema_version: u16,
+    compatibility_input_sha256: Sha256Hex,
+    fluxsemble: FluxsembleBuildBindingV1,
+    provider: BoundedId,
+    target: CatalogTarget,
+    pi_version: ExactVersion,
+    node_version: ExactVersion,
+    checks: QualificationChecksV1,
+    reviewer: BoundedPlainText,
+    release_owner_approved_at: CatalogTimestamp,
+    residual_risks: Vec<BoundedPlainText>,
 }
 
 impl CompatibilityQualificationV1 {
@@ -58,24 +65,124 @@ impl CompatibilityQualificationV1 {
                 .collect::<Result<Vec<_>, _>>()?,
         })
     }
+
+    #[must_use]
+    pub const fn schema_version(&self) -> u16 {
+        self.schema_version
+    }
+
+    #[must_use]
+    pub fn compatibility_input_sha256(&self) -> &Sha256Hex {
+        &self.compatibility_input_sha256
+    }
+
+    #[must_use]
+    pub fn fluxsemble(&self) -> &FluxsembleBuildBindingV1 {
+        &self.fluxsemble
+    }
+
+    #[must_use]
+    pub fn provider(&self) -> &BoundedId {
+        &self.provider
+    }
+
+    #[must_use]
+    pub const fn target(&self) -> CatalogTarget {
+        self.target
+    }
+
+    #[must_use]
+    pub fn pi_version(&self) -> &ExactVersion {
+        &self.pi_version
+    }
+
+    #[must_use]
+    pub fn node_version(&self) -> &ExactVersion {
+        &self.node_version
+    }
+
+    #[must_use]
+    pub fn checks(&self) -> &QualificationChecksV1 {
+        &self.checks
+    }
+
+    #[must_use]
+    pub fn reviewer(&self) -> &BoundedPlainText {
+        &self.reviewer
+    }
+
+    #[must_use]
+    pub fn release_owner_approved_at(&self) -> &CatalogTimestamp {
+        &self.release_owner_approved_at
+    }
+
+    #[must_use]
+    pub fn residual_risks(&self) -> &[BoundedPlainText] {
+        &self.residual_risks
+    }
 }
 
 /// Closed list of pre-publication checks required for compatibility qualification.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QualificationChecksV1 {
-    pub catalog_v1_conformance: QualificationOutcome,
-    pub managed_installation: QualificationOutcome,
-    pub node_probe: QualificationOutcome,
-    pub pi_probe: QualificationOutcome,
-    pub pi_rpc_readiness: QualificationOutcome,
-    pub activation: QualificationOutcome,
-    pub managed_resolution: QualificationOutcome,
-    pub required_failure: QualificationOutcome,
-    pub cancellation: QualificationOutcome,
+    catalog_v1_conformance: QualificationOutcome,
+    managed_installation: QualificationOutcome,
+    node_probe: QualificationOutcome,
+    pi_probe: QualificationOutcome,
+    pi_rpc_readiness: QualificationOutcome,
+    activation: QualificationOutcome,
+    managed_resolution: QualificationOutcome,
+    required_failure: QualificationOutcome,
+    cancellation: QualificationOutcome,
 }
 
 impl QualificationChecksV1 {
+    #[must_use]
+    pub const fn catalog_v1_conformance(&self) -> QualificationOutcome {
+        self.catalog_v1_conformance
+    }
+
+    #[must_use]
+    pub const fn managed_installation(&self) -> QualificationOutcome {
+        self.managed_installation
+    }
+
+    #[must_use]
+    pub const fn node_probe(&self) -> QualificationOutcome {
+        self.node_probe
+    }
+
+    #[must_use]
+    pub const fn pi_probe(&self) -> QualificationOutcome {
+        self.pi_probe
+    }
+
+    #[must_use]
+    pub const fn pi_rpc_readiness(&self) -> QualificationOutcome {
+        self.pi_rpc_readiness
+    }
+
+    #[must_use]
+    pub const fn activation(&self) -> QualificationOutcome {
+        self.activation
+    }
+
+    #[must_use]
+    pub const fn managed_resolution(&self) -> QualificationOutcome {
+        self.managed_resolution
+    }
+
+    #[must_use]
+    pub const fn required_failure(&self) -> QualificationOutcome {
+        self.required_failure
+    }
+
+    #[must_use]
+    pub const fn cancellation(&self) -> QualificationOutcome {
+        self.cancellation
+    }
+
     fn all_passed(&self) -> bool {
         [
             self.catalog_v1_conformance,
@@ -141,16 +248,16 @@ pub fn verify_qualification(
 ) -> Result<(), CoreError> {
     require(record.schema_version == QUALIFICATION_SCHEMA_VERSION)?;
     require(record.checks.all_passed())?;
-    require(record.fluxsemble == source.build)?;
-    require(record.provider.as_str() == source.intent.release.provider())?;
-    require(record.target == source.intent.release.target())?;
-    require(record.pi_version == *source.intent.release.pi_version())?;
-    require(record.node_version == *source.intent.release.node_version())?;
+    require(record.fluxsemble == *source.build())?;
+    require(record.provider.as_str() == source.intent().release().provider())?;
+    require(record.target == source.intent().release().target())?;
+    require(record.pi_version == *source.intent().release().pi_version())?;
+    require(record.node_version == *source.intent().release().node_version())?;
 
-    let expected_input = compatibility_input_digest(&source.intent, &source.build)?;
+    let expected_input = compatibility_input_digest(source.intent(), source.build())?;
     require(record.compatibility_input_sha256.as_str() == encode_hex(&expected_input))?;
     let expected_record = qualification_record_digest(record)?;
-    require(source.qualification.sha256.as_str() == encode_hex(&expected_record))
+    require(source.qualification().sha256().as_str() == encode_hex(&expected_record))
 }
 
 fn encode_hex(bytes: &[u8; 32]) -> String {

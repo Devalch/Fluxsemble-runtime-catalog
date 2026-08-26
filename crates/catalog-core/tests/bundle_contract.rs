@@ -2,6 +2,7 @@ use catalog_core::{
     BundleInventoryV1, CatalogPayloadV1, MAX_BUNDLE_OBJECT_BYTES, SignedReleaseBundleManifestV1,
     VerifiedInputBundleV1, bundle_inventory_digest, canonical_catalog_payload,
     release_bundle_domain_digest, release_bundle_signing_bytes, verified_input_bundle_digest,
+    verify_signed_release_inventory,
 };
 use serde_json::{Value, json};
 
@@ -51,6 +52,45 @@ fn inventory_value(kind: &str) -> Value {
         _ => unreachable!(),
     };
     json!({"schema_version": 1, "kind": kind, "entries": entries})
+}
+
+fn signed_inventory_value() -> Value {
+    json!({
+        "schema_version": 1,
+        "kind": "signed_release",
+        "entries": [
+            {
+                "relative_path": "catalog-v1.json",
+                "mode": "0400",
+                "size": 1024,
+                "sha256": SHA_C
+            },
+            {
+                "relative_path": "checksums-sha256.txt",
+                "mode": "0400",
+                "size": 256,
+                "sha256": SHA_D
+            },
+            {
+                "relative_path": "package-manifest-a.json",
+                "mode": "0400",
+                "size": 512,
+                "sha256": SHA_A
+            },
+            {
+                "relative_path": "qualification-v1.json",
+                "mode": "0400",
+                "size": 768,
+                "sha256": SHA_B
+            },
+            {
+                "relative_path": "signed-release-bundle-manifest-v1.json",
+                "mode": "0400",
+                "size": 768,
+                "sha256": SHA_D
+            }
+        ]
+    })
 }
 
 fn verified_bundle_value() -> Value {
@@ -152,6 +192,57 @@ fn bundle_inventory_is_sorted_normalized_bounded_regular_file_only_and_kind_comp
     wrong_kind["kind"] = json!("signed_release");
     assert!(BundleInventoryV1::from_json(&serde_json::to_vec(&wrong_kind).unwrap()).is_err());
 
+    let mut mixed_verified = inventory_value("verified_input");
+    mixed_verified["entries"].as_array_mut().unwrap().insert(
+        0,
+        json!({
+            "relative_path": "catalog-v1.json",
+            "mode": "0400",
+            "size": 8,
+            "sha256": SHA_C
+        }),
+    );
+    assert!(BundleInventoryV1::from_json(&serde_json::to_vec(&mixed_verified).unwrap()).is_err());
+
+    let mut extra_verified = inventory_value("verified_input");
+    extra_verified["entries"].as_array_mut().unwrap().insert(
+        0,
+        json!({
+            "relative_path": "notes.txt",
+            "mode": "0400",
+            "size": 8,
+            "sha256": SHA_C
+        }),
+    );
+    assert!(BundleInventoryV1::from_json(&serde_json::to_vec(&extra_verified).unwrap()).is_err());
+
+    let mut mixed_signed = inventory_value("signed_release");
+    mixed_signed["entries"].as_array_mut().unwrap().push(json!({
+        "relative_path": "verified-input-bundle-v1.json",
+        "mode": "0400",
+        "size": 8,
+        "sha256": SHA_D
+    }));
+    assert!(BundleInventoryV1::from_json(&serde_json::to_vec(&mixed_signed).unwrap()).is_err());
+
+    let mut digest_object_in_signed = inventory_value("signed_release");
+    digest_object_in_signed["entries"]
+        .as_array_mut()
+        .unwrap()
+        .insert(
+            2,
+            json!({
+                "relative_path": format!("objects/{SHA_D}"),
+                "mode": "0400",
+                "size": 8,
+                "sha256": SHA_D
+            }),
+        );
+    assert!(
+        BundleInventoryV1::from_json(&serde_json::to_vec(&digest_object_in_signed).unwrap())
+            .is_err()
+    );
+
     let mut unknown = inventory_value("verified_input");
     unknown["root_path"] = json!("/private/input");
     assert!(BundleInventoryV1::from_json(&serde_json::to_vec(&unknown).unwrap()).is_err());
@@ -177,6 +268,38 @@ fn verified_input_bundle_is_public_data_only_and_digest_bound() {
             .insert(pointer.trim_start_matches('/').to_owned(), json!("secret"));
         assert!(VerifiedInputBundleV1::from_json(&serde_json::to_vec(&attack).unwrap()).is_err());
     }
+}
+
+#[test]
+fn signed_inventory_is_exactly_cross_bound_to_the_manifest_asset_set() {
+    let manifest = parse_manifest(&manifest_value());
+    let inventory = parse_inventory(&signed_inventory_value());
+    verify_signed_release_inventory(&inventory, &manifest).unwrap();
+
+    let mut extra = signed_inventory_value();
+    extra["entries"].as_array_mut().unwrap().insert(
+        4,
+        json!({
+            "relative_path": "release-notes.txt",
+            "mode": "0400",
+            "size": 32,
+            "sha256": SHA_C
+        }),
+    );
+    let extra = parse_inventory(&extra);
+    assert!(verify_signed_release_inventory(&extra, &manifest).is_err());
+
+    let mut substituted = signed_inventory_value();
+    substituted["entries"][2]["sha256"] = json!(SHA_D);
+    let substituted = parse_inventory(&substituted);
+    assert!(verify_signed_release_inventory(&substituted, &manifest).is_err());
+
+    let mut cross_kind_asset = manifest_value();
+    cross_kind_asset["assets"][1]["name"] = json!("verified-input-bundle-v1.json");
+    assert!(
+        SignedReleaseBundleManifestV1::from_json(&serde_json::to_vec(&cross_kind_asset).unwrap())
+            .is_err()
+    );
 }
 
 #[test]

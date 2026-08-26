@@ -27,17 +27,47 @@ const SIGNED_MANIFEST_DOMAIN: &[u8] = b"fluxsemble:runtime-catalog-signed-releas
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BundleEntryV1 {
-    pub relative_path: BundlePath,
-    pub mode: BundleMode,
-    pub size: u64,
-    pub sha256: Sha256Hex,
+    relative_path: BundlePath,
+    mode: BundleMode,
+    size: u64,
+    sha256: Sha256Hex,
 }
 
+impl BundleEntryV1 {
+    #[must_use]
+    pub fn relative_path(&self) -> &BundlePath {
+        &self.relative_path
+    }
+
+    #[must_use]
+    pub const fn mode(&self) -> BundleMode {
+        self.mode
+    }
+
+    #[must_use]
+    pub const fn size(&self) -> u64 {
+        self.size
+    }
+
+    #[must_use]
+    pub fn sha256(&self) -> &Sha256Hex {
+        &self.sha256
+    }
+}
+
+/// A validated transfer inventory whose order and entries cannot be mutated after admission.
+///
+/// ```compile_fail
+/// use catalog_core::BundleInventoryV1;
+/// fn reorder(inventory: &mut BundleInventoryV1) {
+///     inventory.entries.reverse();
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BundleInventoryV1 {
-    pub schema_version: u16,
-    pub kind: BundleKind,
-    pub entries: Vec<BundleEntryV1>,
+    schema_version: u16,
+    kind: BundleKind,
+    entries: Vec<BundleEntryV1>,
 }
 
 impl BundleInventoryV1 {
@@ -59,6 +89,21 @@ impl BundleInventoryV1 {
             kind: wire.kind,
             entries,
         })
+    }
+
+    #[must_use]
+    pub const fn schema_version(&self) -> u16 {
+        self.schema_version
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> BundleKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub fn entries(&self) -> &[BundleEntryV1] {
+        &self.entries
     }
 }
 
@@ -112,11 +157,11 @@ impl fmt::Display for BundlePath {
 /// Public, inert acquisition result. Object names are digest-addressed and contain no local paths.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct VerifiedInputBundleV1 {
-    pub schema_version: u16,
-    pub source_kind: InputSourceKind,
-    pub source_sha256: Sha256Hex,
-    pub compatibility_input_sha256: Sha256Hex,
-    pub objects: Vec<VerifiedInputObjectV1>,
+    schema_version: u16,
+    source_kind: InputSourceKind,
+    source_sha256: Sha256Hex,
+    compatibility_input_sha256: Sha256Hex,
+    objects: Vec<VerifiedInputObjectV1>,
 }
 
 impl VerifiedInputBundleV1 {
@@ -144,6 +189,31 @@ impl VerifiedInputBundleV1 {
             objects,
         })
     }
+
+    #[must_use]
+    pub const fn schema_version(&self) -> u16 {
+        self.schema_version
+    }
+
+    #[must_use]
+    pub const fn source_kind(&self) -> InputSourceKind {
+        self.source_kind
+    }
+
+    #[must_use]
+    pub fn source_sha256(&self) -> &Sha256Hex {
+        &self.source_sha256
+    }
+
+    #[must_use]
+    pub fn compatibility_input_sha256(&self) -> &Sha256Hex {
+        &self.compatibility_input_sha256
+    }
+
+    #[must_use]
+    pub fn objects(&self) -> &[VerifiedInputObjectV1] {
+        &self.objects
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -155,13 +225,33 @@ pub enum InputSourceKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct VerifiedInputObjectV1 {
-    pub relative_path: BundlePath,
-    pub source_url: HttpsArtifactUrl,
-    pub size: u64,
-    pub sha256: Sha256Hex,
+    relative_path: BundlePath,
+    source_url: HttpsArtifactUrl,
+    size: u64,
+    sha256: Sha256Hex,
 }
 
 impl VerifiedInputObjectV1 {
+    #[must_use]
+    pub fn relative_path(&self) -> &BundlePath {
+        &self.relative_path
+    }
+
+    #[must_use]
+    pub fn source_url(&self) -> &HttpsArtifactUrl {
+        &self.source_url
+    }
+
+    #[must_use]
+    pub const fn size(&self) -> u64 {
+        self.size
+    }
+
+    #[must_use]
+    pub fn sha256(&self) -> &Sha256Hex {
+        &self.sha256
+    }
+
     fn try_from(wire: VerifiedInputObjectWire) -> Result<Self, CoreError> {
         require(wire.size != 0 && wire.size <= MAX_BUNDLE_OBJECT_BYTES)?;
         let relative_path = BundlePath::parse(wire.relative_path)?;
@@ -176,16 +266,24 @@ impl VerifiedInputObjectV1 {
     }
 }
 
+/// Validated release manifest fields cannot be substituted after admission.
+///
+/// ```compile_fail
+/// use catalog_core::SignedReleaseBundleManifestV1;
+/// fn substitute_assets(manifest: &mut SignedReleaseBundleManifestV1) {
+///     manifest.assets.clear();
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SignedReleaseBundleManifestV1 {
-    pub schema_version: u16,
-    pub source_commit: CommitSha,
-    pub source_tree_sha256: Sha256Hex,
-    pub qualification_sha256: Sha256Hex,
-    pub tag: CatalogTag,
-    pub catalog_envelope: ReleaseAssetV1,
-    pub assets: Vec<ReleaseAssetV1>,
-    pub signature: ReleaseBundleSignatureV1,
+    schema_version: u16,
+    source_commit: CommitSha,
+    source_tree_sha256: Sha256Hex,
+    qualification_sha256: Sha256Hex,
+    tag: CatalogTag,
+    catalog_envelope: ReleaseAssetV1,
+    assets: Vec<ReleaseAssetV1>,
+    signature: ReleaseBundleSignatureV1,
 }
 
 impl SignedReleaseBundleManifestV1 {
@@ -210,7 +308,10 @@ impl SignedReleaseBundleManifestV1 {
         require(!assets.iter().any(|asset| {
             matches!(
                 asset.name.as_str(),
-                CATALOG_ENVELOPE_NAME | RELEASE_CHECKSUMS_NAME | RELEASE_MANIFEST_NAME
+                VERIFIED_INPUT_RECORD_NAME
+                    | CATALOG_ENVELOPE_NAME
+                    | RELEASE_CHECKSUMS_NAME
+                    | RELEASE_MANIFEST_NAME
             )
         }))?;
         require_bounded_total(
@@ -227,16 +328,71 @@ impl SignedReleaseBundleManifestV1 {
             signature: ReleaseBundleSignatureV1::try_from(wire.signature)?,
         })
     }
+
+    #[must_use]
+    pub const fn schema_version(&self) -> u16 {
+        self.schema_version
+    }
+
+    #[must_use]
+    pub fn source_commit(&self) -> &CommitSha {
+        &self.source_commit
+    }
+
+    #[must_use]
+    pub fn source_tree_sha256(&self) -> &Sha256Hex {
+        &self.source_tree_sha256
+    }
+
+    #[must_use]
+    pub fn qualification_sha256(&self) -> &Sha256Hex {
+        &self.qualification_sha256
+    }
+
+    #[must_use]
+    pub fn tag(&self) -> &CatalogTag {
+        &self.tag
+    }
+
+    #[must_use]
+    pub fn catalog_envelope(&self) -> &ReleaseAssetV1 {
+        &self.catalog_envelope
+    }
+
+    #[must_use]
+    pub fn assets(&self) -> &[ReleaseAssetV1] {
+        &self.assets
+    }
+
+    #[must_use]
+    pub fn signature(&self) -> &ReleaseBundleSignatureV1 {
+        &self.signature
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ReleaseAssetV1 {
-    pub name: ReleaseAssetName,
-    pub size: u64,
-    pub sha256: Sha256Hex,
+    name: ReleaseAssetName,
+    size: u64,
+    sha256: Sha256Hex,
 }
 
 impl ReleaseAssetV1 {
+    #[must_use]
+    pub fn name(&self) -> &ReleaseAssetName {
+        &self.name
+    }
+
+    #[must_use]
+    pub const fn size(&self) -> u64 {
+        self.size
+    }
+
+    #[must_use]
+    pub fn sha256(&self) -> &Sha256Hex {
+        &self.sha256
+    }
+
     fn try_from(wire: ReleaseAssetWire) -> Result<Self, CoreError> {
         require(wire.size != 0 && wire.size <= MAX_BUNDLE_OBJECT_BYTES)?;
         Ok(Self {
@@ -253,17 +409,7 @@ pub struct ReleaseAssetName(String);
 
 impl ReleaseAssetName {
     fn parse(value: String) -> Result<Self, CoreError> {
-        require(
-            !value.is_empty()
-                && value.len() <= MAX_BUNDLE_ASSET_NAME_BYTES
-                && value != "."
-                && value != ".."
-                && value.is_ascii()
-                && !value.contains(['/', '\\'])
-                && !value
-                    .bytes()
-                    .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace()),
-        )?;
+        require(valid_release_asset_name(&value))?;
         Ok(Self(value))
     }
 
@@ -275,11 +421,21 @@ impl ReleaseAssetName {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ReleaseBundleSignatureV1 {
-    pub key_id: BoundedId,
-    pub signature: BoundedSignatureText,
+    key_id: BoundedId,
+    signature: BoundedSignatureText,
 }
 
 impl ReleaseBundleSignatureV1 {
+    #[must_use]
+    pub fn key_id(&self) -> &BoundedId {
+        &self.key_id
+    }
+
+    #[must_use]
+    pub fn signature(&self) -> &BoundedSignatureText {
+        &self.signature
+    }
+
     fn try_from(wire: ReleaseBundleSignatureWire) -> Result<Self, CoreError> {
         Ok(Self {
             key_id: BoundedId::parse(wire.key_id)?,
@@ -317,6 +473,29 @@ pub fn bundle_inventory_digest(inventory: &BundleInventoryV1) -> Result<[u8; 32]
 
 pub fn verified_input_bundle_digest(bundle: &VerifiedInputBundleV1) -> Result<[u8; 32], CoreError> {
     domain_digest(VERIFIED_INPUT_DOMAIN, bundle)
+}
+
+/// Requires the signed inventory's non-circular asset entries to exactly match the manifest.
+///
+/// The checksum and signed-manifest entries are reserved outputs and cannot bind their own bytes.
+/// Every other entry, including the catalog envelope, is matched by name, size, and digest.
+pub fn verify_signed_release_inventory(
+    inventory: &BundleInventoryV1,
+    manifest: &SignedReleaseBundleManifestV1,
+) -> Result<(), CoreError> {
+    require(inventory.kind == BundleKind::SignedRelease)?;
+    require(inventory.schema_version == BUNDLE_SCHEMA_VERSION)?;
+    require(inventory.entries.len() == manifest.assets.len() + 3)?;
+
+    let catalog = find_entry(&inventory.entries, CATALOG_ENVELOPE_NAME)?;
+    require(catalog.size == manifest.catalog_envelope.size)?;
+    require(catalog.sha256 == manifest.catalog_envelope.sha256)?;
+    for asset in &manifest.assets {
+        let entry = find_entry(&inventory.entries, asset.name.as_str())?;
+        require(entry.size == asset.size)?;
+        require(entry.sha256 == asset.sha256)?;
+    }
+    Ok(())
 }
 
 /// Bytes signed by the release-bundle signature. The signature field is intentionally absent.
@@ -362,17 +541,39 @@ pub fn signed_release_bundle_manifest_digest(
 }
 
 fn require_kind_objects(kind: BundleKind, entries: &[BundleEntryV1]) -> Result<(), CoreError> {
-    let has = |name: &str| {
-        entries
-            .binary_search_by_key(&name, |entry| entry.relative_path.as_str())
-            .is_ok()
-    };
+    let has = |name: &str| find_entry(entries, name).is_ok();
     match kind {
-        BundleKind::VerifiedInput => require(has(VERIFIED_INPUT_RECORD_NAME)),
+        BundleKind::VerifiedInput => require(
+            has(VERIFIED_INPUT_RECORD_NAME)
+                && entries.iter().all(|entry| {
+                    entry.relative_path.as_str() == VERIFIED_INPUT_RECORD_NAME
+                        || entry
+                            .relative_path
+                            .as_str()
+                            .strip_prefix("objects/")
+                            .is_some_and(|digest| digest == entry.sha256.as_str())
+                }),
+        ),
         BundleKind::SignedRelease => require(
-            has(CATALOG_ENVELOPE_NAME) && has(RELEASE_CHECKSUMS_NAME) && has(RELEASE_MANIFEST_NAME),
+            has(CATALOG_ENVELOPE_NAME)
+                && has(RELEASE_CHECKSUMS_NAME)
+                && has(RELEASE_MANIFEST_NAME)
+                && entries.iter().all(|entry| {
+                    let path = entry.relative_path.as_str();
+                    path != VERIFIED_INPUT_RECORD_NAME && valid_release_asset_name(path)
+                }),
         ),
     }
+}
+
+fn find_entry<'a>(
+    entries: &'a [BundleEntryV1],
+    name: &str,
+) -> Result<&'a BundleEntryV1, CoreError> {
+    entries
+        .binary_search_by_key(&name, |entry| entry.relative_path.as_str())
+        .map(|index| &entries[index])
+        .map_err(|_| invalid())
 }
 
 fn require_strictly_sorted_paths(entries: &[BundleEntryV1]) -> Result<(), CoreError> {
@@ -390,6 +591,18 @@ fn require_bounded_total(sizes: impl IntoIterator<Item = u64>) -> Result<(), Cor
         require(total <= MAX_BUNDLE_TOTAL_BYTES)?;
     }
     Ok(())
+}
+
+fn valid_release_asset_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_BUNDLE_ASSET_NAME_BYTES
+        && value != "."
+        && value != ".."
+        && value.is_ascii()
+        && !value.contains(['/', '\\'])
+        && !value
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
 }
 
 fn valid_relative_path(value: &str, maximum: usize) -> bool {

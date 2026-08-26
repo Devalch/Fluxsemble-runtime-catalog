@@ -161,10 +161,10 @@ fn only_final_source_carries_build_and_qualification_bindings() {
         }
     });
     let parsed = CatalogSourceV1::from_json(&serde_json::to_vec(&source).unwrap()).unwrap();
-    assert_eq!(parsed.intent.release.provider(), "builtin:pi");
-    assert_eq!(parsed.intent.release.target().as_str(), "linux_x86_64");
-    assert_eq!(parsed.intent.release.pi_version().as_str(), "0.83.0");
-    assert_eq!(parsed.intent.release.node_version().as_str(), "22.19.0");
+    assert_eq!(parsed.intent().release().provider(), "builtin:pi");
+    assert_eq!(parsed.intent().release().target().as_str(), "linux_x86_64");
+    assert_eq!(parsed.intent().release().pi_version().as_str(), "0.83.0");
+    assert_eq!(parsed.intent().release().node_version().as_str(), "22.19.0");
 
     let mut missing = source.clone();
     missing.as_object_mut().unwrap().remove("qualification");

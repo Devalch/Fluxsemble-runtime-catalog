@@ -25,13 +25,20 @@ const BUILD_BINDING_DOMAIN: &[u8] = b"fluxsemble:runtime-catalog-build-binding:v
 const CATALOG_SOURCE_DOMAIN: &[u8] = b"fluxsemble:runtime-catalog-source:v1\0";
 
 /// Exact final Fluxsemble implementation, packaged binaries, and consumer profile.
+///
+/// ```compile_fail
+/// use catalog_core::FluxsembleBuildBindingV1;
+/// fn substitute(build: &mut FluxsembleBuildBindingV1) {
+///     build.application_sha256 = build.daemon_sha256.clone();
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FluxsembleBuildBindingV1 {
-    pub implementation_commit: CommitSha,
-    pub application_sha256: Sha256Hex,
-    pub daemon_sha256: Sha256Hex,
-    pub compatibility_profile_id: BoundedId,
-    pub compatibility_profile_sha256: Sha256Hex,
+    implementation_commit: CommitSha,
+    application_sha256: Sha256Hex,
+    daemon_sha256: Sha256Hex,
+    compatibility_profile_id: BoundedId,
+    compatibility_profile_sha256: Sha256Hex,
 }
 
 impl FluxsembleBuildBindingV1 {
@@ -39,6 +46,31 @@ impl FluxsembleBuildBindingV1 {
         require_bounded_json(bytes)?;
         let wire: BuildBindingWire = serde_json::from_slice(bytes).map_err(|_| invalid())?;
         Self::try_from(wire)
+    }
+
+    #[must_use]
+    pub fn implementation_commit(&self) -> &CommitSha {
+        &self.implementation_commit
+    }
+
+    #[must_use]
+    pub fn application_sha256(&self) -> &Sha256Hex {
+        &self.application_sha256
+    }
+
+    #[must_use]
+    pub fn daemon_sha256(&self) -> &Sha256Hex {
+        &self.daemon_sha256
+    }
+
+    #[must_use]
+    pub fn compatibility_profile_id(&self) -> &BoundedId {
+        &self.compatibility_profile_id
+    }
+
+    #[must_use]
+    pub fn compatibility_profile_sha256(&self) -> &Sha256Hex {
+        &self.compatibility_profile_sha256
     }
 
     fn try_from(wire: BuildBindingWire) -> Result<Self, CoreError> {
@@ -59,12 +91,12 @@ impl FluxsembleBuildBindingV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct InitialPiReleaseIntentV1 {
     #[serde(serialize_with = "serialize_nonzero_decimal")]
-    pub sequence: NonZeroU64,
-    pub tag: CatalogTag,
-    pub generated_at: CatalogTimestamp,
-    pub expires_at: CatalogTimestamp,
-    pub fluxsemble_requirement: ExactVersionRequirement,
-    pub release: InitialPiReleaseSemanticsV1,
+    sequence: NonZeroU64,
+    tag: CatalogTag,
+    generated_at: CatalogTimestamp,
+    expires_at: CatalogTimestamp,
+    fluxsemble_requirement: ExactVersionRequirement,
+    release: InitialPiReleaseSemanticsV1,
 }
 
 impl InitialPiReleaseIntentV1 {
@@ -72,6 +104,36 @@ impl InitialPiReleaseIntentV1 {
         require_bounded_json(bytes)?;
         let wire: ReleaseIntentWire = serde_json::from_slice(bytes).map_err(|_| invalid())?;
         Self::try_from(wire)
+    }
+
+    #[must_use]
+    pub const fn sequence(&self) -> NonZeroU64 {
+        self.sequence
+    }
+
+    #[must_use]
+    pub fn tag(&self) -> &CatalogTag {
+        &self.tag
+    }
+
+    #[must_use]
+    pub fn generated_at(&self) -> &CatalogTimestamp {
+        &self.generated_at
+    }
+
+    #[must_use]
+    pub fn expires_at(&self) -> &CatalogTimestamp {
+        &self.expires_at
+    }
+
+    #[must_use]
+    pub fn fluxsemble_requirement(&self) -> &ExactVersionRequirement {
+        &self.fluxsemble_requirement
+    }
+
+    #[must_use]
+    pub fn release(&self) -> &InitialPiReleaseSemanticsV1 {
+        &self.release
     }
 
     fn try_from(wire: ReleaseIntentWire) -> Result<Self, CoreError> {
@@ -204,11 +266,18 @@ impl Serialize for InitialPiReleaseSemanticsV1 {
 }
 
 /// Final and only production-signable source record.
+///
+/// ```compile_fail
+/// use catalog_core::CatalogSourceV1;
+/// fn replace_intent(source: &mut CatalogSourceV1) {
+///     source.intent = source.intent.clone();
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CatalogSourceV1 {
-    pub intent: InitialPiReleaseIntentV1,
-    pub build: FluxsembleBuildBindingV1,
-    pub qualification: QualifiedRecordRefV1,
+    intent: InitialPiReleaseIntentV1,
+    build: FluxsembleBuildBindingV1,
+    qualification: QualifiedRecordRefV1,
 }
 
 impl CatalogSourceV1 {
@@ -221,15 +290,40 @@ impl CatalogSourceV1 {
             qualification: QualifiedRecordRefV1::try_from(wire.qualification)?,
         })
     }
+
+    #[must_use]
+    pub fn intent(&self) -> &InitialPiReleaseIntentV1 {
+        &self.intent
+    }
+
+    #[must_use]
+    pub fn build(&self) -> &FluxsembleBuildBindingV1 {
+        &self.build
+    }
+
+    #[must_use]
+    pub fn qualification(&self) -> &QualifiedRecordRefV1 {
+        &self.qualification
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct QualifiedRecordRefV1 {
-    pub relative_path: QualificationRecordPath,
-    pub sha256: Sha256Hex,
+    relative_path: QualificationRecordPath,
+    sha256: Sha256Hex,
 }
 
 impl QualifiedRecordRefV1 {
+    #[must_use]
+    pub fn relative_path(&self) -> &QualificationRecordPath {
+        &self.relative_path
+    }
+
+    #[must_use]
+    pub fn sha256(&self) -> &Sha256Hex {
+        &self.sha256
+    }
+
     fn try_from(wire: QualifiedRecordRefWire) -> Result<Self, CoreError> {
         let relative_path = QualificationRecordPath::parse(wire.relative_path)?;
         require(relative_path.as_str().starts_with("qualifications/"))?;
