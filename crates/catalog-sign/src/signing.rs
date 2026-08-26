@@ -42,10 +42,14 @@ const MAX_ARGUMENT_BYTES: usize = 16 * 1024;
 const INTENT_SEMANTICS_DOMAIN: &[u8] = b"fluxsemble:runtime-catalog-intent-semantics:v1\0";
 const APPROVED_PACKAGE_INPUT_DOMAIN: &[u8] =
     b"fluxsemble:runtime-catalog-approved-package-input-manifest:v1\0";
-// Derived with Task 5's PackageInputManifestV1::canonical_bytes from the authenticated public
-// 140-package Pi fixture: 78,346 canonical bytes, raw SHA-256 d511e45be4fc28ec20c62c2450b61ab61e61fbbd12024a1e95698ab0b702a02d.
-const APPROVED_PACKAGE_INPUT_SHA256: &str =
+const APPROVED_RELEASE_SEMANTIC_DOMAIN: &[u8] =
+    b"fluxsemble:runtime-catalog-approved-release-semantics:v1\0";
+// These compiled digests are independently rederived from the committed public evidence fixtures
+// in tests. Production admission reads no fixture and has no external repository dependency.
+const APPROVED_PACKAGE_INPUT_DOMAIN_SHA256: &str =
     "04ff8560de163983621e86598c8eb6b80fabb32cfced020602c14ed45818f9ef";
+const APPROVED_RELEASE_SEMANTIC_SHA256: &str =
+    "46116101d1ffa3b1184d14347f62478fbc3a2d609afc3ba0bf6b2505265e8441";
 const ROOT_NAME: &str = "@earendil-works/pi-coding-agent";
 const ROOT_VERSION: &str = "0.83.0";
 const ROOT_ARTIFACT_URL: &str =
@@ -479,24 +483,22 @@ pub fn verify_transferred_bundle(path: &Path) -> Result<VerifiedTransferredBundl
 #[derive(Clone, Copy)]
 enum ReleaseAdmissionPolicy {
     Production,
+    // This private test-only seam begins after exact production admission and enters the same
+    // candidate/object/finalization body. It creates no production bypass or exported authority.
     #[cfg(test)]
-    SyntheticTestFixture,
+    PostAdmissionTest,
 }
 
 #[cfg(test)]
-fn assemble_release_intent_for_test(
+fn assemble_release_intent_after_admission_for_test(
     bundle: &VerifiedTransferredBundle,
     intent: &InitialPiReleaseIntentV1,
 ) -> Result<UnsignedReleaseCandidateV1, SignError> {
-    assemble_release_intent_with_policy(
-        bundle,
-        intent,
-        ReleaseAdmissionPolicy::SyntheticTestFixture,
-    )
+    assemble_release_intent_with_policy(bundle, intent, ReleaseAdmissionPolicy::PostAdmissionTest)
 }
 
 #[cfg(test)]
-fn finalize_candidate_for_test(
+fn finalize_candidate_after_admission_for_test(
     bundle: &VerifiedTransferredBundle,
     source: &CatalogSourceV1,
     qualification: &CompatibilityQualificationV1,
@@ -505,7 +507,7 @@ fn finalize_candidate_for_test(
         bundle,
         source,
         qualification,
-        ReleaseAdmissionPolicy::SyntheticTestFixture,
+        ReleaseAdmissionPolicy::PostAdmissionTest,
     )
 }
 
@@ -1082,14 +1084,16 @@ fn require_release_admission(
     match policy {
         ReleaseAdmissionPolicy::Production => {
             require_approved_production_tuple(intent)?;
-            if approved_package_input_digest(package_inputs_bytes) != APPROVED_PACKAGE_INPUT_SHA256
+            if approved_package_input_digest(package_inputs_bytes)
+                != APPROVED_PACKAGE_INPUT_DOMAIN_SHA256
+                || approved_release_semantic_digest(intent)? != APPROVED_RELEASE_SEMANTIC_SHA256
             {
                 return Err(candidate_rejected());
             }
             Ok(())
         }
         #[cfg(test)]
-        ReleaseAdmissionPolicy::SyntheticTestFixture => Ok(()),
+        ReleaseAdmissionPolicy::PostAdmissionTest => Ok(()),
     }
 }
 
@@ -1545,6 +1549,19 @@ fn parse_package_inputs(bytes: &[u8]) -> Result<PackageInputManifestV1, SignErro
 }
 
 fn intent_semantic_digest(intent: &InitialPiReleaseIntentV1) -> Result<String, SignError> {
+    release_semantic_digest(INTENT_SEMANTICS_DOMAIN, intent)
+}
+
+fn approved_release_semantic_digest(
+    intent: &InitialPiReleaseIntentV1,
+) -> Result<String, SignError> {
+    release_semantic_digest(APPROVED_RELEASE_SEMANTIC_DOMAIN, intent)
+}
+
+fn release_semantic_digest(
+    domain: &[u8],
+    intent: &InitialPiReleaseIntentV1,
+) -> Result<String, SignError> {
     #[derive(Serialize)]
     struct Semantic<'a> {
         fluxsemble_requirement: &'a catalog_core::ExactVersionRequirement,
@@ -1556,7 +1573,7 @@ fn intent_semantic_digest(intent: &InitialPiReleaseIntentV1) -> Result<String, S
     })
     .map_err(|_| candidate_rejected())?;
     let mut hasher = Sha256::new();
-    hasher.update(INTENT_SEMANTICS_DOMAIN);
+    hasher.update(domain);
     hasher.update(canonical);
     Ok(format!("{:x}", hasher.finalize()))
 }
@@ -2541,24 +2558,278 @@ mod tests {
     const SRI: &str = "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
 
     #[test]
-    fn approved_package_input_digest_derivation_is_domain_separated_and_fixed() {
+    fn committed_approved_evidence_derives_compiled_admission_digests() {
+        let package_inputs_bytes =
+            include_bytes!("../tests/fixtures/approved-release/package-input-manifest-v1.json");
+        let package_inputs = parse_package_inputs(package_inputs_bytes).unwrap();
         assert_eq!(
-            APPROVED_PACKAGE_INPUT_DOMAIN,
-            b"fluxsemble:runtime-catalog-approved-package-input-manifest:v1\0"
+            serde_jcs::to_vec(&package_inputs).unwrap(),
+            package_inputs_bytes
+        );
+        assert_eq!(package_inputs_bytes.len(), 78_346);
+        assert_eq!(
+            sha256(package_inputs_bytes),
+            "d511e45be4fc28ec20c62c2450b61ab61e61fbbd12024a1e95698ab0b702a02d"
         );
         assert_eq!(
-            APPROVED_PACKAGE_INPUT_SHA256,
-            "04ff8560de163983621e86598c8eb6b80fabb32cfced020602c14ed45818f9ef"
+            approved_package_input_digest(package_inputs_bytes),
+            APPROVED_PACKAGE_INPUT_DOMAIN_SHA256
         );
+
+        let intent_bytes =
+            include_bytes!("../tests/fixtures/approved-release/initial-release-intent-v1.json");
+        let intent = InitialPiReleaseIntentV1::from_json(intent_bytes).unwrap();
+        assert_eq!(serde_jcs::to_vec(&intent).unwrap(), intent_bytes);
+        assert_eq!(
+            approved_release_semantic_digest(&intent).unwrap(),
+            APPROVED_RELEASE_SEMANTIC_SHA256
+        );
+        require_release_admission(
+            &intent,
+            package_inputs_bytes,
+            ReleaseAdmissionPolicy::Production,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn approved_evidence_manifest_is_canonical_and_binds_local_fixture_files() {
+        let evidence_bytes =
+            include_bytes!("../tests/fixtures/approved-release/evidence-manifest-v1.json");
+        let evidence: Value = serde_json::from_slice(evidence_bytes).unwrap();
+        assert_eq!(serde_jcs::to_vec(&evidence).unwrap(), evidence_bytes);
+        assert_eq!(
+            evidence.pointer("/source/initial_runtime_matrix/sha256"),
+            Some(&json!(
+                "6f389eb3b8b040acda99e63b8dfb0be710dc666182438b7b1c5881e430076d53"
+            ))
+        );
+        assert_eq!(
+            evidence.pointer("/source/approval_report/sha256"),
+            Some(&json!(
+                "c4864c7bdccaf5ee9fa2e607ecf46a1657c8026fa6af0f492e021cf4724c4996"
+            ))
+        );
+        assert_eq!(
+            evidence.pointer("/immutable_release_semantic/excluded_freshness_fields"),
+            Some(&json!(["sequence", "tag", "generated_at", "expires_at"]))
+        );
+        assert_eq!(
+            evidence.pointer(
+                "/task_6_initial_release_approval/representative_fixture_freshness/compiled_production_authority"
+            ),
+            Some(&json!(false))
+        );
+
+        let expected = [
+            (
+                "initial-release-intent-v1.json",
+                include_bytes!("../tests/fixtures/approved-release/initial-release-intent-v1.json")
+                    .as_slice(),
+            ),
+            (
+                "package-input-manifest-v1.json",
+                include_bytes!("../tests/fixtures/approved-release/package-input-manifest-v1.json")
+                    .as_slice(),
+            ),
+        ];
+        let entries = evidence["fixture_files"].as_array().unwrap();
+        assert_eq!(entries.len(), expected.len());
+        for (entry, (name, bytes)) in entries.iter().zip(expected) {
+            assert_eq!(entry["path"], name);
+            assert_eq!(entry["size"], bytes.len() as u64);
+            assert_eq!(entry["sha256"], sha256(bytes));
+        }
+    }
+
+    #[test]
+    fn strict_approved_fixtures_reject_duplicates_and_mutation() {
+        let package_inputs_bytes =
+            include_bytes!("../tests/fixtures/approved-release/package-input-manifest-v1.json");
+        let duplicate_package = String::from_utf8(package_inputs_bytes.to_vec())
+            .unwrap()
+            .replacen(
+                "\"schema_version\":1,",
+                "\"schema_version\":1,\"schema_version\":1,",
+                1,
+            );
+        assert!(parse_package_inputs(duplicate_package.as_bytes()).is_err());
+
+        let intent_bytes =
+            include_bytes!("../tests/fixtures/approved-release/initial-release-intent-v1.json");
+        let duplicate_intent = String::from_utf8(intent_bytes.to_vec()).unwrap().replacen(
+            "\"fluxsemble_requirement\":\"=0.1.0\",",
+            "\"fluxsemble_requirement\":\"=0.1.0\",\"fluxsemble_requirement\":\"=0.1.0\",",
+            1,
+        );
+        assert!(InitialPiReleaseIntentV1::from_json(duplicate_intent.as_bytes()).is_err());
+
+        let mut package_mutation: Value = serde_json::from_slice(package_inputs_bytes).unwrap();
+        package_mutation["root"]["archive_member_count"] = json!(885);
+        let package_mutation = serde_jcs::to_vec(&package_mutation).unwrap();
+        parse_package_inputs(&package_mutation).unwrap();
+        assert_ne!(sha256(&package_mutation), sha256(package_inputs_bytes));
         assert_ne!(
-            approved_package_input_digest(b"{}"),
-            APPROVED_PACKAGE_INPUT_SHA256
+            approved_package_input_digest(&package_mutation),
+            APPROVED_PACKAGE_INPUT_DOMAIN_SHA256
+        );
+        reset_key_open_count();
+        assert_eq!(
+            require_release_admission(
+                &approved_evidence_intent(),
+                &package_mutation,
+                ReleaseAdmissionPolicy::Production,
+            ),
+            Err(SignError::CandidateRejected)
+        );
+        assert_eq!(key_open_count(), 0);
+    }
+
+    #[test]
+    fn complete_immutable_release_projection_rejects_every_leaf_and_structural_mutation() {
+        let package_inputs =
+            include_bytes!("../tests/fixtures/approved-release/package-input-manifest-v1.json");
+        let baseline_bytes =
+            include_bytes!("../tests/fixtures/approved-release/initial-release-intent-v1.json");
+        let baseline: Value = serde_json::from_slice(baseline_bytes).unwrap();
+        let mut pointers = Vec::new();
+        collect_leaf_pointers(
+            &baseline["fluxsemble_requirement"],
+            "/fluxsemble_requirement",
+            &mut pointers,
+        );
+        collect_leaf_pointers(&baseline["release"], "/release", &mut pointers);
+        assert!(
+            pointers.len() > 850,
+            "complete locked closure was not enumerated"
+        );
+        for required in [
+            "/release/release/release_metadata/title",
+            "/release/release/release_metadata/notes",
+            "/release/release/components/0/artifacts/0/inventory/0/path",
+            "/release/release/components/0/artifacts/0/inventory/0/size_bytes",
+            "/release/release/components/0/artifacts/0/inventory/0/sha256",
+            "/release/release/components/1/artifacts/0/inventory/0/path",
+            "/release/release/components/1/artifacts/0/inventory/0/size_bytes",
+            "/release/release/components/1/artifacts/0/inventory/0/sha256",
+            "/release/release/provider_extension/metadata/shipped_shrinkwrap/locked_packages/138/archive_sha256",
+        ] {
+            assert!(
+                pointers.iter().any(|pointer| pointer == required),
+                "missing {required}"
+            );
+        }
+
+        reset_key_open_count();
+        let mut parsed_mutations = 0_usize;
+        for pointer in &pointers {
+            let mut mutation = baseline.clone();
+            let original = mutation.pointer(pointer).unwrap().clone();
+            *mutation.pointer_mut(pointer).unwrap() = mutated_leaf(&original);
+            let bytes = serde_jcs::to_vec(&mutation).unwrap();
+            if let Ok(intent) = InitialPiReleaseIntentV1::from_json(&bytes) {
+                parsed_mutations += 1;
+                assert_eq!(
+                    require_release_admission(
+                        &intent,
+                        package_inputs,
+                        ReleaseAdmissionPolicy::Production,
+                    ),
+                    Err(SignError::CandidateRejected),
+                    "production admission accepted immutable leaf {pointer}"
+                );
+            }
+            assert_eq!(key_open_count(), 0, "key opened for {pointer}");
+        }
+        assert!(
+            parsed_mutations > 700,
+            "mutations did not exercise the compiled semantic gate"
+        );
+
+        for pointer in [
+            "/release/release/release_metadata/title",
+            "/release/release/release_metadata/notes",
+            "/release/release/components/0/artifacts/0/inventory/0/path",
+            "/release/release/components/0/artifacts/0/inventory/0/size_bytes",
+            "/release/release/components/0/artifacts/0/inventory/0/sha256",
+            "/release/release/components/1/artifacts/0/inventory/0/size_bytes",
+            "/release/release/components/1/artifacts/0/inventory/0/sha256",
+            "/release/release/provider_extension/metadata/shipped_shrinkwrap/locked_packages/0/archive_sha256",
+        ] {
+            let mut mutation = baseline.clone();
+            let original = mutation.pointer(pointer).unwrap().clone();
+            *mutation.pointer_mut(pointer).unwrap() = mutated_leaf(&original);
+            let intent =
+                InitialPiReleaseIntentV1::from_json(&serde_jcs::to_vec(&mutation).unwrap())
+                    .unwrap_or_else(|_| {
+                        panic!("strict model rejected semantic-gate probe {pointer}")
+                    });
+            require_approved_production_tuple(&intent).unwrap();
+            assert_ne!(
+                approved_release_semantic_digest(&intent).unwrap(),
+                APPROVED_RELEASE_SEMANTIC_SHA256,
+                "semantic digest omitted {pointer}"
+            );
+        }
+
+        for (name, mutation) in structural_release_mutations(&baseline) {
+            let bytes = serde_jcs::to_vec(&mutation).unwrap();
+            if let Ok(intent) = InitialPiReleaseIntentV1::from_json(&bytes) {
+                assert_eq!(
+                    require_release_admission(
+                        &intent,
+                        package_inputs,
+                        ReleaseAdmissionPolicy::Production,
+                    ),
+                    Err(SignError::CandidateRejected),
+                    "production admission accepted structural mutation {name}"
+                );
+            }
+            assert_eq!(key_open_count(), 0, "key opened for {name}");
+        }
+    }
+
+    #[test]
+    fn immutable_semantic_excludes_only_representative_freshness() {
+        let approved = approved_evidence_intent();
+        let baseline = approved_release_semantic_digest(&approved).unwrap();
+        let mut value: Value = serde_json::from_slice(include_bytes!(
+            "../tests/fixtures/approved-release/initial-release-intent-v1.json"
+        ))
+        .unwrap();
+        value["generated_at"] = json!("2026-08-27T00:00:00Z");
+        value["expires_at"] = json!("2026-09-27T00:00:00Z");
+        let freshness =
+            InitialPiReleaseIntentV1::from_json(&serde_jcs::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(
+            approved_release_semantic_digest(&freshness).unwrap(),
+            baseline
+        );
+        require_release_admission(
+            &freshness,
+            include_bytes!("../tests/fixtures/approved-release/package-input-manifest-v1.json"),
+            ReleaseAdmissionPolicy::Production,
+        )
+        .unwrap();
+
+        value["sequence"] = json!("2");
+        value["tag"] = json!("catalog-v1-sequence-2");
+        let retagged =
+            InitialPiReleaseIntentV1::from_json(&serde_jcs::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(
+            require_release_admission(
+                &retagged,
+                include_bytes!("../tests/fixtures/approved-release/package-input-manifest-v1.json"),
+                ReleaseAdmissionPolicy::Production,
+            ),
+            Err(SignError::CandidateRejected),
+            "tag-bound support URLs admitted a different initial tag"
         );
     }
 
     #[test]
-    fn approved_production_tuple_pins_each_public_immutable_fact() {
-        let approved = approved_tuple_shape_for_test();
+    fn individual_production_tuple_checks_remain_defense_in_depth() {
+        let approved = approved_evidence_intent();
         require_approved_production_tuple(&approved).unwrap();
         let baseline: Value =
             serde_json::from_slice(&serde_jcs::to_vec(&approved).unwrap()).unwrap();
@@ -2631,6 +2902,160 @@ mod tests {
         }
     }
 
+    fn approved_evidence_intent() -> InitialPiReleaseIntentV1 {
+        InitialPiReleaseIntentV1::from_json(include_bytes!(
+            "../tests/fixtures/approved-release/initial-release-intent-v1.json"
+        ))
+        .unwrap()
+    }
+
+    fn collect_leaf_pointers(value: &Value, pointer: &str, output: &mut Vec<String>) {
+        match value {
+            Value::Object(object) => {
+                for (key, child) in object {
+                    let key = key.replace('~', "~0").replace('/', "~1");
+                    collect_leaf_pointers(child, &format!("{pointer}/{key}"), output);
+                }
+            }
+            Value::Array(array) => {
+                for (index, child) in array.iter().enumerate() {
+                    collect_leaf_pointers(child, &format!("{pointer}/{index}"), output);
+                }
+            }
+            _ => output.push(pointer.to_owned()),
+        }
+    }
+
+    fn mutated_leaf(original: &Value) -> Value {
+        match original {
+            Value::String(value)
+                if value.len() == 64
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')) =>
+            {
+                let mut mutated = value.as_bytes().to_vec();
+                mutated[0] = if mutated[0] == b'a' { b'b' } else { b'a' };
+                json!(String::from_utf8(mutated).unwrap())
+            }
+            Value::String(value) if value.bytes().all(|byte| byte.is_ascii_digit()) => {
+                json!((value.parse::<u64>().unwrap() + 1).to_string())
+            }
+            Value::String(value) if value.starts_with("sha512-") => {
+                let mut mutated = value.as_bytes().to_vec();
+                mutated[7] = if mutated[7] == b'A' { b'B' } else { b'A' };
+                json!(String::from_utf8(mutated).unwrap())
+            }
+            Value::String(value) if value == "=0.1.0" => json!("=0.1.1"),
+            Value::String(value) if value == "0.83.0" => json!("0.83.1"),
+            Value::String(value) if value == "22.19.0" => json!("22.19.1"),
+            Value::String(value) if value.starts_with("https://") => {
+                json!(format!("{value}-task6-mutation"))
+            }
+            Value::String(value) => json!(format!("{value}-task6-mutation")),
+            Value::Number(value) => json!(value.as_u64().unwrap() + 1),
+            Value::Bool(value) => json!(!value),
+            Value::Null | Value::Array(_) | Value::Object(_) => {
+                panic!("mutation helper expected a scalar")
+            }
+        }
+    }
+
+    fn structural_release_mutations(baseline: &Value) -> Vec<(&'static str, Value)> {
+        let mut mutations = Vec::new();
+
+        let mut allowed_origin_extra = baseline.clone();
+        allowed_origin_extra["release"]["allowed_origins"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("https://z-task6.example"));
+        mutations.push(("allowed origin extra", allowed_origin_extra));
+
+        let mut allowed_origin_reorder = baseline.clone();
+        allowed_origin_reorder["release"]["allowed_origins"]
+            .as_array_mut()
+            .unwrap()
+            .swap(0, 1);
+        mutations.push(("allowed origin reorder", allowed_origin_reorder));
+
+        let mut component_reorder = baseline.clone();
+        component_reorder["release"]["release"]["components"]
+            .as_array_mut()
+            .unwrap()
+            .swap(0, 1);
+        mutations.push(("component reorder", component_reorder));
+
+        let mut component_extra = baseline.clone();
+        let mut extra = component_extra["release"]["release"]["components"][0].clone();
+        extra["component_id"] = json!("component:node-extra");
+        extra["artifacts"][0]["artifact_id"] = json!("artifact:node-extra");
+        component_extra["release"]["release"]["components"]
+            .as_array_mut()
+            .unwrap()
+            .insert(1, extra);
+        mutations.push(("component extra", component_extra));
+
+        let mut artifact_extra = baseline.clone();
+        let mut extra =
+            artifact_extra["release"]["release"]["components"][0]["artifacts"][0].clone();
+        extra["artifact_id"] = json!("artifact:node-linux-x86_64-extra");
+        artifact_extra["release"]["release"]["components"][0]["artifacts"]
+            .as_array_mut()
+            .unwrap()
+            .push(extra);
+        mutations.push(("artifact extra", artifact_extra));
+
+        for (name, component, path) in [
+            ("node inventory extra", 0, "bin/node-extra"),
+            ("pi inventory extra", 1, "dist/cli-extra.js"),
+        ] {
+            let mut mutation = baseline.clone();
+            mutation["release"]["release"]["components"][component]["artifacts"][0]["inventory"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({
+                    "path": path,
+                    "size_bytes": "1",
+                    "sha256": "ab".repeat(32),
+                }));
+            mutations.push((name, mutation));
+        }
+
+        let mut extension_extra = baseline.clone();
+        extension_extra["release"]["release"]["provider_extension"]["metadata"]["unapproved_task6_field"] =
+            json!(true);
+        mutations.push(("provider extension extra", extension_extra));
+
+        let locked_pointer =
+            "/release/release/provider_extension/metadata/shipped_shrinkwrap/locked_packages";
+        let mut locked_extra = baseline.clone();
+        locked_extra
+            .pointer_mut(locked_pointer)
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "locator": "node_modules/zz-task6-extra",
+                "name": "zz-task6-extra",
+                "version": "1.0.0",
+                "resolved_url": "https://registry.npmjs.org/zz-task6-extra/-/zz-task6-extra-1.0.0.tgz",
+                "registry_integrity": SRI,
+                "archive_sha256": "ab".repeat(32),
+            }));
+        mutations.push(("provider extension locked record extra", locked_extra));
+
+        let mut locked_reorder = baseline.clone();
+        locked_reorder
+            .pointer_mut(locked_pointer)
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .swap(0, 1);
+        mutations.push(("provider extension locked record reorder", locked_reorder));
+
+        mutations
+    }
+
     #[test]
     fn public_production_entry_points_reject_synthetic_tuples_before_key_open() {
         let fixture = CandidateFixture::new();
@@ -2664,13 +3089,18 @@ mod tests {
     fn intent_and_final_candidates_bind_the_same_runtime_semantics_and_only_final_can_sign() {
         let fixture = CandidateFixture::new();
         let intent_bundle = verify_transferred_bundle(&fixture.intent_bundle).unwrap();
-        let intent = assemble_release_intent_for_test(&intent_bundle, &fixture.intent).unwrap();
+        let intent =
+            assemble_release_intent_after_admission_for_test(&intent_bundle, &fixture.intent)
+                .unwrap();
         assert!(!intent.is_production_signable());
 
         let final_bundle = verify_transferred_bundle(&fixture.final_bundle).unwrap();
-        let final_candidate =
-            finalize_candidate_for_test(&final_bundle, &fixture.source, &fixture.qualification)
-                .unwrap();
+        let final_candidate = finalize_candidate_after_admission_for_test(
+            &final_bundle,
+            &fixture.source,
+            &fixture.qualification,
+        )
+        .unwrap();
         assert!(final_candidate.is_production_signable());
         assert_eq!(
             final_candidate.runtime_semantic_sha256(),
@@ -2701,8 +3131,12 @@ mod tests {
     fn fixture_signing_exercises_both_domains_atomic_output_and_complete_inventory() {
         let fixture = CandidateFixture::new();
         let bundle = verify_transferred_bundle(&fixture.final_bundle).unwrap();
-        let candidate =
-            finalize_candidate_for_test(&bundle, &fixture.source, &fixture.qualification).unwrap();
+        let candidate = finalize_candidate_after_admission_for_test(
+            &bundle,
+            &fixture.source,
+            &fixture.qualification,
+        )
+        .unwrap();
         let key = fixture_signing_key_for_test();
         let signed = sign_candidate(&candidate, key.as_dalek(), "catalog-test-key-v1").unwrap();
         drop(key);
@@ -2785,8 +3219,12 @@ mod tests {
 
         let fixture = CandidateFixture::new();
         let bundle = verify_transferred_bundle(&fixture.final_bundle).unwrap();
-        let candidate =
-            finalize_candidate_for_test(&bundle, &fixture.source, &fixture.qualification).unwrap();
+        let candidate = finalize_candidate_after_admission_for_test(
+            &bundle,
+            &fixture.source,
+            &fixture.qualification,
+        )
+        .unwrap();
 
         let output = fixture.root.path.join("candidate.json");
         write_candidate(&output, &candidate).unwrap();
@@ -2838,31 +3276,41 @@ mod tests {
     }
 
     #[test]
-    fn every_pre_key_source_build_profile_qualification_tag_time_url_and_tuple_mutation_keeps_counter_zero()
+    fn post_admission_seam_exercises_source_build_profile_qualification_tag_time_url_and_tuple_policy()
      {
         let fixture = CandidateFixture::new();
         let bundle = verify_transferred_bundle(&fixture.final_bundle).unwrap();
+        finalize_candidate_after_admission_for_test(
+            &bundle,
+            &fixture.source,
+            &fixture.qualification,
+        )
+        .expect("the private post-admission seam must enter the complete shared body");
         let base: Value =
             serde_json::from_slice(&serde_jcs::to_vec(&fixture.source).unwrap()).unwrap();
         let mut mutations = Vec::new();
 
+        let mut source = base.clone();
+        source["intent"]["release"]["release"]["release_metadata"]["notes"] =
+            json!("mutated source record");
+        mutations.push(("source", source));
         let mut application = base.clone();
         application["build"]["application_sha256"] = json!("91".repeat(32));
-        mutations.push(application);
+        mutations.push(("build", application));
         let mut profile = base.clone();
         profile["build"]["compatibility_profile_sha256"] = json!("92".repeat(32));
-        mutations.push(profile);
+        mutations.push(("profile", profile));
         let mut qualification = base.clone();
         qualification["qualification"]["sha256"] = json!("93".repeat(32));
-        mutations.push(qualification);
-        let mut freshness = base.clone();
-        freshness["intent"]["sequence"] = json!("2");
-        freshness["intent"]["tag"] = json!("catalog-v1-sequence-2");
-        mutations.push(freshness);
+        mutations.push(("qualification", qualification));
+        let mut tag = base.clone();
+        tag["intent"]["sequence"] = json!("2");
+        tag["intent"]["tag"] = json!("catalog-v1-sequence-2");
+        mutations.push(("tag", tag));
         let mut time = base.clone();
         time["intent"]["generated_at"] = json!("2026-08-27T00:00:00Z");
         time["intent"]["expires_at"] = json!("2026-09-27T00:00:00Z");
-        mutations.push(time);
+        mutations.push(("time", time));
         let mut support_url = base.clone();
         let original = support_url
             .pointer(
@@ -2877,7 +3325,7 @@ mod tests {
                 "/intent/release/release/provider_extension/metadata/root_package_manifest/url",
             )
             .unwrap() = json!(original.replace("pi-package", "other-package"));
-        mutations.push(support_url);
+        mutations.push(("url", support_url));
         let mut tuple = base;
         for pointer in [
             "/intent/release/release/version",
@@ -2887,27 +3335,144 @@ mod tests {
         ] {
             *tuple.pointer_mut(pointer).unwrap() = json!("0.84.0");
         }
-        mutations.push(tuple);
+        mutations.push(("tuple", tuple));
 
-        for mutation in mutations {
+        reset_key_open_count();
+        for (name, mutation) in mutations {
             let source =
                 CatalogSourceV1::from_json(&serde_jcs::to_vec(&mutation).unwrap()).unwrap();
-            reset_key_open_count();
-            let output = fixture
-                .root
-                .path
-                .join(format!("rejected-{}", key_open_count()));
-            let result = sign_release(SignReleaseRequest {
-                bundle: &bundle,
-                source: &source,
-                qualification: &fixture.qualification,
-                key_path: &fixture.fixture_key,
-                output: &output,
-            });
-            assert!(result.is_err());
-            assert_eq!(key_open_count(), 0);
-            assert!(!output.exists());
+            assert_eq!(
+                finalize_candidate_after_admission_for_test(
+                    &bundle,
+                    &source,
+                    &fixture.qualification,
+                ),
+                Err(SignError::CandidateRejected),
+                "{name} mutation did not reach its shared finalization rejection seam"
+            );
+            assert_eq!(key_open_count(), 0, "key opened for {name} mutation");
         }
+
+        let tag_fixture = CandidateFixture::with_intent_mutation(|intent| {
+            intent["sequence"] = json!("2");
+            intent["tag"] = json!("catalog-v1-sequence-2");
+        });
+        let tag_bundle = verify_transferred_bundle(&tag_fixture.final_bundle).unwrap();
+        assert_eq!(
+            finalize_candidate_after_admission_for_test(
+                &tag_bundle,
+                &tag_fixture.source,
+                &tag_fixture.qualification,
+            ),
+            Err(SignError::CandidateRejected),
+            "self-consistent retagging did not reach tag-bound support URL policy"
+        );
+
+        let url_fixture = CandidateFixture::with_intent_mutation(|intent| {
+            let url = intent
+                .pointer("/release/release/provider_extension/metadata/root_package_manifest/url")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .replace("pi-package", "other-package");
+            *intent
+                .pointer_mut(
+                    "/release/release/provider_extension/metadata/root_package_manifest/url",
+                )
+                .unwrap() = json!(url);
+        });
+        let url_bundle = verify_transferred_bundle(&url_fixture.final_bundle).unwrap();
+        assert_eq!(
+            finalize_candidate_after_admission_for_test(
+                &url_bundle,
+                &url_fixture.source,
+                &url_fixture.qualification,
+            ),
+            Err(SignError::CandidateRejected),
+            "self-consistent URL mutation did not reach complete object-graph policy"
+        );
+
+        let time_fixture = CandidateFixture::with_intent_mutation(|intent| {
+            intent["generated_at"] = json!("2026-08-27T00:00:00Z");
+            intent["expires_at"] = json!("2026-09-27T00:00:00Z");
+        });
+        let time_bundle = verify_transferred_bundle(&time_fixture.final_bundle).unwrap();
+        finalize_candidate_after_admission_for_test(
+            &time_bundle,
+            &time_fixture.source,
+            &time_fixture.qualification,
+        )
+        .expect("valid bound freshness must reach and pass shared finalization policy");
+
+        let tuple_fixture = CandidateFixture::with_intent_mutation(|intent| {
+            for pointer in [
+                "/release/release/version",
+                "/release/release/components/1/version",
+                "/release/release/provider_extension/metadata/approved_package/version",
+                "/release/release/provider_extension/metadata/shipped_shrinkwrap/root_package/version",
+            ] {
+                *intent.pointer_mut(pointer).unwrap() = json!("0.84.0");
+            }
+        });
+        let tuple_bundle = verify_transferred_bundle(&tuple_fixture.final_bundle).unwrap();
+        assert_eq!(
+            finalize_candidate_after_admission_for_test(
+                &tuple_bundle,
+                &tuple_fixture.source,
+                &tuple_fixture.qualification,
+            ),
+            Err(SignError::CandidateRejected),
+            "self-consistent tuple mutation did not reach first-tuple policy"
+        );
+        assert_eq!(key_open_count(), 0);
+    }
+
+    #[test]
+    #[ignore = "set CATALOG_AUTHENTIC_PUBLIC_CORPUS to an authenticated public Pi 0.83.0 corpus"]
+    fn environment_supplied_public_corpus_exercises_public_production_assembly_and_finalization() {
+        let corpus = std::env::var_os("CATALOG_AUTHENTIC_PUBLIC_CORPUS")
+            .map(PathBuf::from)
+            .expect("CATALOG_AUTHENTIC_PUBLIC_CORPUS is required");
+        let fixture = CandidateFixture::from_approved_corpus(&corpus);
+
+        let intent_bundle = verify_transferred_bundle(&fixture.intent_bundle).unwrap();
+        let intent_candidate = assemble_release_intent(&intent_bundle, &fixture.intent).unwrap();
+        assert!(!intent_candidate.is_production_signable());
+
+        let final_bundle = verify_transferred_bundle(&fixture.final_bundle).unwrap();
+        let final_candidate =
+            finalize_candidate(&final_bundle, &fixture.source, &fixture.qualification).unwrap();
+        assert!(final_candidate.is_production_signable());
+        assert_eq!(
+            final_candidate.runtime_semantic_sha256(),
+            intent_candidate.runtime_semantic_sha256()
+        );
+        assert_eq!(
+            final_candidate.canonical_payload(),
+            intent_candidate.canonical_payload()
+        );
+
+        reset_key_open_count();
+        let output = fixture.root.path.join("authentic-public-production-output");
+        assert!(
+            matches!(
+                sign_release(SignReleaseRequest {
+                    bundle: &final_bundle,
+                    source: &fixture.source,
+                    qualification: &fixture.qualification,
+                    key_path: &fixture.fixture_key,
+                    output: &output,
+                }),
+                Err(SignError::SigningKeyRejected)
+            ),
+            "the public fixture key must never acquire production signing authority"
+        );
+        assert_eq!(
+            key_open_count(),
+            1,
+            "authentic admission did not reach key open"
+        );
+        assert!(!output.exists());
     }
 
     #[test]
@@ -2977,8 +3542,12 @@ mod tests {
 
         let fixture = CandidateFixture::new();
         let bundle = verify_transferred_bundle(&fixture.final_bundle).unwrap();
-        let candidate =
-            finalize_candidate_for_test(&bundle, &fixture.source, &fixture.qualification).unwrap();
+        let candidate = finalize_candidate_after_admission_for_test(
+            &bundle,
+            &fixture.source,
+            &fixture.qualification,
+        )
+        .unwrap();
         let key = fixture_signing_key_for_test();
         let signed = sign_candidate(&candidate, key.as_dalek(), "catalog-test-key-v1").unwrap();
         let original: Value =
@@ -3097,8 +3666,8 @@ mod tests {
                 "fluxsemble": build_value,
                 "provider": "builtin:pi",
                 "target": "linux_x86_64",
-                "pi_version": ROOT_VERSION,
-                "node_version": NODE_VERSION,
+                "pi_version": intent.release().pi_version().as_str(),
+                "node_version": intent.release().node_version().as_str(),
                 "checks": {
                     "catalog_v1_conformance": "passed",
                     "managed_installation": "passed",
@@ -3163,40 +3732,212 @@ mod tests {
                 qualification,
             }
         }
+
+        fn from_approved_corpus(corpus: &Path) -> Self {
+            assert!(
+                corpus.is_absolute(),
+                "authenticated corpus path must be absolute"
+            );
+            let root = TempDirectory::new();
+            let intent_bytes =
+                include_bytes!("../tests/fixtures/approved-release/initial-release-intent-v1.json");
+            let intent_value: Value = serde_json::from_slice(intent_bytes).unwrap();
+            let intent = InitialPiReleaseIntentV1::from_json(intent_bytes).unwrap();
+            let package_inputs =
+                include_bytes!("../tests/fixtures/approved-release/package-input-manifest-v1.json")
+                    .to_vec();
+            let package_manifest = parse_package_inputs(&package_inputs).unwrap();
+            let release = intent.release().catalog_release();
+            let metadata = match release.provider_extension() {
+                ProviderExtensionV1::Pi(metadata) => metadata.as_ref(),
+                ProviderExtensionV1::None => panic!("approved evidence has no Pi metadata"),
+            };
+            let node = &release.components()[0].artifacts()[0];
+            let pi = &release.components()[1].artifacts()[0];
+            let mut objects = FixtureObjects::new();
+            objects.insert(
+                node.sha256().as_str().to_owned(),
+                (
+                    node.url().as_str().to_owned(),
+                    read_approved_corpus_object(
+                        corpus,
+                        "toolchain/node/node-v22.19.0-linux-x64.tar.xz",
+                        node.size_bytes().get(),
+                        node.sha256().as_str(),
+                    ),
+                ),
+            );
+            objects.insert(
+                pi.sha256().as_str().to_owned(),
+                (
+                    pi.url().as_str().to_owned(),
+                    read_approved_corpus_object(
+                        corpus,
+                        &format!("packages/archives/{}.tgz", pi.sha256().as_str()),
+                        pi.size_bytes().get(),
+                        pi.sha256().as_str(),
+                    ),
+                ),
+            );
+            for record in &package_manifest.locked_packages {
+                objects.insert(
+                    record.archive_sha256.clone(),
+                    (
+                        record.resolved_url.clone(),
+                        read_approved_corpus_object(
+                            corpus,
+                            &format!("packages/archives/{}.tgz", record.archive_sha256),
+                            record.archive_size,
+                            &record.archive_sha256,
+                        ),
+                    ),
+                );
+            }
+            for (descriptor, relative) in [
+                (
+                    metadata.root_package_manifest(),
+                    "packages/installed-declarations/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855/package.json",
+                ),
+                (
+                    metadata.shipped_shrinkwrap().artifact(),
+                    "packages/installed-declarations/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855/npm-shrinkwrap.json",
+                ),
+            ] {
+                objects.insert(
+                    descriptor.sha256().as_str().to_owned(),
+                    (
+                        descriptor.url().as_str().to_owned(),
+                        read_approved_corpus_object(
+                            corpus,
+                            relative,
+                            descriptor.size_bytes().get(),
+                            descriptor.sha256().as_str(),
+                        ),
+                    ),
+                );
+            }
+
+            let semantic = intent_semantic_digest(&intent).unwrap();
+            let intent_bundle = root.path.join("approved-intent-bundle");
+            write_transfer(
+                &intent_bundle,
+                InputSourceKind::ReleaseIntent,
+                encode_hex(&initial_release_intent_digest(&intent).unwrap()),
+                semantic,
+                None,
+                vec![
+                    ("package_inputs".to_owned(), package_inputs.clone()),
+                    ("release_intent".to_owned(), intent_bytes.to_vec()),
+                ],
+                &objects,
+            );
+
+            let build_value = json!({
+                "implementation_commit": "44".repeat(20),
+                "application_sha256": "11".repeat(32),
+                "daemon_sha256": "22".repeat(32),
+                "compatibility_profile_id": "runtime-catalog-compatibility-v1",
+                "compatibility_profile_sha256": "33".repeat(32),
+            });
+            let build =
+                FluxsembleBuildBindingV1::from_json(&serde_jcs::to_vec(&build_value).unwrap())
+                    .unwrap();
+            let compatibility = encode_hex(&compatibility_input_digest(&intent, &build).unwrap());
+            let qualification_value = json!({
+                "schema_version": 1,
+                "compatibility_input_sha256": compatibility,
+                "fluxsemble": build_value,
+                "provider": "builtin:pi",
+                "target": "linux_x86_64",
+                "pi_version": ROOT_VERSION,
+                "node_version": NODE_VERSION,
+                "checks": {
+                    "catalog_v1_conformance": "passed",
+                    "managed_installation": "passed",
+                    "node_probe": "passed",
+                    "pi_probe": "passed",
+                    "pi_rpc_readiness": "passed",
+                    "activation": "passed",
+                    "managed_resolution": "passed",
+                    "required_failure": "passed",
+                    "cancellation": "passed",
+                },
+                "reviewer": "approved-public-evidence-test",
+                "release_owner_approved_at": "2026-08-25T00:00:00Z",
+                "residual_risks": ["Production private key intentionally unavailable."],
+            });
+            let qualification = CompatibilityQualificationV1::from_json(
+                &serde_jcs::to_vec(&qualification_value).unwrap(),
+            )
+            .unwrap();
+            let qualification_digest =
+                encode_hex(&qualification_record_digest(&qualification).unwrap());
+            let source_value = json!({
+                "intent": intent_value,
+                "build": build,
+                "qualification": {
+                    "relative_path": "qualifications/approved-public-evidence-v1.json",
+                    "sha256": qualification_digest,
+                },
+            });
+            let source =
+                CatalogSourceV1::from_json(&serde_jcs::to_vec(&source_value).unwrap()).unwrap();
+            verify_qualification(&source, &qualification).unwrap();
+            let final_bundle = root.path.join("approved-final-bundle");
+            write_transfer(
+                &final_bundle,
+                InputSourceKind::CatalogSource,
+                encode_hex(&catalog_source_digest(&source).unwrap()),
+                compatibility,
+                Some(("55".repeat(20), "66".repeat(32))),
+                vec![
+                    (
+                        "catalog_source".to_owned(),
+                        serde_jcs::to_vec(&source).unwrap(),
+                    ),
+                    ("package_inputs".to_owned(), package_inputs),
+                    (
+                        "qualification".to_owned(),
+                        serde_jcs::to_vec(&qualification).unwrap(),
+                    ),
+                ],
+                &objects,
+            );
+            let fixture_key = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/nonproduction-ed25519-pkcs8.pem");
+            Self {
+                root,
+                fixture_key,
+                intent_bundle,
+                final_bundle,
+                intent,
+                source,
+                qualification,
+            }
+        }
+    }
+
+    fn read_approved_corpus_object(
+        corpus: &Path,
+        relative: &str,
+        expected_size: u64,
+        expected_sha256: &str,
+    ) -> Vec<u8> {
+        let bytes = fs::read(corpus.join(relative)).unwrap();
+        assert_eq!(
+            bytes.len() as u64,
+            expected_size,
+            "size mismatch for {relative}"
+        );
+        assert_eq!(
+            sha256(&bytes),
+            expected_sha256,
+            "digest mismatch for {relative}"
+        );
+        bytes
     }
 
     type FixtureObjects = BTreeMap<String, (String, Vec<u8>)>;
-
-    fn approved_tuple_shape_for_test() -> InitialPiReleaseIntentV1 {
-        let (mut intent, _, _) = intent_fixture();
-        let tag = intent["tag"].as_str().unwrap().to_owned();
-        let release = &mut intent["release"]["release"];
-        release["components"][0]["artifacts"][0]["url"] = json!(NODE_ARTIFACT_URL);
-        release["components"][0]["artifacts"][0]["size_bytes"] =
-            json!(NODE_ARTIFACT_SIZE.to_string());
-        release["components"][0]["artifacts"][0]["sha256"] = json!(NODE_ARTIFACT_SHA256);
-        release["components"][1]["artifacts"][0]["url"] = json!(ROOT_ARTIFACT_URL);
-        release["components"][1]["artifacts"][0]["size_bytes"] =
-            json!(ROOT_ARTIFACT_SIZE.to_string());
-        release["components"][1]["artifacts"][0]["sha256"] = json!(ROOT_ARTIFACT_SHA256);
-        let metadata = &mut release["provider_extension"]["metadata"];
-        metadata["registry_integrity"] = json!(ROOT_REGISTRY_INTEGRITY);
-        metadata["root_package_manifest"] = json!({
-            "url": format!(
-                "https://github.com/Devalch/Fluxsemble-runtime-catalog/releases/download/{tag}/pi-package-{ROOT_MANIFEST_SHA256}.json"
-            ),
-            "size_bytes": ROOT_MANIFEST_SIZE.to_string(),
-            "sha256": ROOT_MANIFEST_SHA256,
-        });
-        metadata["shipped_shrinkwrap"]["artifact"] = json!({
-            "url": format!(
-                "https://github.com/Devalch/Fluxsemble-runtime-catalog/releases/download/{tag}/pi-shrinkwrap-{SHRINKWRAP_SHA256}.json"
-            ),
-            "size_bytes": SHRINKWRAP_SIZE.to_string(),
-            "sha256": SHRINKWRAP_SHA256,
-        });
-        InitialPiReleaseIntentV1::from_json(&serde_jcs::to_vec(&intent).unwrap()).unwrap()
-    }
 
     fn intent_fixture() -> (Value, Vec<u8>, FixtureObjects) {
         let mut payload: Value = serde_json::from_slice(include_bytes!(
