@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/catalog-core",
+  "crates/catalog-acquire",
+  "crates/catalog-sign",
+  "crates/catalog-publish",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"

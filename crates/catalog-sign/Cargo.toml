@@ -1,0 +1,16 @@
+[package]
+name = "catalog-sign"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+catalog-core = { path = "../catalog-core" }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "catalog-sign"
+path = "src/main.rs"

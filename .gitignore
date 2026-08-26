@@ -1,0 +1,5 @@
+.release-work/
+target/
+catalog-v1.json
+signed-release-bundle/
+*.private.pem
