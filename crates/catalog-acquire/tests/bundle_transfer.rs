@@ -145,7 +145,7 @@ fn cli_is_bounded_and_emits_only_stable_safe_output() {
 }
 
 #[test]
-fn failed_bundle_write_leaves_only_private_staging_and_never_clobbers_final_names() {
+fn failed_bundle_preflight_creates_no_stage_and_never_clobbers_final_names() {
     let root = TempRoot::new();
     let fresh = root.path.join("failed");
     let object_path = root.path.join("source-object");
@@ -196,8 +196,11 @@ fn failed_bundle_write_leaves_only_private_staging_and_never_clobbers_final_name
                 .starts_with(".catalog-acquire-stage-")
         })
         .collect::<Vec<_>>();
-    assert_eq!(leftovers.len(), 1, "one bounded staging container remains");
-    assert_eq!(mode(&leftovers[0].path()), 0o700);
+    assert_eq!(
+        leftovers.len(),
+        0,
+        "public writer preflight must reject before creating a stage"
+    );
 
     let empty_existing = root.path.join("empty-existing");
     fs::DirBuilder::new()
@@ -215,6 +218,84 @@ fn failed_bundle_write_leaves_only_private_staging_and_never_clobbers_final_name
     fs::write(existing.join("sentinel"), b"keep").unwrap();
     assert!(write_request(&existing).is_err());
     assert_eq!(fs::read(existing.join("sentinel")).unwrap(), b"keep");
+}
+
+#[test]
+fn oversized_and_overcount_requests_leave_no_final_name_or_staging_container() {
+    for records in [
+        vec![BundleRecord {
+            role: "oversized".into(),
+            bytes: vec![0_u8; 8 * 1024 * 1024 + 1],
+        }],
+        (0..32_768)
+            .map(|index| BundleRecord {
+                role: format!("record_{index}"),
+                bytes: b"record".to_vec(),
+            })
+            .collect(),
+    ] {
+        let root = TempRoot::new();
+        let output = root.path.join("rejected");
+        let object_path = root.path.join("source-object");
+        fs::write(&object_path, b"object").unwrap();
+        fs::set_permissions(&object_path, fs::Permissions::from_mode(0o400)).unwrap();
+        let object = fs::File::open(&object_path).unwrap();
+        let result = write_verified_bundle(
+            VerifiedBundleWriteRequest {
+                source_kind: InputSourceKind::ReleaseIntent,
+                source_sha256: "11".repeat(32),
+                compatibility_input_sha256: "22".repeat(32),
+                source_commit: None,
+                source_tree_sha256: None,
+                records,
+                objects: vec![
+                    PublicBundleObject::verified_file(
+                        object,
+                        "https://registry.npmjs.org/object/-/object-1.0.0.tgz".into(),
+                        6,
+                        sha256(b"object"),
+                    )
+                    .unwrap(),
+                ],
+            },
+            &output,
+        );
+
+        assert!(result.is_err());
+        assert!(!output.exists());
+        assert!(stage_paths(&root.path).is_empty());
+    }
+}
+
+#[test]
+fn transfer_rejects_special_permission_bits_throughout_tree() {
+    for special_bit in [0o1000, 0o2000, 0o4000] {
+        for target in [
+            SpecialModeTarget::Root,
+            SpecialModeTarget::Objects,
+            SpecialModeTarget::Records,
+            SpecialModeTarget::Object,
+            SpecialModeTarget::Record,
+            SpecialModeTarget::VerifiedInput,
+            SpecialModeTarget::TransferManifest,
+        ] {
+            let root = TempRoot::new();
+            let bundle = root.path.join("bundle");
+            write_fixture_bundle(&bundle);
+            let path = special_mode_target(&bundle, target);
+            let ordinary_mode = if path.is_dir() { 0o700 } else { 0o400 };
+            fs::set_permissions(
+                &path,
+                fs::Permissions::from_mode(ordinary_mode | special_bit),
+            )
+            .unwrap();
+
+            assert!(
+                verify_transferred_bundle(&bundle).is_err(),
+                "special mode bit {special_bit:o} on {target:?} was accepted"
+            );
+        }
+    }
 }
 
 #[test]
@@ -253,6 +334,34 @@ fn transfer_rejects_path_mode_owner_link_size_hash_missing_extra_and_replacement
         verify_transferred_bundle(&original).is_err(),
         "input-root symlink replacement"
     );
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SpecialModeTarget {
+    Root,
+    Objects,
+    Records,
+    Object,
+    Record,
+    VerifiedInput,
+    TransferManifest,
+}
+
+fn special_mode_target(bundle: &Path, target: SpecialModeTarget) -> PathBuf {
+    match target {
+        SpecialModeTarget::Root => bundle.to_owned(),
+        SpecialModeTarget::Objects => bundle.join("objects"),
+        SpecialModeTarget::Records => bundle.join("records"),
+        SpecialModeTarget::Object => object_path(bundle),
+        SpecialModeTarget::Record => fs::read_dir(bundle.join("records"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path(),
+        SpecialModeTarget::VerifiedInput => bundle.join("verified-input-bundle-v1.json"),
+        SpecialModeTarget::TransferManifest => bundle.join("transfer-manifest-v1.json"),
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -384,7 +493,21 @@ fn object_path(bundle: &Path) -> PathBuf {
 }
 
 fn mode(path: &Path) -> u32 {
-    fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777
+    fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777
+}
+
+fn stage_paths(parent: &Path) -> Vec<PathBuf> {
+    fs::read_dir(parent)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".catalog-acquire-stage-")
+        })
+        .map(|entry| entry.path())
+        .collect()
 }
 
 fn run_cli(arguments: &[String]) -> std::process::Output {

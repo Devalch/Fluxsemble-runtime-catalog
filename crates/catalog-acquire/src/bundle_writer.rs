@@ -84,6 +84,19 @@ pub struct VerifiedBundleWriteRequest {
     pub objects: Vec<PublicBundleObject>,
 }
 
+struct PreparedBundleRecord {
+    relative_path: String,
+    bytes: Vec<u8>,
+}
+
+struct VerifiedBundlePreflight {
+    records: Vec<PreparedBundleRecord>,
+    objects: Vec<PublicBundleObject>,
+    bundle_bytes: Vec<u8>,
+    verified: VerifiedInputBundleV1,
+    manifest_bytes: Vec<u8>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TransferManifestV1 {
@@ -230,7 +243,10 @@ struct TrackedOutputFile {
 /// An unpublished payload retained beneath one owner-private staging container.
 ///
 /// Staging is intentionally never deleted. The only output namespace mutation after creation is
-/// the one-shot, no-clobber rename of `payload` from the retained container descriptor.
+/// the one-shot, no-clobber rename of `payload` from the retained container descriptor. Linux
+/// cannot rename a directory by retained-fd identity, so principals with this effective UID and
+/// access to the exact private parent are trusted producer principals; stronger hostility requires
+/// separate UID, mount, or container isolation.
 pub(crate) struct OutputRoot {
     parent: fs::File,
     final_name: CString,
@@ -241,6 +257,7 @@ pub(crate) struct OutputRoot {
     payload_identity: FileIdentity,
     directories: BTreeMap<String, TrackedDirectory>,
     files: BTreeMap<String, TrackedOutputFile>,
+    prepared: bool,
     published: bool,
 }
 
@@ -280,6 +297,7 @@ impl OutputRoot {
             payload,
             directories: BTreeMap::new(),
             files: BTreeMap::new(),
+            prepared: false,
             published: false,
         })
     }
@@ -512,15 +530,61 @@ impl OutputRoot {
         Ok(())
     }
 
-    pub(crate) fn commit(&mut self) -> Result<(), AcquireError> {
-        if self.published {
+    /// Settles and fully verifies the unpublished tree before publication is authorized.
+    pub(crate) fn prepare(&mut self) -> Result<(), AcquireError> {
+        if self.prepared || self.published {
             return Err(AcquireError::Bundle);
         }
         self.sync()?;
         self.verify_tracked_tree()?;
+        self.prepared = true;
+        Ok(())
+    }
+
+    fn verify_publication_binding(&self) -> Result<(), AcquireError> {
+        let parent_metadata = self.parent.metadata().map_err(|_| AcquireError::Bundle)?;
+        if !secure_directory(&parent_metadata) {
+            return Err(AcquireError::Bundle);
+        }
+        verify_named_directory(
+            &self.parent,
+            &self.container_name,
+            &self.container,
+            self.container_identity,
+            3,
+        )?;
+        if enumerate_names(&self.container)? != BTreeSet::from(["payload".to_owned()]) {
+            return Err(AcquireError::Bundle);
+        }
         let payload_name = CString::new("payload").expect("fixed output payload name");
+        verify_named_directory(
+            &self.container,
+            &payload_name,
+            &self.payload,
+            self.payload_identity,
+            2 + self.directories.len() as u64,
+        )
+    }
+
+    /// Attempts the final publication claim and immediately performs the one-shot rename.
+    ///
+    /// A successful rename is committed even if the following parent fsync fails. That error means
+    /// durability is indeterminate; callers must not attempt cleanup or a second publication.
+    pub(crate) fn publish(
+        &mut self,
+        claim_publication: impl FnOnce() -> bool,
+    ) -> Result<(), AcquireError> {
+        if !self.prepared || self.published {
+            return Err(AcquireError::Bundle);
+        }
+        let payload_name = CString::new("payload").expect("fixed output payload name");
+        self.verify_publication_binding()?;
+        if !claim_publication() {
+            return Err(AcquireError::Cancelled);
+        }
         // SAFETY: both retained directory descriptors and NUL-terminated names are valid. The
-        // no-replace flag makes this syscall the sole publication linearization point.
+        // no-replace flag makes this syscall the sole publication linearization point. The
+        // authorization claim immediately above is the last operation before this syscall.
         let renamed = unsafe {
             libc::syscall(
                 libc::SYS_renameat2,
@@ -543,58 +607,122 @@ pub fn write_verified_bundle(
     request: VerifiedBundleWriteRequest,
     output: &Path,
 ) -> Result<VerifiedInputBundleV1, AcquireError> {
-    write_verified_bundle_with_decision(request, output, || true)
+    write_verified_bundle_with_publication(request, output, || true, || true)
 }
 
-pub(crate) fn write_verified_bundle_with_decision(
+pub(crate) fn write_verified_bundle_with_publication(
     request: VerifiedBundleWriteRequest,
     output: &Path,
-    decide_publication: impl FnOnce() -> bool,
+    authorize_publication: impl FnOnce() -> bool,
+    claim_publication: impl FnOnce() -> bool,
 ) -> Result<VerifiedInputBundleV1, AcquireError> {
-    validate_claims(&request)?;
+    let preflight = preflight_verified_bundle(request)?;
     let mut output_root = OutputRoot::create(output)?;
     output_root.create_directory("objects")?;
     output_root.create_directory("records")?;
 
-    let mut entries = Vec::new();
-    let mut records = Vec::new();
+    for record in preflight.records {
+        output_root.write_file(&record.relative_path, &record.bytes)?;
+    }
+    for mut object in preflight.objects {
+        let relative = format!("objects/{}", object.sha256);
+        output_root.copy_file(&relative, &mut object.file, object.size, &object.sha256)?;
+    }
+    output_root.write_file(VERIFIED_INPUT_NAME, &preflight.bundle_bytes)?;
+    output_root.write_file(TRANSFER_MANIFEST_NAME, &preflight.manifest_bytes)?;
+    output_root.sync()?;
+    let reopened = verify_transferred_bundle_root(output_root.cloned_root()?)?;
+    if reopened.verified_input != preflight.verified
+        || reopened.root_identity() != output_root.identity()
+    {
+        return Err(AcquireError::Bundle);
+    }
+    output_root.prepare()?;
+    if !authorize_publication() {
+        return Err(AcquireError::Cancelled);
+    }
+    output_root.publish(claim_publication)?;
+    Ok(preflight.verified)
+}
+
+fn preflight_verified_bundle(
+    mut request: VerifiedBundleWriteRequest,
+) -> Result<VerifiedBundlePreflight, AcquireError> {
+    validate_claims(&request)?;
+    let declared_entries = request
+        .records
+        .len()
+        .checked_add(request.objects.len())
+        .and_then(|count| count.checked_add(1))
+        .ok_or(AcquireError::Bundle)?;
+    if request.records.len() > MAX_ENTRIES
+        || request.objects.len() > MAX_ENTRIES
+        || declared_entries > MAX_ENTRIES
+    {
+        return Err(AcquireError::Bundle);
+    }
+
+    let mut entries = Vec::with_capacity(declared_entries);
+    let mut manifest_records = Vec::with_capacity(request.records.len());
+    let mut prepared_records = Vec::with_capacity(request.records.len());
     let mut role_names = BTreeSet::new();
+    let mut record_paths = BTreeSet::new();
+    let mut total = 0_u64;
     for record in request.records {
+        let size = record.bytes.len() as u64;
         if !safe_role(&record.role)
             || !role_names.insert(record.role.clone())
-            || record.bytes.is_empty()
-            || record.bytes.len() as u64 > MAX_MANIFEST_BYTES
+            || size == 0
+            || size > MAX_MANIFEST_BYTES
+            || size > MAX_ENTRY_BYTES
         {
             return Err(AcquireError::Bundle);
         }
         let digest = sha256(&record.bytes);
-        let relative = format!("records/{digest}");
-        output_root.write_file(&relative, &record.bytes)?;
-        entries.push(entry(&relative, record.bytes.len() as u64, &digest));
-        records.push(TransferRecordRef {
+        let relative_path = format!("records/{digest}");
+        if !record_paths.insert(relative_path.clone()) {
+            return Err(AcquireError::Bundle);
+        }
+        total = checked_preflight_total(total, size)?;
+        entries.push(entry(&relative_path, size, &digest));
+        manifest_records.push(TransferRecordRef {
             role: record.role,
-            relative_path: relative,
+            relative_path: relative_path.clone(),
             sha256: digest,
         });
+        prepared_records.push(PreparedBundleRecord {
+            relative_path,
+            bytes: record.bytes,
+        });
     }
-    records.sort_by(|left, right| left.role.cmp(&right.role));
+    manifest_records.sort_by(|left, right| left.role.cmp(&right.role));
 
     let mut object_records = BTreeMap::<String, (String, u64)>::new();
-    for mut object in request.objects {
-        verify_object_descriptor(&mut object.file, object.size, &object.sha256)?;
-        match object_records.get(&object.sha256) {
-            Some((url, size)) if url == &object.source_url && *size == object.size => continue,
-            Some(_) => return Err(AcquireError::Bundle),
-            None => {}
+    for object in &request.objects {
+        if object.size == 0 || object.size > MAX_ENTRY_BYTES || !valid_sha256(&object.sha256) {
+            return Err(AcquireError::Bundle);
         }
-        let relative = format!("objects/{}", object.sha256);
-        output_root.copy_file(&relative, &mut object.file, object.size, &object.sha256)?;
-        entries.push(entry(&relative, object.size, &object.sha256));
-        object_records.insert(object.sha256, (object.source_url, object.size));
+        match object_records.get(&object.sha256) {
+            Some((url, size)) if url == &object.source_url && *size == object.size => {}
+            Some(_) => return Err(AcquireError::Bundle),
+            None => {
+                total = checked_preflight_total(total, object.size)?;
+                entries.push(entry(
+                    &format!("objects/{}", object.sha256),
+                    object.size,
+                    &object.sha256,
+                ));
+                object_records.insert(
+                    object.sha256.clone(),
+                    (object.source_url.clone(), object.size),
+                );
+            }
+        }
     }
     if object_records.is_empty() {
         return Err(AcquireError::Bundle);
     }
+
     let objects = object_records
         .iter()
         .map(|(digest, (url, size))| {
@@ -614,37 +742,57 @@ pub(crate) fn write_verified_bundle_with_decision(
         "objects": objects,
     });
     let bundle_bytes = serde_jcs::to_vec(&bundle_value).map_err(|_| AcquireError::Bundle)?;
+    if bundle_bytes.is_empty() || bundle_bytes.len() as u64 > MAX_MANIFEST_BYTES {
+        return Err(AcquireError::Bundle);
+    }
+    checked_preflight_total(total, bundle_bytes.len() as u64)?;
     let verified =
         VerifiedInputBundleV1::from_json(&bundle_bytes).map_err(|_| AcquireError::Bundle)?;
-    output_root.write_file(VERIFIED_INPUT_NAME, &bundle_bytes)?;
     entries.push(entry(
         VERIFIED_INPUT_NAME,
         bundle_bytes.len() as u64,
         &sha256(&bundle_bytes),
     ));
-
     entries.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+
     let manifest = TransferManifestV1 {
         schema_version: 1,
         kind: "verified_input".to_owned(),
         source_commit: request.source_commit,
         source_tree_sha256: request.source_tree_sha256,
-        records,
+        records: manifest_records,
         entries,
     };
     validate_manifest(&manifest)?;
     let manifest_bytes = serde_jcs::to_vec(&manifest).map_err(|_| AcquireError::Bundle)?;
-    output_root.write_file(TRANSFER_MANIFEST_NAME, &manifest_bytes)?;
-    output_root.sync()?;
-    let reopened = verify_transferred_bundle_root(output_root.cloned_root()?)?;
-    if reopened.verified_input != verified || reopened.root_identity() != output_root.identity() {
+    if manifest_bytes.is_empty() || manifest_bytes.len() as u64 > MAX_MANIFEST_BYTES {
         return Err(AcquireError::Bundle);
     }
-    if !decide_publication() {
-        return Err(AcquireError::Cancelled);
+
+    let mut prepared_objects = Vec::with_capacity(object_records.len());
+    let mut seen_objects = BTreeSet::new();
+    for mut object in request.objects.drain(..) {
+        verify_object_descriptor(&mut object.file, object.size, &object.sha256)?;
+        if seen_objects.insert(object.sha256.clone()) {
+            prepared_objects.push(object);
+        }
     }
-    output_root.commit()?;
-    Ok(verified)
+
+    Ok(VerifiedBundlePreflight {
+        records: prepared_records,
+        objects: prepared_objects,
+        bundle_bytes,
+        verified,
+        manifest_bytes,
+    })
+}
+
+fn checked_preflight_total(total: u64, size: u64) -> Result<u64, AcquireError> {
+    let total = total.checked_add(size).ok_or(AcquireError::Bundle)?;
+    if total > MAX_TOTAL_BYTES {
+        return Err(AcquireError::Bundle);
+    }
+    Ok(total)
 }
 
 pub fn verify_transferred_bundle(path: &Path) -> Result<VerifiedTransferredBundle, AcquireError> {
@@ -816,7 +964,8 @@ pub fn export_transfer_bundle(
     if exported.root_identity() != output_root.identity() {
         return Err(AcquireError::Bundle);
     }
-    output_root.commit()?;
+    output_root.prepare()?;
+    output_root.publish(|| true)?;
     Ok(exported)
 }
 
@@ -959,16 +1108,15 @@ fn name_exists_at(parent: &fs::File, name: &CString) -> Result<bool, AcquireErro
 }
 
 fn create_staging_container(parent: &fs::File) -> Result<(CString, fs::File), AcquireError> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static NEXT_STAGE: AtomicU64 = AtomicU64::new(1);
     for _ in 0..128 {
-        let sequence = NEXT_STAGE.fetch_add(1, Ordering::Relaxed);
-        let name = CString::new(format!(
-            ".catalog-acquire-stage-{}-{sequence:016x}",
-            std::process::id()
-        ))
-        .map_err(|_| AcquireError::Bundle)?;
+        let mut random = [0_u8; 16];
+        fill_random(&mut random)?;
+        let suffix = random
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let name = CString::new(format!(".catalog-acquire-stage-{suffix}"))
+            .map_err(|_| AcquireError::Bundle)?;
         // SAFETY: the retained parent and NUL-terminated bounded name are valid.
         if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } == 0 {
             parent.sync_all().map_err(|_| AcquireError::Bundle)?;
@@ -980,6 +1128,33 @@ fn create_staging_container(parent: &fs::File) -> Result<(CString, fs::File), Ac
         }
     }
     Err(AcquireError::Bundle)
+}
+
+fn fill_random(output: &mut [u8]) -> Result<(), AcquireError> {
+    let mut filled = 0;
+    while filled < output.len() {
+        // SAFETY: the remaining output slice is writable for the supplied length. A zero flag uses
+        // the kernel CSPRNG and does not permit a weaker fallback.
+        let read = unsafe {
+            libc::syscall(
+                libc::SYS_getrandom,
+                output[filled..].as_mut_ptr(),
+                output.len() - filled,
+                0,
+            )
+        };
+        if read > 0 {
+            filled = filled
+                .checked_add(read as usize)
+                .ok_or(AcquireError::Bundle)?;
+            continue;
+        }
+        if read < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        return Err(AcquireError::Bundle);
+    }
+    Ok(())
 }
 
 fn verify_named_directory(
@@ -1330,7 +1505,7 @@ fn secure_directory(metadata: &fs::Metadata) -> bool {
     metadata.is_dir()
         && !metadata.file_type().is_symlink()
         && metadata.uid() == current_euid()
-        && metadata.permissions().mode() & 0o777 == 0o700
+        && metadata.permissions().mode() & 0o7777 == 0o700
 }
 
 fn secure_file(metadata: &fs::Metadata) -> bool {
@@ -1338,7 +1513,7 @@ fn secure_file(metadata: &fs::Metadata) -> bool {
         && !metadata.file_type().is_symlink()
         && metadata.uid() == current_euid()
         && metadata.nlink() == 1
-        && metadata.permissions().mode() & 0o777 == 0o400
+        && metadata.permissions().mode() & 0o7777 == 0o400
 }
 
 fn safe_relative(value: &str) -> bool {
@@ -1400,13 +1575,23 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::OutputRoot;
+    use catalog_core::InputSourceKind;
+
+    use super::{
+        BundleRecord, MAX_ENTRIES, MAX_ENTRY_BYTES, OutputRoot, PublicBundleObject,
+        VerifiedBundleWriteRequest, write_verified_bundle,
+    };
 
     #[test]
     fn output_parent_must_be_exact_owner_private_and_symlink_free() {
         let parent = TempDirectory::new();
-        fs::set_permissions(&parent.path, fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(OutputRoot::create(&parent.path.join("bundle")).is_err());
+        for mode in [0o755, 0o1700, 0o2700, 0o4700] {
+            fs::set_permissions(&parent.path, fs::Permissions::from_mode(mode)).unwrap();
+            assert!(
+                OutputRoot::create(&parent.path.join(format!("bundle-{mode:o}"))).is_err(),
+                "parent mode {mode:o} was accepted"
+            );
+        }
         fs::set_permissions(&parent.path, fs::Permissions::from_mode(0o700)).unwrap();
 
         let real = parent.path.join("real");
@@ -1417,15 +1602,120 @@ mod tests {
     }
 
     #[test]
-    fn final_name_is_absent_until_atomic_no_clobber_commit() {
+    fn writer_bounds_are_rejected_before_any_staging_container_is_created() {
+        let oversized_parent = TempDirectory::new();
+        let oversized_output = oversized_parent.path.join("oversized");
+        let source = source_file(&oversized_parent.path);
+        let oversized = VerifiedBundleWriteRequest {
+            source_kind: InputSourceKind::ReleaseIntent,
+            source_sha256: "11".repeat(32),
+            compatibility_input_sha256: "22".repeat(32),
+            source_commit: None,
+            source_tree_sha256: None,
+            records: vec![BundleRecord {
+                role: "record".to_owned(),
+                bytes: b"record".to_vec(),
+            }],
+            objects: vec![PublicBundleObject {
+                file: source,
+                source_url: "https://registry.npmjs.org/object/-/object-1.0.0.tgz".to_owned(),
+                size: MAX_ENTRY_BYTES + 1,
+                sha256: "aa".repeat(32),
+            }],
+        };
+        assert!(write_verified_bundle(oversized, &oversized_output).is_err());
+        assert_no_output_or_stage(&oversized_parent.path, &oversized_output);
+
+        let overcount_parent = TempDirectory::new();
+        let overcount_output = overcount_parent.path.join("overcount");
+        let overcount = VerifiedBundleWriteRequest {
+            source_kind: InputSourceKind::ReleaseIntent,
+            source_sha256: "11".repeat(32),
+            compatibility_input_sha256: "22".repeat(32),
+            source_commit: None,
+            source_tree_sha256: None,
+            records: (0..MAX_ENTRIES)
+                .map(|index| BundleRecord {
+                    role: format!("record_{index}"),
+                    bytes: b"record".to_vec(),
+                })
+                .collect(),
+            objects: vec![PublicBundleObject {
+                file: source_file(&overcount_parent.path),
+                source_url: "https://registry.npmjs.org/object/-/object-1.0.0.tgz".to_owned(),
+                size: 6,
+                sha256: super::sha256(b"object"),
+            }],
+        };
+        assert!(write_verified_bundle(overcount, &overcount_output).is_err());
+        assert_no_output_or_stage(&overcount_parent.path, &overcount_output);
+    }
+
+    #[test]
+    fn checked_total_is_rejected_before_object_reads_or_stage_creation() {
+        let parent = TempDirectory::new();
+        let output = parent.path.join("over-total");
+        let objects = (1_u8..=9)
+            .map(|index| PublicBundleObject {
+                file: source_file(&parent.path),
+                source_url: format!(
+                    "https://registry.npmjs.org/object-{index}/-/object-{index}-1.0.0.tgz"
+                ),
+                size: MAX_ENTRY_BYTES,
+                sha256: format!("{index:064x}"),
+            })
+            .collect();
+        let request = VerifiedBundleWriteRequest {
+            source_kind: InputSourceKind::ReleaseIntent,
+            source_sha256: "11".repeat(32),
+            compatibility_input_sha256: "22".repeat(32),
+            source_commit: None,
+            source_tree_sha256: None,
+            records: vec![BundleRecord {
+                role: "record".to_owned(),
+                bytes: b"record".to_vec(),
+            }],
+            objects,
+        };
+
+        assert!(write_verified_bundle(request, &output).is_err());
+        assert_no_output_or_stage(&parent.path, &output);
+    }
+
+    #[test]
+    fn staging_names_are_csprng_derived_not_pid_or_sequence_derived() {
+        let source = include_str!("bundle_writer.rs");
+        let start = source.find("fn create_staging_container").unwrap();
+        let end = source[start..].find("fn verify_named_directory").unwrap() + start;
+        let implementation = &source[start..end];
+        assert!(implementation.contains("SYS_getrandom"));
+        assert!(!implementation.contains(concat!("Atomic", "U64")));
+        assert!(!implementation.contains(concat!("process", "::id")));
+
+        let parent = TempDirectory::new();
+        let first = OutputRoot::create(&parent.path.join("first")).unwrap();
+        let second = OutputRoot::create(&parent.path.join("second")).unwrap();
+        let first_name = first.container_name.to_str().unwrap();
+        let second_name = second.container_name.to_str().unwrap();
+        for name in [first_name, second_name] {
+            let suffix = name.strip_prefix(".catalog-acquire-stage-").unwrap();
+            assert_eq!(suffix.len(), 32);
+            assert!(suffix.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        }
+        assert_ne!(first_name, second_name);
+    }
+
+    #[test]
+    fn final_name_is_absent_until_atomic_no_clobber_publication() {
         let parent = TempDirectory::new();
         let output = parent.path.join("bundle");
         let mut root = populated_output(&output);
+        root.prepare().unwrap();
         assert!(!output.exists());
 
         fs::DirBuilder::new().mode(0o700).create(&output).unwrap();
         fs::write(output.join("sentinel"), b"replacement").unwrap();
-        assert!(root.commit().is_err());
+        assert!(root.publish(|| true).is_err());
         drop(root);
 
         assert_eq!(fs::read(output.join("sentinel")).unwrap(), b"replacement");
@@ -1442,7 +1732,7 @@ mod tests {
         fs::DirBuilder::new().mode(0o700).create(&stage).unwrap();
         fs::write(stage.join("sentinel"), b"replacement").unwrap();
 
-        assert!(root.commit().is_err());
+        assert!(root.prepare().is_err());
         drop(root);
 
         assert!(!output.exists());
@@ -1497,7 +1787,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_rejects_child_file_mode_inventory_and_symlink_mutations() {
+    fn prepare_rejects_child_file_mode_inventory_and_symlink_mutations() {
         for mutation in [
             Mutation::ChildReplacement,
             Mutation::FileReplacement,
@@ -1513,21 +1803,64 @@ mod tests {
             let payload = stage_path(&parent.path, &root).join("payload");
             mutate(&payload, mutation);
 
-            assert!(root.commit().is_err(), "mutation {mutation:?}");
+            assert!(root.prepare().is_err(), "mutation {mutation:?}");
             assert!(!output.exists(), "mutation {mutation:?} was published");
         }
     }
 
     #[test]
-    fn successful_commit_publishes_exact_payload_once() {
+    fn exact_special_modes_are_rejected_before_publication() {
+        for special_bit in [0o1000, 0o2000, 0o4000] {
+            for target in [
+                SpecialModeTarget::Container,
+                SpecialModeTarget::Payload,
+                SpecialModeTarget::ChildDirectory,
+                SpecialModeTarget::File,
+            ] {
+                let parent = TempDirectory::new();
+                let output = parent.path.join("bundle");
+                let mut root = populated_output(&output);
+                let stage = stage_path(&parent.path, &root);
+                let (path, ordinary_mode) = match target {
+                    SpecialModeTarget::Container => (stage, 0o700),
+                    SpecialModeTarget::Payload => (stage.join("payload"), 0o700),
+                    SpecialModeTarget::ChildDirectory => (stage.join("payload/objects"), 0o700),
+                    SpecialModeTarget::File => (stage.join("payload/objects/object"), 0o400),
+                };
+                fs::set_permissions(
+                    path,
+                    fs::Permissions::from_mode(ordinary_mode | special_bit),
+                )
+                .unwrap();
+
+                assert!(
+                    root.prepare().is_err(),
+                    "special mode bit {special_bit:o} on {target:?} was accepted"
+                );
+                assert!(!output.exists());
+            }
+        }
+    }
+
+    #[test]
+    fn successful_prepare_and_publish_exposes_exact_payload_once() {
         let parent = TempDirectory::new();
         let output = parent.path.join("bundle");
         let mut root = populated_output(&output);
-        root.commit().unwrap();
+        root.prepare().unwrap();
+        root.publish(|| true).unwrap();
 
         assert_eq!(fs::read(output.join("objects/object")).unwrap(), b"object");
         assert_eq!(fs::read(output.join("records/record")).unwrap(), b"record");
-        assert!(root.commit().is_err());
+        assert!(root.publish(|| true).is_err());
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum SpecialModeTarget {
+        Container,
+        Payload,
+        ChildDirectory,
+        File,
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -1584,6 +1917,29 @@ mod tests {
                 symlink("../top-level", object).unwrap();
             }
         }
+    }
+
+    fn source_file(parent: &Path) -> fs::File {
+        let path = parent.join(format!(
+            "source-object-{}",
+            fs::read_dir(parent).unwrap().count()
+        ));
+        fs::write(&path, b"object").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+        fs::File::open(path).unwrap()
+    }
+
+    fn assert_no_output_or_stage(parent: &Path, output: &Path) {
+        assert!(!output.exists());
+        assert!(
+            fs::read_dir(parent)
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".catalog-acquire-stage-"))
+        );
     }
 
     fn populated_output(path: &Path) -> OutputRoot {

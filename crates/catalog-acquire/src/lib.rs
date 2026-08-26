@@ -103,7 +103,12 @@ pub async fn discover_inputs(
     let output = request.output;
     run_publication_blocking(&request.cancellation, move |control| {
         let observed = discover_package_inputs(&intent, &mut root, &mut locked)?;
-        write_discovery(&output, &observed, || control.wait_for_decision())?;
+        write_discovery(
+            &output,
+            &observed,
+            || control.wait_for_authorization(),
+            || control.claim_publication(),
+        )?;
         Ok(observed)
     })
     .await
@@ -259,7 +264,7 @@ pub async fn acquire_release(
         objects.extend(locked.into_iter().map(PublicBundleObject::from_archive));
         let (source_commit, source_tree_sha256) =
             source_claims.map_or((None, None), |(commit, tree)| (Some(commit), Some(tree)));
-        write_verified_bundle_with_decision(
+        write_verified_bundle_with_publication(
             VerifiedBundleWriteRequest {
                 source_kind,
                 source_sha256: source_digest,
@@ -270,7 +275,8 @@ pub async fn acquire_release(
                 objects,
             },
             &output,
-            || control.wait_for_decision(),
+            || control.wait_for_authorization(),
+            || control.claim_publication(),
         )
     })
     .await
@@ -335,18 +341,44 @@ async fn run_publication_blocking<T: Send + 'static>(
     tokio::select! {
         biased;
         () = cancellation.cancelled() => {
-            guard.abort();
-            let _ = task.await.map_err(|_| AcquireError::Input)?;
-            Err(AcquireError::Cancelled)
+            let abort_won = guard.abort();
+            let result = task.await.map_err(|_| AcquireError::Input)?;
+            if abort_won {
+                Err(AcquireError::Cancelled)
+            } else {
+                result
+            }
         }
-        () = control.tentative() => {
+        () = control.ready() => {
             if cancellation.is_cancelled() {
-                guard.abort();
+                let abort_won = guard.abort();
+                let result = task.await.map_err(|_| AcquireError::Input)?;
+                return if abort_won {
+                    Err(AcquireError::Cancelled)
+                } else {
+                    result
+                };
+            }
+            if !guard.authorize() {
                 let _ = task.await.map_err(|_| AcquireError::Input)?;
                 return Err(AcquireError::Cancelled);
             }
-            guard.commit();
-            task.await.map_err(|_| AcquireError::Input)?
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => {
+                    let abort_won = guard.abort();
+                    let result = task.await.map_err(|_| AcquireError::Input)?;
+                    if abort_won {
+                        Err(AcquireError::Cancelled)
+                    } else {
+                        result
+                    }
+                }
+                result = &mut task => {
+                    guard.abort();
+                    result.map_err(|_| AcquireError::Input)?
+                }
+            }
         }
         result = &mut task => {
             guard.abort();
@@ -356,9 +388,10 @@ async fn run_publication_blocking<T: Send + 'static>(
 }
 
 const PUBLICATION_WORKING: u8 = 0;
-const PUBLICATION_TENTATIVE: u8 = 1;
-const PUBLICATION_COMMIT: u8 = 2;
+const PUBLICATION_READY: u8 = 1;
+const PUBLICATION_AUTHORIZED: u8 = 2;
 const PUBLICATION_ABORT: u8 = 3;
+const PUBLICATION_CLAIMED: u8 = 4;
 
 #[derive(Clone)]
 struct PublicationControl {
@@ -384,7 +417,7 @@ impl PublicationControl {
         }
     }
 
-    async fn tentative(&self) {
+    async fn ready(&self) {
         loop {
             let notified = self.inner.notify.notified();
             if self.inner.state.load(Ordering::Acquire) != PUBLICATION_WORKING {
@@ -394,71 +427,101 @@ impl PublicationControl {
         }
     }
 
-    fn wait_for_decision(&self) -> bool {
-        if self
-            .inner
-            .state
-            .compare_exchange(
-                PUBLICATION_WORKING,
-                PUBLICATION_TENTATIVE,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_err()
-        {
+    fn wait_for_authorization(&self) -> bool {
+        if !self.transition(PUBLICATION_WORKING, PUBLICATION_READY) {
             return false;
         }
-        self.inner.notify.notify_waiters();
         let mut lock = self.inner.lock.lock().expect("publication decision lock");
-        while self.inner.state.load(Ordering::Acquire) == PUBLICATION_TENTATIVE {
+        while self.inner.state.load(Ordering::Acquire) == PUBLICATION_READY {
             lock = self
                 .inner
                 .decision
                 .wait(lock)
                 .expect("publication decision wait");
         }
-        self.inner.state.load(Ordering::Acquire) == PUBLICATION_COMMIT
+        self.inner.state.load(Ordering::Acquire) == PUBLICATION_AUTHORIZED
     }
 
-    fn decide(&self, state: u8) {
+    fn authorize(&self) -> bool {
+        self.transition(PUBLICATION_READY, PUBLICATION_AUTHORIZED)
+    }
+
+    fn claim_publication(&self) -> bool {
+        self.transition(PUBLICATION_AUTHORIZED, PUBLICATION_CLAIMED)
+    }
+
+    fn abort(&self) -> bool {
         let _lock = self.inner.lock.lock().expect("publication decision lock");
-        let current = self.inner.state.load(Ordering::Acquire);
-        if current != PUBLICATION_COMMIT && current != PUBLICATION_ABORT {
-            self.inner.state.store(state, Ordering::Release);
+        loop {
+            let current = self.inner.state.load(Ordering::Acquire);
+            match current {
+                PUBLICATION_ABORT => return true,
+                PUBLICATION_CLAIMED => return false,
+                PUBLICATION_WORKING | PUBLICATION_READY | PUBLICATION_AUTHORIZED => {
+                    if self
+                        .inner
+                        .state
+                        .compare_exchange(
+                            current,
+                            PUBLICATION_ABORT,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        self.inner.notify.notify_waiters();
+                        self.inner.decision.notify_all();
+                        return true;
+                    }
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    fn transition(&self, current: u8, next: u8) -> bool {
+        let _lock = self.inner.lock.lock().expect("publication decision lock");
+        let transitioned = self
+            .inner
+            .state
+            .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        if transitioned {
             self.inner.notify.notify_waiters();
             self.inner.decision.notify_all();
         }
+        transitioned
     }
 }
 
 struct PublicationGuard {
     control: PublicationControl,
-    decided: bool,
+    active: bool,
 }
 
 impl PublicationGuard {
     fn new(control: PublicationControl) -> Self {
         Self {
             control,
-            decided: false,
+            active: true,
         }
     }
 
-    fn commit(&mut self) {
-        self.control.decide(PUBLICATION_COMMIT);
-        self.decided = true;
+    fn authorize(&self) -> bool {
+        self.control.authorize()
     }
 
-    fn abort(&mut self) {
-        self.control.decide(PUBLICATION_ABORT);
-        self.decided = true;
+    fn abort(&mut self) -> bool {
+        let won = self.control.abort();
+        self.active = false;
+        won
     }
 }
 
 impl Drop for PublicationGuard {
     fn drop(&mut self) {
-        if !self.decided {
-            self.control.decide(PUBLICATION_ABORT);
+        if self.active {
+            self.control.abort();
         }
     }
 }
@@ -652,7 +715,8 @@ fn node_artifact(intent: &InitialPiReleaseIntentV1) -> Result<&ArtifactDescripto
 fn write_discovery(
     output: &std::path::Path,
     manifest: &PackageInputManifestV1,
-    decide_publication: impl FnOnce() -> bool,
+    authorize_publication: impl FnOnce() -> bool,
+    claim_publication: impl FnOnce() -> bool,
 ) -> Result<(), AcquireError> {
     const DISCOVERY_NAME: &str = "observed-package-inputs-v1.json";
 
@@ -660,11 +724,11 @@ fn write_discovery(
     let mut output_root = bundle_writer::OutputRoot::create(output)?;
     output_root.write_file(DISCOVERY_NAME, &bytes)?;
     output_root.verify_file_bytes(DISCOVERY_NAME, &bytes)?;
-    output_root.sync()?;
-    if !decide_publication() {
+    output_root.prepare()?;
+    if !authorize_publication() {
         return Err(AcquireError::Cancelled);
     }
-    output_root.commit()
+    output_root.publish(claim_publication)
 }
 
 fn intent_semantic_digest(intent: &InitialPiReleaseIntentV1) -> Result<String, AcquireError> {
@@ -767,13 +831,18 @@ mod tests {
         let parent = TempDirectory::new();
         let output = parent.path.join("discovery");
         let expected = manifest().canonical_bytes().unwrap();
-        write_discovery(&output, &manifest(), || {
-            assert!(
-                !output.exists(),
-                "final name must stay unpublished while tentative"
-            );
-            true
-        })
+        write_discovery(
+            &output,
+            &manifest(),
+            || {
+                assert!(
+                    !output.exists(),
+                    "final name must stay unpublished while tentative"
+                );
+                true
+            },
+            || true,
+        )
         .unwrap();
 
         let file = output.join("observed-package-inputs-v1.json");
@@ -786,12 +855,13 @@ mod tests {
     }
 
     #[test]
-    fn discovery_rejects_replaced_identity_and_identical_bytes_with_wrong_mode() {
-        for replace_identity in [false, true] {
-            let parent = TempDirectory::new();
-            let output = parent.path.join("discovery");
-            let expected = manifest().canonical_bytes().unwrap();
-            let result = write_discovery(&output, &manifest(), || {
+    fn discovery_rejects_replaced_staging_container_before_worker_claim() {
+        let parent = TempDirectory::new();
+        let output = parent.path.join("discovery");
+        let result = write_discovery(
+            &output,
+            &manifest(),
+            || {
                 let staged = fs::read_dir(&parent.path)
                     .unwrap()
                     .filter_map(Result::ok)
@@ -802,20 +872,15 @@ mod tests {
                             .starts_with(".catalog-acquire-stage-")
                     })
                     .unwrap()
-                    .path()
-                    .join("payload/observed-package-inputs-v1.json");
-                if replace_identity {
-                    fs::rename(&staged, staged.with_extension("original")).unwrap();
-                    fs::write(&staged, &expected).unwrap();
-                    fs::set_permissions(&staged, fs::Permissions::from_mode(0o400)).unwrap();
-                } else {
-                    fs::set_permissions(&staged, fs::Permissions::from_mode(0o600)).unwrap();
-                }
+                    .path();
+                fs::rename(&staged, staged.with_extension("original")).unwrap();
+                fs::DirBuilder::new().mode(0o700).create(&staged).unwrap();
                 true
-            });
-            assert_eq!(result, Err(AcquireError::Bundle));
-            assert!(!output.exists());
-        }
+            },
+            || true,
+        );
+        assert_eq!(result, Err(AcquireError::Bundle));
+        assert!(!output.exists());
     }
 
     #[test]
@@ -823,7 +888,7 @@ mod tests {
         let parent = TempDirectory::new();
         let output = parent.path.join("discovery");
         assert_eq!(
-            write_discovery(&output, &manifest(), || false),
+            write_discovery(&output, &manifest(), || false, || true),
             Err(AcquireError::Cancelled)
         );
         assert!(!output.exists());
@@ -833,15 +898,20 @@ mod tests {
     fn discovery_abort_never_deletes_a_late_final_directory_name() {
         let parent = TempDirectory::new();
         let output = parent.path.join("discovery");
-        let result = write_discovery(&output, &manifest(), || {
-            assert!(
-                !output.exists(),
-                "final name must stay unpublished while tentative"
-            );
-            fs::DirBuilder::new().mode(0o700).create(&output).unwrap();
-            fs::write(output.join("sentinel"), b"replacement").unwrap();
-            false
-        });
+        let result = write_discovery(
+            &output,
+            &manifest(),
+            || {
+                assert!(
+                    !output.exists(),
+                    "final name must stay unpublished while tentative"
+                );
+                fs::DirBuilder::new().mode(0o700).create(&output).unwrap();
+                fs::write(output.join("sentinel"), b"replacement").unwrap();
+                false
+            },
+            || true,
+        );
         assert_eq!(result, Err(AcquireError::Cancelled));
         assert_eq!(fs::read(output.join("sentinel")).unwrap(), b"replacement");
         assert!(!output.join("observed-package-inputs-v1.json").exists());
@@ -854,14 +924,19 @@ mod tests {
         let outside = parent.path.join("outside");
         fs::DirBuilder::new().mode(0o700).create(&outside).unwrap();
         fs::write(outside.join("sentinel"), b"outside").unwrap();
-        let result = write_discovery(&output, &manifest(), || {
-            assert!(
-                !output.exists(),
-                "final name must stay unpublished while tentative"
-            );
-            symlink(&outside, &output).unwrap();
-            false
-        });
+        let result = write_discovery(
+            &output,
+            &manifest(),
+            || {
+                assert!(
+                    !output.exists(),
+                    "final name must stay unpublished while tentative"
+                );
+                symlink(&outside, &output).unwrap();
+                false
+            },
+            || true,
+        );
         assert_eq!(result, Err(AcquireError::Cancelled));
         assert_eq!(fs::read(outside.join("sentinel")).unwrap(), b"outside");
         assert!(!outside.join("observed-package-inputs-v1.json").exists());
@@ -878,10 +953,15 @@ mod tests {
         let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
             run_publication_blocking(&operation_cancellation, move |control| {
-                write_discovery(&operation_output, &manifest(), || {
-                    let _ = reached_tx.send(());
-                    control.wait_for_decision()
-                })
+                write_discovery(
+                    &operation_output,
+                    &manifest(),
+                    || {
+                        let _ = reached_tx.send(());
+                        control.wait_for_authorization()
+                    },
+                    || control.claim_publication(),
+                )
             })
             .await
         });
@@ -903,6 +983,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancellation_after_authorization_but_before_worker_claim_aborts_publication() {
+        let parent = TempDirectory::new();
+        let output = parent.path.join("discovery");
+        let operation_output = output.clone();
+        let cancellation = AcquisitionCancellation::new();
+        let operation_cancellation = cancellation.clone();
+        let (authorized_tx, authorized_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let task = tokio::spawn(async move {
+            run_publication_blocking(&operation_cancellation, move |control| {
+                write_discovery(
+                    &operation_output,
+                    &manifest(),
+                    || {
+                        let authorized = control.wait_for_authorization();
+                        if authorized {
+                            let _ = authorized_tx.send(());
+                            release_rx.recv().unwrap();
+                        }
+                        authorized
+                    },
+                    || control.claim_publication(),
+                )
+            })
+            .await
+        });
+        authorized_rx.await.unwrap();
+        assert!(!output.exists());
+
+        cancellation.cancel();
+        release_tx.send(()).unwrap();
+
+        assert_eq!(task.await.unwrap(), Err(AcquireError::Cancelled));
+        assert!(!output.exists());
+    }
+
+    #[tokio::test]
+    async fn dropping_after_authorization_but_before_worker_claim_aborts_publication() {
+        let parent = TempDirectory::new();
+        let output = parent.path.join("discovery");
+        let operation_output = output.clone();
+        let cancellation = AcquisitionCancellation::new();
+        let (authorized_tx, authorized_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (settled_tx, settled_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            run_publication_blocking(&cancellation, move |control| {
+                let result = write_discovery(
+                    &operation_output,
+                    &manifest(),
+                    || {
+                        let authorized = control.wait_for_authorization();
+                        if authorized {
+                            let _ = authorized_tx.send(());
+                            release_rx.recv().unwrap();
+                        }
+                        authorized
+                    },
+                    || control.claim_publication(),
+                );
+                let _ = settled_tx.send(result);
+                result
+            })
+            .await
+        });
+        authorized_rx.await.unwrap();
+        assert!(!output.exists());
+
+        task.abort();
+        let _ = task.await;
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), settled_rx)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(AcquireError::Cancelled)
+        );
+        assert!(!output.exists());
+    }
+
+    #[tokio::test]
     async fn dropping_discovery_future_aborts_and_settles_without_late_publication() {
         let parent = TempDirectory::new();
         let output = parent.path.join("discovery");
@@ -915,10 +1077,15 @@ mod tests {
         let (settled_tx, settled_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
             run_publication_blocking(&cancellation, move |control| {
-                let result = write_discovery(&operation_output, &manifest(), || {
-                    let _ = reached_tx.send(());
-                    control.wait_for_decision()
-                });
+                let result = write_discovery(
+                    &operation_output,
+                    &manifest(),
+                    || {
+                        let _ = reached_tx.send(());
+                        control.wait_for_authorization()
+                    },
+                    || control.claim_publication(),
+                );
                 let _ = settled_tx.send(());
                 result
             })
