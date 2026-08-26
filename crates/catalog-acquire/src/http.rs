@@ -796,13 +796,20 @@ impl PublicationControl {
     }
 
     fn decide(&self, decision: u8) {
-        let _ = self.inner.decision.compare_exchange(
-            PUBLICATION_UNDECIDED,
-            decision,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-        self.inner.decision_notify.notify_all();
+        let _lock = self.inner.decision_lock.lock().expect("publication lock");
+        if self
+            .inner
+            .decision
+            .compare_exchange(
+                PUBLICATION_UNDECIDED,
+                decision,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.inner.decision_notify.notify_all();
+        }
     }
 
     fn is_aborted(&self) -> bool {
@@ -810,12 +817,19 @@ impl PublicationControl {
     }
 
     fn wait_for_decision(&self) -> bool {
+        self.wait_for_decision_with_hook(None)
+    }
+
+    fn wait_for_decision_with_hook(&self, hook: Option<&BlockingTestHook>) -> bool {
         let mut lock = self.inner.decision_lock.lock().expect("publication lock");
         loop {
             match self.inner.decision.load(Ordering::Acquire) {
                 PUBLICATION_COMMIT => return true,
                 PUBLICATION_ABORT => return false,
                 _ => {
+                    if let Some(hook) = hook {
+                        hook.block();
+                    }
                     lock = self
                         .inner
                         .decision_notify
@@ -1752,6 +1766,8 @@ pub(crate) enum BlockingTestHookPoint {
     TemporarySettlement,
     Publication,
     PublicationAfterLink,
+    #[cfg(test)]
+    DecisionWait,
 }
 
 #[derive(Clone)]
@@ -1814,6 +1830,50 @@ impl BlockingTestHook {
         *self.inner.released.lock().expect("blocking hook lock") = true;
         self.inner.release_notify.notify_all();
     }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TestPublicationDecision {
+    Commit,
+    Abort,
+}
+
+#[cfg(test)]
+pub(crate) async fn publication_decision_race_for_test(decision: TestPublicationDecision) -> bool {
+    let control = PublicationControl::new();
+    let waiter_control = control.clone();
+    let hook = BlockingTestHook::new(BlockingTestHookPoint::DecisionWait);
+    let waiter_hook = hook.clone();
+    let waiter =
+        spawn_blocking(move || waiter_control.wait_for_decision_with_hook(Some(&waiter_hook)));
+    hook.wait_until_reached().await;
+
+    let attempted = Arc::new(AtomicBool::new(false));
+    let attempted_notify = Arc::new(Notify::new());
+    let decision_control = control.clone();
+    let decision_attempted = attempted.clone();
+    let decision_notify = attempted_notify.clone();
+    let decider = spawn_blocking(move || {
+        decision_attempted.store(true, Ordering::Release);
+        decision_notify.notify_waiters();
+        let (first, second) = match decision {
+            TestPublicationDecision::Commit => (PUBLICATION_COMMIT, PUBLICATION_ABORT),
+            TestPublicationDecision::Abort => (PUBLICATION_ABORT, PUBLICATION_COMMIT),
+        };
+        decision_control.decide(first);
+        decision_control.decide(second);
+    });
+    loop {
+        let notified = attempted_notify.notified();
+        if attempted.load(Ordering::Acquire) {
+            break;
+        }
+        notified.await;
+    }
+    hook.release();
+    decider.await.expect("decision task");
+    waiter.await.expect("decision waiter")
 }
 
 #[cfg(test)]

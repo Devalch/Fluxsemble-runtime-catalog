@@ -14,6 +14,7 @@ use std::{
 use http::{
     AcquireError, AcquisitionCancellation, BlockingTestHook, BlockingTestHookPoint,
     CredentialFreeFetcher, FetchRequest, FetchedObject, RedirectProfile, TestHook, TestHookPoint,
+    TestPublicationDecision,
 };
 use sha2::{Digest, Sha256, Sha512};
 use tokio::{
@@ -581,6 +582,22 @@ async fn large_artifact_returns_descriptor_authority_without_retaining_artifact_
     assert!(!fetched_source.contains("Vec<u8>"));
     assert!(!fetched_source.contains("pub fn bytes"));
     assert!(fetched_source.contains("file: fs::File"));
+}
+
+#[tokio::test]
+async fn publication_decision_cannot_lose_commit_or_abort_wakeup() {
+    for (decision, expected) in [
+        (TestPublicationDecision::Commit, true),
+        (TestPublicationDecision::Abort, false),
+    ] {
+        let observed = timeout(
+            Duration::from_secs(2),
+            http::publication_decision_race_for_test(decision),
+        )
+        .await
+        .expect("decision waiter must settle without a lost wakeup");
+        assert_eq!(observed, expected);
+    }
 }
 
 #[tokio::test]
