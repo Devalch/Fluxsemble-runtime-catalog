@@ -261,6 +261,11 @@ python_reader_policies = [
         1,
     ),
     (
+        "complete directory mode predicate use",
+        "and stat.S_IMODE(metadata.st_mode) in SAFE_PUBLIC_DIRECTORY_MODES",
+        1,
+    ),
+    (
         "directory production current effective owner",
         "_public_directory_policy_matches(metadata, os.geteuid())",
         1,
@@ -451,6 +456,11 @@ rust_reader_policies = [
         1,
     ),
     ("directory exact safe modes", "0o700 | 0o755", 1),
+    (
+        "complete metadata-bound directory mode predicate",
+        "&& matches!(metadata.permissions().mode() & 0o7777, 0o700 | 0o755)",
+        1,
+    ),
     (
         "root admission directory-policy invocation",
         "let metadata = root.metadata().map_err(|_| bundle_rejected())?;\n            if !secure_public_corpus_directory(&metadata)",
