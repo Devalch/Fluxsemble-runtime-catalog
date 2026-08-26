@@ -657,20 +657,9 @@ fn write_discovery(
     const DISCOVERY_NAME: &str = "observed-package-inputs-v1.json";
 
     let bytes = manifest.canonical_bytes()?;
-    let mut output_root = bundle_writer::OutputRoot::create_new(output)?;
+    let mut output_root = bundle_writer::OutputRoot::create(output)?;
     output_root.write_file(DISCOVERY_NAME, &bytes)?;
-    let (mut reopened, metadata) = output_root.open_file(DISCOVERY_NAME)?;
-    if metadata.len() != bytes.len() as u64 {
-        return Err(AcquireError::Bundle);
-    }
-    use std::io::Read as _;
-    let mut observed = Vec::with_capacity(bytes.len());
-    reopened
-        .read_to_end(&mut observed)
-        .map_err(|_| AcquireError::Bundle)?;
-    if observed != bytes {
-        return Err(AcquireError::Bundle);
-    }
+    output_root.verify_file_bytes(DISCOVERY_NAME, &bytes)?;
     output_root.sync()?;
     if !decide_publication() {
         return Err(AcquireError::Cancelled);
@@ -722,7 +711,7 @@ fn valid_sha256(value: &str) -> bool {
 mod tests {
     use std::{
         fs,
-        os::unix::fs::{DirBuilderExt, symlink},
+        os::unix::fs::{DirBuilderExt, PermissionsExt, symlink},
         path::PathBuf,
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
@@ -774,45 +763,114 @@ mod tests {
     ];
 
     #[test]
-    fn discovery_cleanup_stays_on_the_original_root_after_directory_replacement() {
+    fn discovery_publishes_one_verified_read_only_file_atomically() {
         let parent = TempDirectory::new();
         let output = parent.path.join("discovery");
-        let moved = parent.path.join("original");
+        let expected = manifest().canonical_bytes().unwrap();
+        write_discovery(&output, &manifest(), || {
+            assert!(
+                !output.exists(),
+                "final name must stay unpublished while tentative"
+            );
+            true
+        })
+        .unwrap();
+
+        let file = output.join("observed-package-inputs-v1.json");
+        assert_eq!(fs::read(&file).unwrap(), expected);
+        assert_eq!(
+            fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+        assert_eq!(fs::read_dir(&output).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn discovery_rejects_replaced_identity_and_identical_bytes_with_wrong_mode() {
+        for replace_identity in [false, true] {
+            let parent = TempDirectory::new();
+            let output = parent.path.join("discovery");
+            let expected = manifest().canonical_bytes().unwrap();
+            let result = write_discovery(&output, &manifest(), || {
+                let staged = fs::read_dir(&parent.path)
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .find(|entry| {
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with(".catalog-acquire-stage-")
+                    })
+                    .unwrap()
+                    .path()
+                    .join("payload/observed-package-inputs-v1.json");
+                if replace_identity {
+                    fs::rename(&staged, staged.with_extension("original")).unwrap();
+                    fs::write(&staged, &expected).unwrap();
+                    fs::set_permissions(&staged, fs::Permissions::from_mode(0o400)).unwrap();
+                } else {
+                    fs::set_permissions(&staged, fs::Permissions::from_mode(0o600)).unwrap();
+                }
+                true
+            });
+            assert_eq!(result, Err(AcquireError::Bundle));
+            assert!(!output.exists());
+        }
+    }
+
+    #[test]
+    fn discovery_abort_leaves_the_final_output_name_absent() {
+        let parent = TempDirectory::new();
+        let output = parent.path.join("discovery");
+        assert_eq!(
+            write_discovery(&output, &manifest(), || false),
+            Err(AcquireError::Cancelled)
+        );
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn discovery_abort_never_deletes_a_late_final_directory_name() {
+        let parent = TempDirectory::new();
+        let output = parent.path.join("discovery");
         let result = write_discovery(&output, &manifest(), || {
-            fs::rename(&output, &moved).unwrap();
+            assert!(
+                !output.exists(),
+                "final name must stay unpublished while tentative"
+            );
             fs::DirBuilder::new().mode(0o700).create(&output).unwrap();
             fs::write(output.join("sentinel"), b"replacement").unwrap();
             false
         });
         assert_eq!(result, Err(AcquireError::Cancelled));
         assert_eq!(fs::read(output.join("sentinel")).unwrap(), b"replacement");
-        assert_eq!(fs::read_dir(&moved).unwrap().count(), 0);
+        assert!(!output.join("observed-package-inputs-v1.json").exists());
     }
 
     #[test]
-    fn discovery_cleanup_stays_on_the_original_root_after_symlink_replacement() {
+    fn discovery_abort_never_follows_or_deletes_a_late_final_symlink() {
         let parent = TempDirectory::new();
         let output = parent.path.join("discovery");
-        let moved = parent.path.join("original");
         let outside = parent.path.join("outside");
         fs::DirBuilder::new().mode(0o700).create(&outside).unwrap();
         fs::write(outside.join("sentinel"), b"outside").unwrap();
         let result = write_discovery(&output, &manifest(), || {
-            fs::rename(&output, &moved).unwrap();
+            assert!(
+                !output.exists(),
+                "final name must stay unpublished while tentative"
+            );
             symlink(&outside, &output).unwrap();
             false
         });
         assert_eq!(result, Err(AcquireError::Cancelled));
         assert_eq!(fs::read(outside.join("sentinel")).unwrap(), b"outside");
         assert!(!outside.join("observed-package-inputs-v1.json").exists());
-        assert_eq!(fs::read_dir(&moved).unwrap().count(), 0);
     }
 
     #[tokio::test]
-    async fn discovery_cancellation_settles_cleanup_on_the_retained_root() {
+    async fn discovery_cancellation_leaves_final_absent_and_cannot_publish_late() {
         let parent = TempDirectory::new();
         let output = parent.path.join("discovery");
-        let moved = parent.path.join("original");
         let replacement = output.clone();
         let operation_output = output.clone();
         let cancellation = AcquisitionCancellation::new();
@@ -828,7 +886,7 @@ mod tests {
             .await
         });
         reached_rx.await.unwrap();
-        fs::rename(&output, &moved).unwrap();
+        assert!(!output.exists());
         fs::DirBuilder::new()
             .mode(0o700)
             .create(&replacement)
@@ -841,14 +899,13 @@ mod tests {
             fs::read(replacement.join("sentinel")).unwrap(),
             b"replacement"
         );
-        assert_eq!(fs::read_dir(&moved).unwrap().count(), 0);
+        assert!(!replacement.join("observed-package-inputs-v1.json").exists());
     }
 
     #[tokio::test]
     async fn dropping_discovery_future_aborts_and_settles_without_late_publication() {
         let parent = TempDirectory::new();
         let output = parent.path.join("discovery");
-        let moved = parent.path.join("original");
         let outside = parent.path.join("outside");
         fs::DirBuilder::new().mode(0o700).create(&outside).unwrap();
         fs::write(outside.join("sentinel"), b"outside").unwrap();
@@ -868,7 +925,7 @@ mod tests {
             .await
         });
         reached_rx.await.unwrap();
-        fs::rename(&output, &moved).unwrap();
+        assert!(!output.exists());
         symlink(&outside, &output).unwrap();
 
         task.abort();
@@ -880,7 +937,6 @@ mod tests {
 
         assert_eq!(fs::read(outside.join("sentinel")).unwrap(), b"outside");
         assert!(!outside.join("observed-package-inputs-v1.json").exists());
-        assert_eq!(fs::read_dir(&moved).unwrap().count(), 0);
     }
 
     fn manifest() -> PackageInputManifestV1 {

@@ -4,7 +4,7 @@ use std::{
     io::Write,
     os::unix::fs::PermissionsExt,
     path::PathBuf,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use base64::Engine as _;
@@ -73,25 +73,7 @@ fn generated_node_lookalike_cannot_satisfy_the_complete_graph() {
 }
 
 #[test]
-fn graph_rejects_manifest_lock_archive_and_platform_mutations() {
-    let mut fixture = GraphFixture::new();
-    fixture.locked.swap(0, 1);
-    assert!(
-        verify_npm_graph(fixture.request()).is_err(),
-        "archive substitution"
-    );
-
-    let fixture = GraphFixture::new();
-    let mut manifest: Value =
-        serde_json::from_slice(&fixture.inputs.canonical_bytes().unwrap()).unwrap();
-    manifest["root"]["archive_member_count"] = Value::from(999_u64);
-    let mutated =
-        PackageInputManifestV1::from_json(&serde_json::to_vec(&manifest).unwrap()).unwrap();
-    assert!(
-        verify_npm_graph(fixture.request_with_inputs(mutated)).is_err(),
-        "manifest mutation"
-    );
-
+fn package_input_manifest_rejects_invalid_platform_counts() {
     let fixture = GraphFixture::new();
     let mut manifest: Value =
         serde_json::from_slice(&fixture.inputs.canonical_bytes().unwrap()).unwrap();
@@ -485,9 +467,10 @@ fn verified(bytes: Vec<u8>, url: &str, sri_value: Option<&str>) -> VerifiedArchi
     archive
 }
 fn temp_file() -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!("catalog-archive-{}-{nanos}", std::process::id()))
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    std::env::temp_dir().join(format!(
+        "catalog-archive-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ))
 }

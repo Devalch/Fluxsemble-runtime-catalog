@@ -367,6 +367,12 @@ pub fn verify_npm_graph(mut request: NpmGraphRequest) -> Result<VerifiedNpmGraph
     if node_inspection.member_count != 5_780 {
         return Err(AcquireError::Graph);
     }
+    verify_npm_graph_after_node_admission(request)
+}
+
+fn verify_npm_graph_after_node_admission(
+    mut request: NpmGraphRequest,
+) -> Result<VerifiedNpmGraph, AcquireError> {
     let observed = discover_package_inputs(
         &request.intent,
         &mut request.root_archive,
@@ -385,6 +391,13 @@ pub fn verify_npm_graph(mut request: NpmGraphRequest) -> Result<VerifiedNpmGraph
         root_manifest: root.declaration,
         shrinkwrap: root.shrinkwrap.ok_or(AcquireError::Graph)?,
     })
+}
+
+#[cfg(test)]
+fn verify_npm_graph_after_exact_node_for_test(
+    request: NpmGraphRequest,
+) -> Result<VerifiedNpmGraph, AcquireError> {
+    verify_npm_graph_after_node_admission(request)
 }
 
 fn pi_metadata(
@@ -747,5 +760,429 @@ impl<'de> de::Visitor<'de> for NoDuplicateVisitor {
             map.next_value::<NoDuplicates>()?;
         }
         Ok(NoDuplicates)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::BTreeSet,
+        fs,
+        io::Write,
+        os::unix::fs::PermissionsExt,
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    use base64::Engine as _;
+    use flate2::{Compression, write::GzEncoder};
+    use serde_json::{Map, Value, json};
+    use sha2::{Digest, Sha256, Sha512};
+
+    use super::{
+        AcquireError, MISSING_LOCK_INTEGRITY, NpmGraphRequest, PRUNED, PackageInputManifestV1,
+        VerifiedArchive, discover_package_inputs, verify_npm_graph_after_exact_node_for_test,
+    };
+
+    #[test]
+    fn post_exact_node_graph_accepts_root_plus_139_locked_archives() {
+        let graph = verify_npm_graph_after_exact_node_for_test(GraphFixture::new().request())
+            .expect("the admitted exact-Node production graph body");
+        assert_eq!(graph.root_package_count(), 1);
+        assert_eq!(graph.locked_package_count(), 139);
+        assert_eq!(graph.total_archive_count(), 140);
+    }
+
+    #[test]
+    fn post_exact_node_graph_reaches_named_mutation_checks() {
+        let mut archive_substitution = GraphFixture::new();
+        archive_substitution.locked.swap(0, 1);
+        assert_graph_rejected(archive_substitution.request(), "archive substitution");
+
+        let fixture = GraphFixture::new();
+        let mut manifest: Value =
+            serde_json::from_slice(&fixture.inputs.canonical_bytes().unwrap()).unwrap();
+        manifest["root"]["archive_member_count"] = Value::from(999_u64);
+        let manifest =
+            PackageInputManifestV1::from_json(&serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert_graph_rejected(fixture.request_with_inputs(manifest), "manifest binding");
+
+        let baseline_inputs = GraphFixture::new().inputs;
+        for (mutation, label) in [
+            (GraphMutation::LockSwap, "lock swap"),
+            (GraphMutation::MissingClosure, "complete closure"),
+            (
+                GraphMutation::InapplicableRequiredPackage,
+                "platform applicability",
+            ),
+        ] {
+            assert_graph_rejected(
+                GraphFixture::mutated(mutation, baseline_inputs.clone()).request(),
+                label,
+            );
+        }
+    }
+
+    fn assert_graph_rejected(request: NpmGraphRequest, label: &str) {
+        assert!(
+            matches!(
+                verify_npm_graph_after_exact_node_for_test(request),
+                Err(AcquireError::Graph)
+            ),
+            "{label} did not reach its post-Node graph rejection"
+        );
+    }
+
+    #[derive(Clone, Copy)]
+    enum GraphMutation {
+        LockSwap,
+        MissingClosure,
+        InapplicableRequiredPackage,
+    }
+
+    struct GraphFixture {
+        intent: catalog_core::InitialPiReleaseIntentV1,
+        node: VerifiedArchive,
+        root: VerifiedArchive,
+        locked: Vec<VerifiedArchive>,
+        inputs: PackageInputManifestV1,
+    }
+
+    impl GraphFixture {
+        fn new() -> Self {
+            Self::build(None, None)
+        }
+
+        fn mutated(mutation: GraphMutation, inputs: PackageInputManifestV1) -> Self {
+            Self::build(Some(mutation), Some(inputs))
+        }
+
+        fn build(
+            mutation: Option<GraphMutation>,
+            supplied_inputs: Option<PackageInputManifestV1>,
+        ) -> Self {
+            let mut locators = BTreeSet::new();
+            locators.extend(PRUNED.iter().map(|(locator, _)| (*locator).to_owned()));
+            locators.extend(
+                MISSING_LOCK_INTEGRITY
+                    .iter()
+                    .map(|locator| (*locator).to_owned()),
+            );
+            let mut index = 0;
+            while locators.len() < 139 {
+                locators.insert(format!("node_modules/package-{index:03}"));
+                index += 1;
+            }
+
+            let mut locked = Vec::new();
+            let mut locked_records = Vec::new();
+            let mut lock_packages = Map::new();
+            lock_packages.insert(
+                "".into(),
+                json!({"name":"@earendil-works/pi-coding-agent","version":"0.83.0"}),
+            );
+            for locator in locators {
+                let name = locator.rsplit("node_modules/").next().unwrap().to_owned();
+                let mut declaration = Map::from_iter([
+                    ("name".into(), Value::String(name.clone())),
+                    ("version".into(), Value::String("1.0.0".into())),
+                ]);
+                declaration.extend(selectors(&locator, "declaration"));
+                if matches!(mutation, Some(GraphMutation::InapplicableRequiredPackage))
+                    && locator == "node_modules/package-000"
+                {
+                    declaration.insert("os".into(), Value::String("darwin".into()));
+                }
+                let declaration = serde_json::to_vec(&Value::Object(declaration)).unwrap();
+                let bytes = gzip(&tar(&[TarEntry::file(
+                    "package/package.json",
+                    &declaration,
+                )]));
+                let digest = sha256(&bytes);
+                let integrity = sri(&bytes);
+                let encoded_name = name.replace('@', "").replace('/', "-");
+                let url =
+                    format!("https://registry.npmjs.org/{encoded_name}/-/{encoded_name}-1.0.0.tgz");
+                let mut lock = Map::from_iter([
+                    ("version".into(), Value::String("1.0.0".into())),
+                    ("resolved".into(), Value::String(url.clone())),
+                ]);
+                if !MISSING_LOCK_INTEGRITY.contains(&locator.as_str()) {
+                    lock.insert("integrity".into(), Value::String(integrity.clone()));
+                }
+                lock.extend(selectors(&locator, "lock"));
+                if PRUNED.iter().any(|(expected, _)| *expected == locator) {
+                    lock.insert("optional".into(), Value::Bool(true));
+                }
+                lock_packages.insert(locator.clone(), Value::Object(lock));
+                locked_records.push(json!({
+                    "locator": locator,
+                    "name": name,
+                    "version": "1.0.0",
+                    "resolved_url": url,
+                    "registry_integrity": integrity,
+                    "archive_sha256": digest,
+                }));
+                locked.push(verified(bytes, &url, Some(&integrity)));
+            }
+
+            if matches!(mutation, Some(GraphMutation::LockSwap)) {
+                lock_packages["node_modules/package-000"]["resolved"] = Value::String(
+                    "https://registry.npmjs.org/package-001/-/package-001-1.0.0.tgz".into(),
+                );
+            }
+            if matches!(mutation, Some(GraphMutation::MissingClosure)) {
+                lock_packages[""]["dependencies"] = json!({"not-in-the-lock":"1.0.0"});
+            }
+
+            let root_manifest = serde_json::to_vec(&json!({
+                "name":"@earendil-works/pi-coding-agent",
+                "version":"0.83.0",
+                "bin":{"pi":"dist/cli.js"}
+            }))
+            .unwrap();
+            let shrinkwrap = serde_json::to_vec(&json!({
+                "name":"@earendil-works/pi-coding-agent",
+                "version":"0.83.0",
+                "lockfileVersion":3,
+                "requires":true,
+                "packages":lock_packages
+            }))
+            .unwrap();
+            let root_bytes = gzip(&tar(&[
+                TarEntry::file("package/package.json", &root_manifest),
+                TarEntry::file("package/npm-shrinkwrap.json", &shrinkwrap),
+                TarEntry::file("package/dist/cli.js", b"entry"),
+            ]));
+            let root_digest = sha256(&root_bytes);
+            let root_integrity = sri(&root_bytes);
+            let node_bytes = b"test-only exact-Node admission marker".to_vec();
+            let node_digest = sha256(&node_bytes);
+            let intent_json = json!({
+                "sequence":"1",
+                "tag":"catalog-v1-sequence-1",
+                "generated_at":"2026-08-26T00:00:00Z",
+                "expires_at":"2026-09-26T00:00:00Z",
+                "fluxsemble_requirement":"=0.1.0",
+                "release":{
+                    "provider":"builtin:pi",
+                    "allowed_origins":["https://nodejs.org","https://registry.npmjs.org"],
+                    "release":{
+                        "version":"0.83.0",
+                        "target":"linux_x86_64",
+                        "compatibility_ranges":["=0.1.0"],
+                        "release_metadata":{"title":"Pi","notes":"fixture"},
+                        "components":[
+                            {
+                                "component_id":"component:node",
+                                "version":"22.19.0",
+                                "artifacts":[{
+                                    "artifact_id":"artifact:node",
+                                    "url":"https://nodejs.org/dist/v22.19.0/node-v22.19.0-linux-x64.tar.xz",
+                                    "size_bytes":node_bytes.len().to_string(),
+                                    "sha256":node_digest,
+                                    "inventory":[]
+                                }]
+                            },
+                            {
+                                "component_id":"component:pi",
+                                "version":"0.83.0",
+                                "artifacts":[{
+                                    "artifact_id":"artifact:pi",
+                                    "url":"https://registry.npmjs.org/pi/-/pi-0.83.0.tgz",
+                                    "size_bytes":root_bytes.len().to_string(),
+                                    "sha256":root_digest,
+                                    "inventory":[{
+                                        "path":"dist/cli.js",
+                                        "size_bytes":"5",
+                                        "sha256":sha256(b"entry")
+                                    }]
+                                }]
+                            }
+                        ],
+                        "provider_extension":{
+                            "kind":"pi",
+                            "metadata":{
+                                "approved_package":{
+                                    "name":"@earendil-works/pi-coding-agent",
+                                    "version":"0.83.0"
+                                },
+                                "expected_entrypoint":"dist/cli.js",
+                                "component_id":"component:pi",
+                                "package_artifact_id":"artifact:pi",
+                                "registry_integrity":root_integrity,
+                                "root_package_manifest":{
+                                    "url":"https://registry.npmjs.org/support/package.json",
+                                    "size_bytes":root_manifest.len().to_string(),
+                                    "sha256":sha256(&root_manifest)
+                                },
+                                "shipped_shrinkwrap":{
+                                    "lockfile_version":3,
+                                    "root_package":{
+                                        "name":"@earendil-works/pi-coding-agent",
+                                        "version":"0.83.0"
+                                    },
+                                    "artifact":{
+                                        "url":"https://registry.npmjs.org/support/npm-shrinkwrap.json",
+                                        "size_bytes":shrinkwrap.len().to_string(),
+                                        "sha256":sha256(&shrinkwrap)
+                                    },
+                                    "locked_packages":locked_records
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+            let intent = catalog_core::InitialPiReleaseIntentV1::from_json(
+                &serde_json::to_vec(&intent_json).unwrap(),
+            )
+            .unwrap();
+            let mut root = verified(
+                root_bytes,
+                "https://registry.npmjs.org/pi/-/pi-0.83.0.tgz",
+                Some(&root_integrity),
+            );
+            let mut locked_for_graph = locked;
+            let inputs = match supplied_inputs {
+                Some(inputs) => inputs,
+                None => discover_package_inputs(&intent, &mut root, &mut locked_for_graph).unwrap(),
+            };
+            Self {
+                intent,
+                node: verified(
+                    node_bytes,
+                    "https://nodejs.org/dist/v22.19.0/node-v22.19.0-linux-x64.tar.xz",
+                    None,
+                ),
+                root,
+                locked: locked_for_graph,
+                inputs,
+            }
+        }
+
+        fn request(self) -> NpmGraphRequest {
+            let inputs = self.inputs.clone();
+            self.request_with_inputs(inputs)
+        }
+
+        fn request_with_inputs(self, package_inputs: PackageInputManifestV1) -> NpmGraphRequest {
+            NpmGraphRequest {
+                intent: self.intent,
+                node_archive: self.node,
+                root_archive: self.root,
+                locked_archives: self.locked,
+                package_inputs,
+            }
+        }
+    }
+
+    fn selectors(locator: &str, source: &str) -> Map<String, Value> {
+        let mut result = Map::new();
+        let Some((_, reasons)) = PRUNED.iter().find(|(expected, _)| *expected == locator) else {
+            return result;
+        };
+        for reason in *reasons {
+            let Some(field) = reason.strip_prefix(&format!("{source}.")) else {
+                continue;
+            };
+            let value = match field {
+                "os" => "darwin",
+                "cpu" => "arm64",
+                "libc" => "musl",
+                _ => unreachable!(),
+            };
+            result.insert(field.into(), Value::String(value.into()));
+        }
+        result
+    }
+
+    struct TarEntry {
+        path: String,
+        data: Vec<u8>,
+    }
+
+    impl TarEntry {
+        fn file(path: &str, data: &[u8]) -> Self {
+            Self {
+                path: path.into(),
+                data: data.into(),
+            }
+        }
+    }
+
+    fn tar(entries: &[TarEntry]) -> Vec<u8> {
+        let mut output = Vec::new();
+        for entry in entries {
+            let mut header = [0_u8; 512];
+            let bytes = entry.path.as_bytes();
+            header[..bytes.len()].copy_from_slice(bytes);
+            write_octal(&mut header[100..108], 0o644);
+            write_octal(&mut header[108..116], 0);
+            write_octal(&mut header[116..124], 0);
+            write_octal(&mut header[124..136], entry.data.len() as u64);
+            write_octal(&mut header[136..148], 0);
+            header[148..156].fill(b' ');
+            header[156] = b'0';
+            header[257..263].copy_from_slice(b"ustar\0");
+            header[263..265].copy_from_slice(b"00");
+            let checksum = header.iter().map(|byte| u64::from(*byte)).sum::<u64>();
+            header[148..156].copy_from_slice(format!("{checksum:06o}\0 ").as_bytes());
+            output.extend_from_slice(&header);
+            output.extend_from_slice(&entry.data);
+            output.resize(output.len().div_ceil(512) * 512, 0);
+        }
+        output.resize(output.len() + 1024, 0);
+        output
+    }
+
+    fn write_octal(field: &mut [u8], value: u64) {
+        let width = field.len() - 1;
+        field.fill(0);
+        let text = format!("{value:0width$o}");
+        field[..width].copy_from_slice(text.as_bytes());
+    }
+
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        let mut output = GzEncoder::new(Vec::new(), Compression::default());
+        output.write_all(bytes).unwrap();
+        output.finish().unwrap()
+    }
+
+    fn sha256(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    fn sri(bytes: &[u8]) -> String {
+        format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode(Sha512::digest(bytes))
+        )
+    }
+
+    fn verified(bytes: Vec<u8>, url: &str, sri_value: Option<&str>) -> VerifiedArchive {
+        let path = temp_file();
+        fs::write(&path, &bytes).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+        let file = fs::File::open(&path).unwrap();
+        let archive = VerifiedArchive::verify(
+            file,
+            url.into(),
+            bytes.len() as u64,
+            sha256(&bytes),
+            sri_value.map(str::to_owned),
+        )
+        .unwrap();
+        fs::remove_file(path).unwrap();
+        archive
+    }
+
+    fn temp_file() -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        std::env::temp_dir().join(format!(
+            "catalog-npm-graph-unit-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
     }
 }

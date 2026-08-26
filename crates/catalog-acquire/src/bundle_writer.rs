@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    ffi::CString,
+    ffi::{CStr, CString},
     fs,
     io::{Read, Seek, SeekFrom, Write},
     os::{
@@ -10,7 +10,7 @@ use std::{
             fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
         },
     },
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 use catalog_core::{InputSourceKind, VerifiedInputBundleV1, verified_input_bundle_digest};
@@ -169,68 +169,118 @@ impl FileIdentity {
     }
 }
 
+struct RetainedTransferDirectory {
+    identity: FileIdentity,
+    names: BTreeSet<String>,
+    file: fs::File,
+}
+
+struct EnumeratedTransferTree {
+    root_names: BTreeSet<String>,
+    entries: BTreeSet<String>,
+    directories: BTreeMap<String, RetainedTransferDirectory>,
+}
+
+impl EnumeratedTransferTree {
+    fn parent_and_name<'a>(
+        &'a self,
+        root: &'a fs::File,
+        relative: &'a str,
+    ) -> Result<(&'a fs::File, &'a str), AcquireError> {
+        let (directory, name) = split_output_relative(relative)?;
+        match directory {
+            None => Ok((root, name)),
+            Some(directory) => self
+                .directories
+                .get(directory)
+                .map(|retained| (&retained.file, name))
+                .ok_or(AcquireError::Bundle),
+        }
+    }
+
+    fn revalidate(&self, root: &fs::File) -> Result<(), AcquireError> {
+        if enumerate_names(root)? != self.root_names {
+            return Err(AcquireError::Bundle);
+        }
+        for (name, retained) in &self.directories {
+            let name_c = CString::new(name.as_str()).map_err(|_| AcquireError::Bundle)?;
+            verify_named_directory(root, &name_c, &retained.file, retained.identity, 2)?;
+            if enumerate_names(&retained.file)? != retained.names {
+                return Err(AcquireError::Bundle);
+            }
+        }
+        Ok(())
+    }
+}
+
+struct TrackedDirectory {
+    identity: FileIdentity,
+    file: fs::File,
+}
+
 struct TrackedOutputFile {
     directory: Option<String>,
     name: String,
     identity: FileIdentity,
-    _file: fs::File,
+    size: u64,
+    sha256: String,
+    file: fs::File,
 }
 
-/// A fresh output namespace retained as directory capabilities for its complete lifetime.
+/// An unpublished payload retained beneath one owner-private staging container.
 ///
-/// Failure cleanup deliberately leaves the owner-private root in place: Linux has no atomic
-/// unlink-by-directory-fd operation that can prove a pathname still names this exact directory.
+/// Staging is intentionally never deleted. The only output namespace mutation after creation is
+/// the one-shot, no-clobber rename of `payload` from the retained container descriptor.
 pub(crate) struct OutputRoot {
     parent: fs::File,
-    name: CString,
-    root: fs::File,
-    identity: FileIdentity,
-    directories: BTreeMap<String, fs::File>,
-    files: Vec<TrackedOutputFile>,
-    committed: bool,
+    final_name: CString,
+    container_name: CString,
+    container: fs::File,
+    container_identity: FileIdentity,
+    payload: fs::File,
+    payload_identity: FileIdentity,
+    directories: BTreeMap<String, TrackedDirectory>,
+    files: BTreeMap<String, TrackedOutputFile>,
+    published: bool,
 }
 
 impl OutputRoot {
     pub(crate) fn create(path: &Path) -> Result<Self, AcquireError> {
-        Self::create_with_policy(path, false)
-    }
-
-    pub(crate) fn create_new(path: &Path) -> Result<Self, AcquireError> {
-        Self::create_with_policy(path, true)
-    }
-
-    fn create_with_policy(path: &Path, require_absent: bool) -> Result<Self, AcquireError> {
-        let (parent, name) = open_output_parent(path)?;
-        let root = match open_directory_at(&parent, &name) {
-            Ok(root) => {
-                let metadata = root.metadata().map_err(|_| AcquireError::Bundle)?;
-                if require_absent || !secure_directory(&metadata) || !directory_is_empty(&root)? {
-                    return Err(AcquireError::Bundle);
-                }
-                root
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                // SAFETY: parent and NUL-terminated name are retained and mode is owner-private.
-                if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
-                    return Err(AcquireError::Bundle);
-                }
-                parent.sync_all().map_err(|_| AcquireError::Bundle)?;
-                open_directory_at(&parent, &name).map_err(|_| AcquireError::Bundle)?
-            }
-            Err(_) => return Err(AcquireError::Bundle),
-        };
-        let metadata = root.metadata().map_err(|_| AcquireError::Bundle)?;
-        if !secure_directory(&metadata) {
+        let (parent, final_name) = open_output_parent(path)?;
+        let parent_metadata = parent.metadata().map_err(|_| AcquireError::Bundle)?;
+        if !secure_directory(&parent_metadata) || name_exists_at(&parent, &final_name)? {
             return Err(AcquireError::Bundle);
         }
+
+        let (container_name, container) = create_staging_container(&parent)?;
+        let container_metadata = container.metadata().map_err(|_| AcquireError::Bundle)?;
+        if !secure_directory(&container_metadata) || container_metadata.nlink() != 2 {
+            return Err(AcquireError::Bundle);
+        }
+        let payload_name = CString::new("payload").expect("fixed output payload name");
+        // SAFETY: the retained container and fixed NUL-terminated name are valid.
+        if unsafe { libc::mkdirat(container.as_raw_fd(), payload_name.as_ptr(), 0o700) } != 0 {
+            return Err(AcquireError::Bundle);
+        }
+        let payload =
+            open_directory_at(&container, &payload_name).map_err(|_| AcquireError::Bundle)?;
+        let payload_metadata = payload.metadata().map_err(|_| AcquireError::Bundle)?;
+        if !secure_directory(&payload_metadata) || payload_metadata.nlink() != 2 {
+            return Err(AcquireError::Bundle);
+        }
+        container.sync_all().map_err(|_| AcquireError::Bundle)?;
+
         Ok(Self {
             parent,
-            name,
-            identity: FileIdentity::from_metadata(&metadata),
-            root,
+            final_name,
+            container_name,
+            container_identity: FileIdentity::from_metadata(&container_metadata),
+            container,
+            payload_identity: FileIdentity::from_metadata(&payload_metadata),
+            payload,
             directories: BTreeMap::new(),
-            files: Vec::new(),
-            committed: false,
+            files: BTreeMap::new(),
+            published: false,
         })
     }
 
@@ -239,24 +289,32 @@ impl OutputRoot {
             return Err(AcquireError::Bundle);
         }
         let name_c = CString::new(name).map_err(|_| AcquireError::Bundle)?;
-        // SAFETY: root and NUL-terminated name are valid and mode is owner-private.
-        if unsafe { libc::mkdirat(self.root.as_raw_fd(), name_c.as_ptr(), 0o700) } != 0 {
+        // SAFETY: payload and NUL-terminated name are valid and mode is owner-private.
+        if unsafe { libc::mkdirat(self.payload.as_raw_fd(), name_c.as_ptr(), 0o700) } != 0 {
             return Err(AcquireError::Bundle);
         }
-        let directory = open_directory_at(&self.root, &name_c).map_err(|_| AcquireError::Bundle)?;
-        if !secure_directory(&directory.metadata().map_err(|_| AcquireError::Bundle)?) {
+        let directory =
+            open_directory_at(&self.payload, &name_c).map_err(|_| AcquireError::Bundle)?;
+        let metadata = directory.metadata().map_err(|_| AcquireError::Bundle)?;
+        if !secure_directory(&metadata) || metadata.nlink() != 2 {
             return Err(AcquireError::Bundle);
         }
-        self.root.sync_all().map_err(|_| AcquireError::Bundle)?;
-        self.directories.insert(name.to_owned(), directory);
+        self.payload.sync_all().map_err(|_| AcquireError::Bundle)?;
+        self.directories.insert(
+            name.to_owned(),
+            TrackedDirectory {
+                identity: FileIdentity::from_metadata(&metadata),
+                file: directory,
+            },
+        );
         Ok(())
     }
 
     pub(crate) fn write_file(&mut self, relative: &str, bytes: &[u8]) -> Result<(), AcquireError> {
         let digest = sha256(bytes);
-        let mut file = self.create_file(relative)?;
+        let (mut file, identity) = self.create_file(relative)?;
         file.write_all(bytes).map_err(|_| AcquireError::Bundle)?;
-        self.settle_file(relative, file, bytes.len() as u64, &digest)
+        self.settle_file(relative, file, identity, bytes.len() as u64, &digest)
     }
 
     fn copy_file(
@@ -269,7 +327,7 @@ impl OutputRoot {
         source
             .seek(SeekFrom::Start(0))
             .map_err(|_| AcquireError::Bundle)?;
-        let mut target = self.create_file(relative)?;
+        let (mut target, identity) = self.create_file(relative)?;
         let copied = std::io::copy(source, &mut target).map_err(|_| AcquireError::Bundle)?;
         source
             .seek(SeekFrom::Start(0))
@@ -277,166 +335,207 @@ impl OutputRoot {
         if copied != size {
             return Err(AcquireError::Bundle);
         }
-        self.settle_file(relative, target, size, digest)
+        self.settle_file(relative, target, identity, size, digest)
     }
 
-    fn create_file(&mut self, relative: &str) -> Result<fs::File, AcquireError> {
+    fn create_file(&self, relative: &str) -> Result<(fs::File, FileIdentity), AcquireError> {
+        if self.files.contains_key(relative) {
+            return Err(AcquireError::Bundle);
+        }
         let (directory, name) = split_output_relative(relative)?;
-        let parent = self.directory(directory)?;
         let file = open_component(
-            parent,
+            self.directory(directory)?,
             name,
             libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
             0o600,
         )
         .map_err(|_| AcquireError::Bundle)?;
-        let tracked = file.try_clone().map_err(|_| AcquireError::Bundle)?;
         let identity =
-            FileIdentity::from_metadata(&tracked.metadata().map_err(|_| AcquireError::Bundle)?);
-        self.files.push(TrackedOutputFile {
-            directory: directory.map(str::to_owned),
-            name: name.to_owned(),
-            identity,
-            _file: tracked,
-        });
-        Ok(file)
+            FileIdentity::from_metadata(&file.metadata().map_err(|_| AcquireError::Bundle)?);
+        Ok((file, identity))
     }
 
     fn settle_file(
-        &self,
+        &mut self,
         relative: &str,
         mut file: fs::File,
+        identity: FileIdentity,
         size: u64,
         digest: &str,
     ) -> Result<(), AcquireError> {
         file.flush().map_err(|_| AcquireError::Bundle)?;
-        file.sync_all().map_err(|_| AcquireError::Bundle)?;
         file.set_permissions(fs::Permissions::from_mode(0o400))
             .map_err(|_| AcquireError::Bundle)?;
         file.sync_all().map_err(|_| AcquireError::Bundle)?;
-        let identity =
-            FileIdentity::from_metadata(&file.metadata().map_err(|_| AcquireError::Bundle)?);
-        drop(file);
-        let directory = split_output_relative(relative)?.0;
+        let (directory, name) = split_output_relative(relative)?;
         self.directory(directory)?
             .sync_all()
             .map_err(|_| AcquireError::Bundle)?;
-        let (file, metadata) = self.open_file(relative)?;
-        if FileIdentity::from_metadata(&metadata) != identity {
+        let metadata = file.metadata().map_err(|_| AcquireError::Bundle)?;
+        if FileIdentity::from_metadata(&metadata) != identity
+            || !secure_file(&metadata)
+            || metadata.len() != size
+        {
             return Err(AcquireError::Bundle);
         }
-        let entry = entry(relative, size, digest);
-        let name = split_output_relative(relative)?.1;
-        let _ = verify_open_file_from(self.directory(directory)?, name, file, &entry)?;
+        let tracked = TrackedOutputFile {
+            directory: directory.map(str::to_owned),
+            name: name.to_owned(),
+            identity,
+            size,
+            sha256: digest.to_owned(),
+            file,
+        };
+        verify_tracked_file(self.directory(directory)?, &tracked)?;
+        self.files.insert(relative.to_owned(), tracked);
         Ok(())
     }
 
-    pub(crate) fn open_file(
+    pub(crate) fn verify_file_bytes(
         &self,
         relative: &str,
-    ) -> Result<(fs::File, fs::Metadata), AcquireError> {
-        let (directory, name) = split_output_relative(relative)?;
-        let file = open_component(
-            self.directory(directory)?,
-            name,
-            libc::O_RDONLY | libc::O_CLOEXEC,
-            0,
-        )
-        .map_err(|_| AcquireError::Bundle)?;
-        let metadata = file.metadata().map_err(|_| AcquireError::Bundle)?;
-        Ok((file, metadata))
+        expected: &[u8],
+    ) -> Result<(), AcquireError> {
+        let tracked = self.files.get(relative).ok_or(AcquireError::Bundle)?;
+        let parent = self.directory(tracked.directory.as_deref())?;
+        verify_tracked_file(parent, tracked)?;
+        let mut file = tracked.file.try_clone().map_err(|_| AcquireError::Bundle)?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|_| AcquireError::Bundle)?;
+        let mut actual = Vec::with_capacity(expected.len());
+        file.take(expected.len() as u64 + 1)
+            .read_to_end(&mut actual)
+            .map_err(|_| AcquireError::Bundle)?;
+        if actual != expected {
+            return Err(AcquireError::Bundle);
+        }
+        Ok(())
     }
 
     fn directory(&self, name: Option<&str>) -> Result<&fs::File, AcquireError> {
         match name {
-            None => Ok(&self.root),
-            Some(name) => self.directories.get(name).ok_or(AcquireError::Bundle),
+            None => Ok(&self.payload),
+            Some(name) => self
+                .directories
+                .get(name)
+                .map(|directory| &directory.file)
+                .ok_or(AcquireError::Bundle),
         }
     }
 
     pub(crate) fn sync(&self) -> Result<(), AcquireError> {
-        for directory in self.directories.values() {
-            directory.sync_all().map_err(|_| AcquireError::Bundle)?;
+        for tracked in self.files.values() {
+            tracked.file.sync_all().map_err(|_| AcquireError::Bundle)?;
         }
-        self.root.sync_all().map_err(|_| AcquireError::Bundle)
+        for directory in self.directories.values() {
+            directory
+                .file
+                .sync_all()
+                .map_err(|_| AcquireError::Bundle)?;
+        }
+        self.payload.sync_all().map_err(|_| AcquireError::Bundle)?;
+        self.container
+            .sync_all()
+            .map_err(|_| AcquireError::Bundle)?;
+        self.parent.sync_all().map_err(|_| AcquireError::Bundle)
     }
 
     fn cloned_root(&self) -> Result<fs::File, AcquireError> {
-        self.root.try_clone().map_err(|_| AcquireError::Bundle)
+        self.payload.try_clone().map_err(|_| AcquireError::Bundle)
     }
 
     fn identity(&self) -> FileIdentity {
-        self.identity
+        self.payload_identity
+    }
+
+    fn verify_tracked_tree(&self) -> Result<(), AcquireError> {
+        let parent_metadata = self.parent.metadata().map_err(|_| AcquireError::Bundle)?;
+        if !secure_directory(&parent_metadata) {
+            return Err(AcquireError::Bundle);
+        }
+        verify_named_directory(
+            &self.parent,
+            &self.container_name,
+            &self.container,
+            self.container_identity,
+            3,
+        )?;
+        if enumerate_names(&self.container)? != BTreeSet::from(["payload".to_owned()]) {
+            return Err(AcquireError::Bundle);
+        }
+
+        let payload_name = CString::new("payload").expect("fixed output payload name");
+        verify_named_directory(
+            &self.container,
+            &payload_name,
+            &self.payload,
+            self.payload_identity,
+            2 + self.directories.len() as u64,
+        )?;
+        let expected_payload = self
+            .directories
+            .keys()
+            .cloned()
+            .chain(
+                self.files
+                    .values()
+                    .filter(|file| file.directory.is_none())
+                    .map(|file| file.name.clone()),
+            )
+            .collect::<BTreeSet<_>>();
+        if enumerate_names(&self.payload)? != expected_payload {
+            return Err(AcquireError::Bundle);
+        }
+
+        for (name, directory) in &self.directories {
+            let name_c = CString::new(name.as_str()).map_err(|_| AcquireError::Bundle)?;
+            verify_named_directory(
+                &self.payload,
+                &name_c,
+                &directory.file,
+                directory.identity,
+                2,
+            )?;
+            let expected = self
+                .files
+                .values()
+                .filter(|file| file.directory.as_deref() == Some(name.as_str()))
+                .map(|file| file.name.clone())
+                .collect::<BTreeSet<_>>();
+            if enumerate_names(&directory.file)? != expected {
+                return Err(AcquireError::Bundle);
+            }
+        }
+        for tracked in self.files.values() {
+            verify_tracked_file(self.directory(tracked.directory.as_deref())?, tracked)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn commit(&mut self) -> Result<(), AcquireError> {
-        let named =
-            open_directory_at(&self.parent, &self.name).map_err(|_| AcquireError::Bundle)?;
-        if FileIdentity::from_metadata(&named.metadata().map_err(|_| AcquireError::Bundle)?)
-            != self.identity
-        {
+        if self.published {
             return Err(AcquireError::Bundle);
         }
-        self.committed = true;
-        Ok(())
-    }
-}
-
-impl Drop for OutputRoot {
-    fn drop(&mut self) {
-        if self.committed {
-            return;
+        self.sync()?;
+        self.verify_tracked_tree()?;
+        let payload_name = CString::new("payload").expect("fixed output payload name");
+        // SAFETY: both retained directory descriptors and NUL-terminated names are valid. The
+        // no-replace flag makes this syscall the sole publication linearization point.
+        let renamed = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                self.container.as_raw_fd(),
+                payload_name.as_ptr(),
+                self.parent.as_raw_fd(),
+                self.final_name.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if renamed != 0 {
+            return Err(AcquireError::Bundle);
         }
-        for tracked in self.files.iter().rev() {
-            let parent = match tracked.directory.as_deref() {
-                Some(name) => self.directories.get(name),
-                None => Some(&self.root),
-            };
-            let Some(parent) = parent else {
-                continue;
-            };
-            let Ok(name) = CString::new(tracked.name.as_str()) else {
-                continue;
-            };
-            let Ok(candidate) =
-                open_component(parent, &tracked.name, libc::O_RDONLY | libc::O_CLOEXEC, 0)
-            else {
-                continue;
-            };
-            let Ok(metadata) = candidate.metadata() else {
-                continue;
-            };
-            if FileIdentity::from_metadata(&metadata) != tracked.identity {
-                continue;
-            }
-            // SAFETY: deletion is relative to the retained original directory capability.
-            let _ = unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) };
-        }
-        for (name, directory) in self.directories.iter().rev() {
-            let _ = directory.sync_all();
-            let Ok(name_c) = CString::new(name.as_str()) else {
-                continue;
-            };
-            let Ok(named) = open_directory_at(&self.root, &name_c) else {
-                continue;
-            };
-            let Ok(retained_metadata) = directory.metadata() else {
-                continue;
-            };
-            let Ok(named_metadata) = named.metadata() else {
-                continue;
-            };
-            if FileIdentity::from_metadata(&retained_metadata)
-                != FileIdentity::from_metadata(&named_metadata)
-            {
-                continue;
-            }
-            // SAFETY: removal is relative to the retained original root and never recurses.
-            let _ = unsafe {
-                libc::unlinkat(self.root.as_raw_fd(), name_c.as_ptr(), libc::AT_REMOVEDIR)
-            };
-        }
-        let _ = self.root.sync_all();
+        self.published = true;
+        self.parent.sync_all().map_err(|_| AcquireError::Bundle)
     }
 }
 
@@ -555,36 +654,52 @@ pub fn verify_transferred_bundle(path: &Path) -> Result<VerifiedTransferredBundl
 fn verify_transferred_bundle_root(
     root: fs::File,
 ) -> Result<VerifiedTransferredBundle, AcquireError> {
-    let (manifest_file, manifest_metadata) = open_relative(&root, TRANSFER_MANIFEST_NAME)?;
+    let mut manifest_file = open_component(
+        &root,
+        TRANSFER_MANIFEST_NAME,
+        libc::O_RDONLY | libc::O_CLOEXEC,
+        0,
+    )
+    .map_err(|_| AcquireError::Bundle)?;
+    let manifest_metadata = manifest_file.metadata().map_err(|_| AcquireError::Bundle)?;
     if !secure_file(&manifest_metadata) || manifest_metadata.len() > MAX_MANIFEST_BYTES {
         return Err(AcquireError::Bundle);
     }
-    let manifest_bytes = read_exact_file(manifest_file, manifest_metadata.len(), None)?;
+    let manifest_bytes = read_exact_file(
+        manifest_file
+            .try_clone()
+            .map_err(|_| AcquireError::Bundle)?,
+        manifest_metadata.len(),
+        None,
+    )?;
     let manifest: TransferManifestV1 =
         serde_json::from_slice(&manifest_bytes).map_err(|_| AcquireError::Bundle)?;
     if serde_jcs::to_vec(&manifest).map_err(|_| AcquireError::Bundle)? != manifest_bytes {
         return Err(AcquireError::Bundle);
     }
     validate_manifest(&manifest)?;
-    let actual = enumerate_tree(&root)?;
+    let tree = enumerate_tree(&root)?;
     let expected = manifest
         .entries
         .iter()
         .map(|entry| entry.relative_path.clone())
         .chain(std::iter::once(TRANSFER_MANIFEST_NAME.to_owned()))
         .collect::<BTreeSet<_>>();
-    if actual != expected {
+    if tree.entries != expected {
         return Err(AcquireError::Bundle);
     }
 
     let mut files = Vec::with_capacity(manifest.entries.len());
     let mut total = 0_u64;
     for entry in &manifest.entries {
-        let (file, metadata) = open_relative(&root, &entry.relative_path)?;
+        let (parent, name) = tree.parent_and_name(&root, &entry.relative_path)?;
+        let file = open_component(parent, name, libc::O_RDONLY | libc::O_CLOEXEC, 0)
+            .map_err(|_| AcquireError::Bundle)?;
+        let metadata = file.metadata().map_err(|_| AcquireError::Bundle)?;
         if !secure_file(&metadata) || metadata.len() != entry.size {
             return Err(AcquireError::Bundle);
         }
-        let file = verify_open_file(&root, &entry.relative_path, file, entry)?;
+        let file = verify_open_file(parent, name, file, entry)?;
         total = total.checked_add(entry.size).ok_or(AcquireError::Bundle)?;
         files.push((entry.clone(), file));
     }
@@ -649,6 +764,27 @@ fn verify_transferred_bundle_root(
             return Err(AcquireError::Bundle);
         }
     }
+    for (entry, file) in &mut files {
+        let (parent, name) = tree.parent_and_name(&root, &entry.relative_path)?;
+        let retained = file.try_clone().map_err(|_| AcquireError::Bundle)?;
+        *file = verify_open_file(parent, name, retained, entry)?;
+    }
+    let manifest_entry = entry(
+        TRANSFER_MANIFEST_NAME,
+        manifest_metadata.len(),
+        &sha256(&manifest_bytes),
+    );
+    manifest_file = verify_open_file(
+        &root,
+        TRANSFER_MANIFEST_NAME,
+        manifest_file,
+        &manifest_entry,
+    )?;
+    manifest_file
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| AcquireError::Bundle)?;
+    tree.revalidate(&root)?;
+
     let object_count = verified_input.objects().len();
     let bundle_sha256 = sha256(&manifest_bytes);
     Ok(VerifiedTransferredBundle {
@@ -802,12 +938,103 @@ fn open_directory_at(parent: &fs::File, name: &CString) -> std::io::Result<fs::F
     )
 }
 
-fn directory_is_empty(directory: &fs::File) -> Result<bool, AcquireError> {
-    let proc_path = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
-    Ok(fs::read_dir(proc_path)
-        .map_err(|_| AcquireError::Bundle)?
-        .next()
-        .is_none())
+fn name_exists_at(parent: &fs::File, name: &CString) -> Result<bool, AcquireError> {
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: the retained descriptor, NUL-terminated name, and output pointer are valid.
+    let result = unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            metadata.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result == 0 {
+        return Ok(true);
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::ENOENT) => Ok(false),
+        _ => Err(AcquireError::Bundle),
+    }
+}
+
+fn create_staging_container(parent: &fs::File) -> Result<(CString, fs::File), AcquireError> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_STAGE: AtomicU64 = AtomicU64::new(1);
+    for _ in 0..128 {
+        let sequence = NEXT_STAGE.fetch_add(1, Ordering::Relaxed);
+        let name = CString::new(format!(
+            ".catalog-acquire-stage-{}-{sequence:016x}",
+            std::process::id()
+        ))
+        .map_err(|_| AcquireError::Bundle)?;
+        // SAFETY: the retained parent and NUL-terminated bounded name are valid.
+        if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } == 0 {
+            parent.sync_all().map_err(|_| AcquireError::Bundle)?;
+            let directory = open_directory_at(parent, &name).map_err(|_| AcquireError::Bundle)?;
+            return Ok((name, directory));
+        }
+        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
+            return Err(AcquireError::Bundle);
+        }
+    }
+    Err(AcquireError::Bundle)
+}
+
+fn verify_named_directory(
+    parent: &fs::File,
+    name: &CString,
+    retained: &fs::File,
+    identity: FileIdentity,
+    expected_nlink: u64,
+) -> Result<(), AcquireError> {
+    let before = retained.metadata().map_err(|_| AcquireError::Bundle)?;
+    let named = open_directory_at(parent, name).map_err(|_| AcquireError::Bundle)?;
+    let named_metadata = named.metadata().map_err(|_| AcquireError::Bundle)?;
+    let after = retained.metadata().map_err(|_| AcquireError::Bundle)?;
+    if FileIdentity::from_metadata(&before) != identity
+        || FileIdentity::from_metadata(&named_metadata) != identity
+        || FileIdentity::from_metadata(&after) != identity
+        || !secure_directory(&before)
+        || !secure_directory(&named_metadata)
+        || !secure_directory(&after)
+        || before.nlink() != expected_nlink
+        || named_metadata.nlink() != expected_nlink
+        || after.nlink() != expected_nlink
+        || before.len() != named_metadata.len()
+        || before.len() != after.len()
+    {
+        return Err(AcquireError::Bundle);
+    }
+    Ok(())
+}
+
+fn verify_tracked_file(parent: &fs::File, tracked: &TrackedOutputFile) -> Result<(), AcquireError> {
+    let mut retained = tracked.file.try_clone().map_err(|_| AcquireError::Bundle)?;
+    let before = retained.metadata().map_err(|_| AcquireError::Bundle)?;
+    if FileIdentity::from_metadata(&before) != tracked.identity
+        || !secure_file(&before)
+        || before.len() != tracked.size
+    {
+        return Err(AcquireError::Bundle);
+    }
+    let digest = hash_file(&mut retained, tracked.size)?;
+    let after = retained.metadata().map_err(|_| AcquireError::Bundle)?;
+    let named = open_component(parent, &tracked.name, libc::O_RDONLY | libc::O_CLOEXEC, 0)
+        .map_err(|_| AcquireError::Bundle)?;
+    let named_metadata = named.metadata().map_err(|_| AcquireError::Bundle)?;
+    if digest != tracked.sha256
+        || FileIdentity::from_metadata(&after) != tracked.identity
+        || FileIdentity::from_metadata(&named_metadata) != tracked.identity
+        || !secure_file(&after)
+        || !secure_file(&named_metadata)
+        || after.len() != tracked.size
+        || named_metadata.len() != tracked.size
+    {
+        return Err(AcquireError::Bundle);
+    }
+    Ok(())
 }
 
 fn split_output_relative(relative: &str) -> Result<(Option<&str>, &str), AcquireError> {
@@ -869,41 +1096,11 @@ fn open_secure_root(path: &Path) -> Result<fs::File, AcquireError> {
     Ok(file)
 }
 
-fn open_relative(
-    root: &fs::File,
-    relative: &str,
-) -> Result<(fs::File, fs::Metadata), AcquireError> {
-    let file = open_beneath(root, relative, libc::O_RDONLY | libc::O_CLOEXEC, 0)?;
-    let metadata = file.metadata().map_err(|_| AcquireError::Bundle)?;
-    Ok((file, metadata))
-}
-
 #[repr(C)]
 struct OpenHow {
     flags: u64,
     mode: u64,
     resolve: u64,
-}
-
-fn open_beneath(
-    root: &fs::File,
-    relative: &str,
-    flags: i32,
-    mode: u32,
-) -> Result<fs::File, AcquireError> {
-    if !safe_relative(relative) {
-        return Err(AcquireError::Bundle);
-    }
-    let name = CString::new(relative).map_err(|_| AcquireError::Bundle)?;
-    openat2_raw(
-        root.as_raw_fd(),
-        &name,
-        flags,
-        mode,
-        // RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH.
-        0x02 | 0x04 | 0x08,
-    )
-    .map_err(|_| AcquireError::Bundle)
 }
 
 fn openat2_raw(
@@ -936,33 +1133,6 @@ fn openat2_raw(
 }
 
 fn verify_open_file(
-    root: &fs::File,
-    relative: &str,
-    mut file: fs::File,
-    entry: &TransferEntry,
-) -> Result<fs::File, AcquireError> {
-    let before = file.metadata().map_err(|_| AcquireError::Bundle)?;
-    if !secure_file(&before) || before.len() != entry.size {
-        return Err(AcquireError::Bundle);
-    }
-    let actual = hash_file(&mut file, entry.size)?;
-    let after = file.metadata().map_err(|_| AcquireError::Bundle)?;
-    let (_, named) = open_relative(root, relative)?;
-    if actual != entry.sha256
-        || before.dev() != after.dev()
-        || before.ino() != after.ino()
-        || before.dev() != named.dev()
-        || before.ino() != named.ino()
-        || !secure_file(&after)
-    {
-        return Err(AcquireError::Bundle);
-    }
-    file.seek(SeekFrom::Start(0))
-        .map_err(|_| AcquireError::Bundle)?;
-    Ok(file)
-}
-
-fn verify_open_file_from(
     parent: &fs::File,
     name: &str,
     mut file: fs::File,
@@ -975,14 +1145,18 @@ fn verify_open_file_from(
     let actual = hash_file(&mut file, entry.size)?;
     let after = file.metadata().map_err(|_| AcquireError::Bundle)?;
     let named = open_component(parent, name, libc::O_RDONLY | libc::O_CLOEXEC, 0)
-        .and_then(|file| file.metadata())
+        .map_err(|_| AcquireError::Bundle)?
+        .metadata()
         .map_err(|_| AcquireError::Bundle)?;
     if actual != entry.sha256
         || before.dev() != after.dev()
         || before.ino() != after.ino()
         || before.dev() != named.dev()
         || before.ino() != named.ino()
+        || before.len() != after.len()
+        || before.len() != named.len()
         || !secure_file(&after)
+        || !secure_file(&named)
     {
         return Err(AcquireError::Bundle);
     }
@@ -1045,50 +1219,102 @@ fn read_exact_file(
     Ok(bytes)
 }
 
-fn enumerate_tree(root: &fs::File) -> Result<BTreeSet<String>, AcquireError> {
-    let proc_root = PathBuf::from(format!("/proc/self/fd/{}", root.as_raw_fd()));
-    let mut result = BTreeSet::new();
-    enumerate_directory(&proc_root, "", &mut result)?;
-    Ok(result)
-}
-
-fn enumerate_directory(
-    path: &Path,
-    prefix: &str,
-    result: &mut BTreeSet<String>,
-) -> Result<(), AcquireError> {
-    for item in fs::read_dir(path).map_err(|_| AcquireError::Bundle)? {
-        let item = item.map_err(|_| AcquireError::Bundle)?;
-        let name = item
-            .file_name()
-            .into_string()
-            .map_err(|_| AcquireError::Bundle)?;
-        if name == "." || name == ".." || name.contains('/') {
-            return Err(AcquireError::Bundle);
-        }
-        let relative = if prefix.is_empty() {
-            name
-        } else {
-            format!("{prefix}/{name}")
-        };
-        let metadata = fs::symlink_metadata(item.path()).map_err(|_| AcquireError::Bundle)?;
-        if metadata.file_type().is_symlink() {
-            return Err(AcquireError::Bundle);
-        }
-        if metadata.is_dir() {
-            if !secure_directory(&metadata) || !matches!(relative.as_str(), "objects" | "records") {
+fn enumerate_tree(root: &fs::File) -> Result<EnumeratedTransferTree, AcquireError> {
+    let root_names = enumerate_names(root)?;
+    let mut entries = BTreeSet::new();
+    let mut directories = BTreeMap::new();
+    for name in &root_names {
+        if matches!(name.as_str(), "objects" | "records") {
+            let name_c = CString::new(name.as_str()).map_err(|_| AcquireError::Bundle)?;
+            let directory = open_directory_at(root, &name_c).map_err(|_| AcquireError::Bundle)?;
+            let metadata = directory.metadata().map_err(|_| AcquireError::Bundle)?;
+            if !secure_directory(&metadata) || metadata.nlink() != 2 {
                 return Err(AcquireError::Bundle);
             }
-            enumerate_directory(&item.path(), &relative, result)?;
-        } else if metadata.is_file() {
-            if !result.insert(relative) {
+            let names = enumerate_names(&directory)?;
+            for child in &names {
+                let file = open_component(&directory, child, libc::O_RDONLY | libc::O_CLOEXEC, 0)
+                    .map_err(|_| AcquireError::Bundle)?;
+                if !file.metadata().map_err(|_| AcquireError::Bundle)?.is_file()
+                    || !entries.insert(format!("{name}/{child}"))
+                {
+                    return Err(AcquireError::Bundle);
+                }
+            }
+            directories.insert(
+                name.clone(),
+                RetainedTransferDirectory {
+                    identity: FileIdentity::from_metadata(&metadata),
+                    names,
+                    file: directory,
+                },
+            );
+        } else {
+            let file = open_component(root, name, libc::O_RDONLY | libc::O_CLOEXEC, 0)
+                .map_err(|_| AcquireError::Bundle)?;
+            if !file.metadata().map_err(|_| AcquireError::Bundle)?.is_file()
+                || !entries.insert(name.clone())
+            {
                 return Err(AcquireError::Bundle);
             }
-        } else {
-            return Err(AcquireError::Bundle);
         }
     }
-    Ok(())
+    Ok(EnumeratedTransferTree {
+        root_names,
+        entries,
+        directories,
+    })
+}
+
+fn enumerate_names(directory: &fs::File) -> Result<BTreeSet<String>, AcquireError> {
+    // SAFETY: fcntl duplicates one valid retained descriptor with close-on-exec.
+    let descriptor = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if descriptor < 0 {
+        return Err(AcquireError::Bundle);
+    }
+    // SAFETY: fdopendir takes ownership of the duplicated descriptor on success.
+    let stream = unsafe { libc::fdopendir(descriptor) };
+    if stream.is_null() {
+        // SAFETY: fdopendir did not take ownership on failure.
+        let _ = unsafe { libc::close(descriptor) };
+        return Err(AcquireError::Bundle);
+    }
+
+    // SAFETY: stream is valid; reset the shared duplicated directory offset before enumeration.
+    unsafe { libc::rewinddir(stream) };
+    let result = (|| {
+        let mut names = BTreeSet::new();
+        loop {
+            // SAFETY: this process targets Linux, where __errno_location returns thread-local errno.
+            unsafe { *libc::__errno_location() = 0 };
+            // SAFETY: stream remains valid and is only used on this thread.
+            let entry = unsafe { libc::readdir(stream) };
+            if entry.is_null() {
+                // SAFETY: errno is read immediately after readdir returned null.
+                if unsafe { *libc::__errno_location() } != 0 {
+                    return Err(AcquireError::Bundle);
+                }
+                break;
+            }
+            // SAFETY: readdir returns a dirent with a NUL-terminated d_name field.
+            let bytes = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+            if matches!(bytes, b"." | b"..") {
+                continue;
+            }
+            let name = std::str::from_utf8(bytes).map_err(|_| AcquireError::Bundle)?;
+            if !safe_component(name) || !names.insert(name.to_owned()) {
+                return Err(AcquireError::Bundle);
+            }
+        }
+        Ok(names)
+    })();
+    // SAFETY: restore the retained directory's shared offset before closing the duplicate.
+    unsafe { libc::rewinddir(stream) };
+    // SAFETY: closedir consumes the stream and closes the duplicated descriptor.
+    if unsafe { libc::closedir(stream) } != 0 {
+        return Err(AcquireError::Bundle);
+    }
+    result
 }
 
 fn entry(path: &str, size: u64, digest: &str) -> TransferEntry {
@@ -1164,8 +1390,12 @@ fn _bind_core_digest(bundle: &VerifiedInputBundleV1) -> Result<[u8; 32], Acquire
 #[cfg(test)]
 mod tests {
     use std::{
+        ffi::OsStr,
         fs,
-        os::unix::fs::{DirBuilderExt, PermissionsExt, symlink},
+        os::unix::{
+            ffi::OsStrExt,
+            fs::{DirBuilderExt, PermissionsExt, symlink},
+        },
         path::{Path, PathBuf},
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -1173,83 +1403,187 @@ mod tests {
     use super::OutputRoot;
 
     #[test]
-    fn cleanup_stays_on_the_retained_root_after_directory_replacement() {
+    fn output_parent_must_be_exact_owner_private_and_symlink_free() {
+        let parent = TempDirectory::new();
+        fs::set_permissions(&parent.path, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(OutputRoot::create(&parent.path.join("bundle")).is_err());
+        fs::set_permissions(&parent.path, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let real = parent.path.join("real");
+        fs::DirBuilder::new().mode(0o700).create(&real).unwrap();
+        let linked = parent.path.join("linked");
+        symlink(&real, &linked).unwrap();
+        assert!(OutputRoot::create(&linked.join("bundle")).is_err());
+    }
+
+    #[test]
+    fn final_name_is_absent_until_atomic_no_clobber_commit() {
         let parent = TempDirectory::new();
         let output = parent.path.join("bundle");
-        let moved = parent.path.join("original");
         let mut root = populated_output(&output);
+        assert!(!output.exists());
 
-        fs::rename(&output, &moved).unwrap();
         fs::DirBuilder::new().mode(0o700).create(&output).unwrap();
         fs::write(output.join("sentinel"), b"replacement").unwrap();
-        root.write_file("records/late", b"late").unwrap();
-        assert!(!output.join("records/late").exists());
-        assert!(moved.join("records/late").exists());
-
+        assert!(root.commit().is_err());
         drop(root);
 
         assert_eq!(fs::read(output.join("sentinel")).unwrap(), b"replacement");
-        assert_eq!(fs::read_dir(&moved).unwrap().count(), 0);
     }
 
     #[test]
-    fn cleanup_stays_on_the_retained_root_after_symlink_replacement() {
+    fn staging_container_name_replacement_fails_closed_without_redirection() {
         let parent = TempDirectory::new();
         let output = parent.path.join("bundle");
-        let moved = parent.path.join("original");
-        let outside = parent.path.join("outside");
-        fs::DirBuilder::new().mode(0o700).create(&outside).unwrap();
-        fs::write(outside.join("sentinel"), b"outside").unwrap();
+        let mut root = populated_output(&output);
+        let stage = stage_path(&parent.path, &root);
+        let moved = parent.path.join("moved-stage");
+        fs::rename(&stage, &moved).unwrap();
+        fs::DirBuilder::new().mode(0o700).create(&stage).unwrap();
+        fs::write(stage.join("sentinel"), b"replacement").unwrap();
+
+        assert!(root.commit().is_err());
+        drop(root);
+
+        assert!(!output.exists());
+        assert_eq!(fs::read(stage.join("sentinel")).unwrap(), b"replacement");
+        assert!(moved.join("payload/objects/object").exists());
+    }
+
+    #[test]
+    fn drop_never_deletes_replacement_file_or_directory_names() {
+        let parent = TempDirectory::new();
+        let output = parent.path.join("bundle");
         let root = populated_output(&output);
+        let payload = stage_path(&parent.path, &root).join("payload");
 
-        fs::rename(&output, &moved).unwrap();
-        symlink(&outside, &output).unwrap();
-        drop(root);
-
-        assert_eq!(fs::read(outside.join("sentinel")).unwrap(), b"outside");
-        assert_eq!(fs::read_dir(&moved).unwrap().count(), 0);
-    }
-
-    #[test]
-    fn cleanup_does_not_unlink_a_replacement_file_inside_the_original_root() {
-        let parent = TempDirectory::new();
-        let output = parent.path.join("bundle");
-        let mut root = OutputRoot::create(&output).unwrap();
-        root.write_file("record", b"original").unwrap();
-        fs::rename(output.join("record"), output.join("moved-record")).unwrap();
-        fs::write(output.join("record"), b"replacement").unwrap();
-        fs::set_permissions(output.join("record"), fs::Permissions::from_mode(0o400)).unwrap();
-
-        drop(root);
-
-        assert_eq!(fs::read(output.join("record")).unwrap(), b"replacement");
-        assert_eq!(fs::read(output.join("moved-record")).unwrap(), b"original");
-    }
-
-    #[test]
-    fn cleanup_does_not_unlink_a_replacement_directory_inside_the_original_root() {
-        let parent = TempDirectory::new();
-        let output = parent.path.join("bundle");
-        let mut root = OutputRoot::create(&output).unwrap();
-        root.create_directory("records").unwrap();
-        root.write_file("records/record", b"original").unwrap();
-        fs::rename(output.join("records"), output.join("moved-records")).unwrap();
+        fs::rename(
+            payload.join("records/record"),
+            payload.join("records/moved-record"),
+        )
+        .unwrap();
+        fs::write(payload.join("records/record"), b"replacement").unwrap();
+        fs::set_permissions(
+            payload.join("records/record"),
+            fs::Permissions::from_mode(0o400),
+        )
+        .unwrap();
+        fs::rename(payload.join("objects"), payload.join("moved-objects")).unwrap();
         fs::DirBuilder::new()
             .mode(0o700)
-            .create(output.join("records"))
+            .create(payload.join("objects"))
             .unwrap();
-        fs::write(output.join("records/sentinel"), b"replacement").unwrap();
+        fs::write(payload.join("objects/sentinel"), b"replacement").unwrap();
 
         drop(root);
 
+        assert!(!output.exists());
         assert_eq!(
-            fs::read(output.join("records/sentinel")).unwrap(),
+            fs::read(payload.join("records/record")).unwrap(),
             b"replacement"
         );
         assert_eq!(
-            fs::read_dir(output.join("moved-records")).unwrap().count(),
-            0
+            fs::read(payload.join("objects/sentinel")).unwrap(),
+            b"replacement"
         );
+        assert_eq!(
+            fs::read(payload.join("records/moved-record")).unwrap(),
+            b"record"
+        );
+        assert_eq!(
+            fs::read(payload.join("moved-objects/object")).unwrap(),
+            b"object"
+        );
+    }
+
+    #[test]
+    fn commit_rejects_child_file_mode_inventory_and_symlink_mutations() {
+        for mutation in [
+            Mutation::ChildReplacement,
+            Mutation::FileReplacement,
+            Mutation::IdenticalBytesWrongMode,
+            Mutation::DifferentBytes,
+            Mutation::Hardlink,
+            Mutation::ExtraEntry,
+            Mutation::Symlink,
+        ] {
+            let parent = TempDirectory::new();
+            let output = parent.path.join("bundle");
+            let mut root = populated_output(&output);
+            let payload = stage_path(&parent.path, &root).join("payload");
+            mutate(&payload, mutation);
+
+            assert!(root.commit().is_err(), "mutation {mutation:?}");
+            assert!(!output.exists(), "mutation {mutation:?} was published");
+        }
+    }
+
+    #[test]
+    fn successful_commit_publishes_exact_payload_once() {
+        let parent = TempDirectory::new();
+        let output = parent.path.join("bundle");
+        let mut root = populated_output(&output);
+        root.commit().unwrap();
+
+        assert_eq!(fs::read(output.join("objects/object")).unwrap(), b"object");
+        assert_eq!(fs::read(output.join("records/record")).unwrap(), b"record");
+        assert!(root.commit().is_err());
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum Mutation {
+        ChildReplacement,
+        FileReplacement,
+        IdenticalBytesWrongMode,
+        DifferentBytes,
+        Hardlink,
+        ExtraEntry,
+        Symlink,
+    }
+
+    fn mutate(payload: &Path, mutation: Mutation) {
+        let object = payload.join("objects/object");
+        match mutation {
+            Mutation::ChildReplacement => {
+                fs::rename(payload.join("objects"), payload.join("original-objects")).unwrap();
+                fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(payload.join("objects"))
+                    .unwrap();
+                fs::write(&object, b"object").unwrap();
+                fs::set_permissions(&object, fs::Permissions::from_mode(0o400)).unwrap();
+            }
+            Mutation::FileReplacement => {
+                fs::rename(&object, payload.join("objects/original-object")).unwrap();
+                fs::write(&object, b"object").unwrap();
+                fs::set_permissions(&object, fs::Permissions::from_mode(0o400)).unwrap();
+            }
+            Mutation::IdenticalBytesWrongMode => {
+                fs::set_permissions(&object, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            Mutation::DifferentBytes => {
+                fs::set_permissions(&object, fs::Permissions::from_mode(0o600)).unwrap();
+                fs::write(&object, b"tamper").unwrap();
+                fs::set_permissions(&object, fs::Permissions::from_mode(0o400)).unwrap();
+            }
+            Mutation::Hardlink => {
+                let outside = payload
+                    .parent()
+                    .and_then(Path::parent)
+                    .unwrap()
+                    .join("outside-hardlink");
+                fs::hard_link(&object, outside).unwrap();
+            }
+            Mutation::ExtraEntry => {
+                fs::write(payload.join("extra"), b"extra").unwrap();
+                fs::set_permissions(payload.join("extra"), fs::Permissions::from_mode(0o400))
+                    .unwrap();
+            }
+            Mutation::Symlink => {
+                fs::remove_file(&object).unwrap();
+                symlink("../top-level", object).unwrap();
+            }
+        }
     }
 
     fn populated_output(path: &Path) -> OutputRoot {
@@ -1260,6 +1594,10 @@ mod tests {
         root.write_file("objects/object", b"object").unwrap();
         root.write_file("records/record", b"record").unwrap();
         root
+    }
+
+    fn stage_path(parent: &Path, root: &OutputRoot) -> PathBuf {
+        parent.join(OsStr::from_bytes(root.container_name.to_bytes()))
     }
 
     struct TempDirectory {

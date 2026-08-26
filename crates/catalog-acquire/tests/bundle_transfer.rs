@@ -23,6 +23,19 @@ fn no_clobber_digest_addressed_bundle_is_reopened_before_success() {
     assert!(verified.total_bytes() > 6);
     assert_eq!(verified.bundle_sha256().len(), 64);
     assert_eq!(mode(&bundle), 0o700);
+    let stages = fs::read_dir(&root.path)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".catalog-acquire-stage-")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(stages.len(), 1);
+    assert_eq!(mode(&stages[0].path()), 0o700);
+    assert_eq!(fs::read_dir(stages[0].path()).unwrap().count(), 0);
     let object = object_path(&bundle);
     assert_eq!(mode(&object), 0o400);
     assert_eq!(
@@ -132,7 +145,7 @@ fn cli_is_bounded_and_emits_only_stable_safe_output() {
 }
 
 #[test]
-fn failed_bundle_write_cleans_a_fresh_output_without_clobbering_existing_roots() {
+fn failed_bundle_write_leaves_only_private_staging_and_never_clobbers_final_names() {
     let root = TempRoot::new();
     let fresh = root.path.join("failed");
     let object_path = root.path.join("source-object");
@@ -170,11 +183,32 @@ fn failed_bundle_write_cleans_a_fresh_output_without_clobbering_existing_roots()
     );
     assert!(result.is_err());
     assert!(
-        fresh.is_dir(),
-        "uncertain root identity leaves the private root"
+        !fresh.exists(),
+        "an aborted staged write must never expose the final output name"
     );
-    assert_eq!(mode(&fresh), 0o700);
-    assert_eq!(fs::read_dir(&fresh).unwrap().count(), 0);
+    let leftovers = fs::read_dir(&root.path)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".catalog-acquire-stage-")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(leftovers.len(), 1, "one bounded staging container remains");
+    assert_eq!(mode(&leftovers[0].path()), 0o700);
+
+    let empty_existing = root.path.join("empty-existing");
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&empty_existing)
+        .unwrap();
+    assert!(
+        write_request(&empty_existing).is_err(),
+        "atomic no-clobber requires the final output name to be absent"
+    );
+    assert_eq!(fs::read_dir(&empty_existing).unwrap().count(), 0);
 
     let existing = root.path.join("existing");
     fs::DirBuilder::new().mode(0o700).create(&existing).unwrap();
