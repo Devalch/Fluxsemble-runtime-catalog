@@ -10,7 +10,10 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     AcquireError,
-    archive::{NpmArchiveInspection, VerifiedArchive, inspect_node_archive, inspect_npm_archive},
+    archive::{
+        NpmArchiveInspection, VerifiedArchive, inspect_node_archive, inspect_npm_archive,
+        require_pinned_node_identity,
+    },
 };
 
 const ROOT_NAME: &str = "@earendil-works/pi-coding-agent";
@@ -354,6 +357,11 @@ pub fn verify_npm_graph(mut request: NpmGraphRequest) -> Result<VerifiedNpmGraph
     let metadata = pi_metadata(&request.intent)?;
     require_exact_intent(&request.intent, metadata)?;
     let node = node_artifact(&request.intent)?;
+    require_pinned_node_identity(
+        node.url().as_str(),
+        node.size_bytes().get(),
+        node.sha256().as_str(),
+    )?;
     require_archive(&request.node_archive, node, None)?;
     let node_inspection = inspect_node_archive(&mut request.node_archive)?;
     if node_inspection.member_count != 5_780 {

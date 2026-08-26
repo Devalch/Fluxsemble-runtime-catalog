@@ -1,7 +1,14 @@
 use std::{
+    ffi::CString,
     fs,
     io::Read,
-    os::unix::fs::{DirBuilderExt, OpenOptionsExt},
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::{
+            ffi::OsStrExt,
+            fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
+        },
+    },
     path::{Path, PathBuf},
 };
 
@@ -109,12 +116,13 @@ fn run() -> Result<Summary, AcquireError> {
                 ],
             )?;
             let source_path = Path::new(&values[0]);
-            let source = CatalogSourceV1::from_json(&read_input(source_path)?)
+            let source_root = RetainedInputRoot::open(source_path)?;
+            let source = CatalogSourceV1::from_json(&source_root.read_source()?)
                 .map_err(|_| AcquireError::Input)?;
-            let qualification_path = Path::new(source.qualification().relative_path().as_str());
-            let qualification =
-                CompatibilityQualificationV1::from_json(&read_input(qualification_path)?)
-                    .map_err(|_| AcquireError::Input)?;
+            let qualification = CompatibilityQualificationV1::from_json(
+                &source_root.read_relative(source.qualification().relative_path().as_str())?,
+            )
+            .map_err(|_| AcquireError::Input)?;
             let package_inputs =
                 PackageInputManifestV1::from_json(&read_input(Path::new(&values[1]))?)?;
             run_acquire(
@@ -199,6 +207,136 @@ fn parse_decimal(value: &str) -> Result<u64, AcquireError> {
     Ok(parsed)
 }
 
+struct RetainedInputRoot {
+    directory: fs::File,
+    source_name: String,
+}
+
+impl RetainedInputRoot {
+    fn open(source_path: &Path) -> Result<Self, AcquireError> {
+        if source_path.as_os_str().as_bytes().len() > MAX_PATH_BYTES {
+            return Err(AcquireError::Input);
+        }
+        let source_name = source_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| safe_relative(name))
+            .ok_or(AcquireError::Input)?
+            .to_owned();
+        let parent = source_path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let parent =
+            CString::new(parent.as_os_str().as_bytes()).map_err(|_| AcquireError::Input)?;
+        let directory = openat2_input(
+            libc::AT_FDCWD,
+            &parent,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            // RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS.
+            0x02 | 0x04,
+        )?;
+        let root = Self {
+            directory,
+            source_name,
+        };
+        let _ = root.read_source()?;
+        Ok(root)
+    }
+
+    fn read_source(&self) -> Result<Vec<u8>, AcquireError> {
+        self.read_relative(&self.source_name)
+    }
+
+    fn read_relative(&self, relative: &str) -> Result<Vec<u8>, AcquireError> {
+        if !safe_relative(relative) {
+            return Err(AcquireError::Input);
+        }
+        let name = CString::new(relative).map_err(|_| AcquireError::Input)?;
+        let mut file = openat2_input(
+            self.directory.as_raw_fd(),
+            &name,
+            libc::O_RDONLY | libc::O_CLOEXEC,
+            // RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH.
+            0x02 | 0x04 | 0x08,
+        )?;
+        let before = file.metadata().map_err(|_| AcquireError::Input)?;
+        if !before.is_file() || before.len() == 0 || before.len() > MAX_INPUT_BYTES {
+            return Err(AcquireError::Input);
+        }
+        let mut bytes = Vec::with_capacity(before.len() as usize);
+        (&mut file)
+            .take(MAX_INPUT_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| AcquireError::Input)?;
+        let after = file.metadata().map_err(|_| AcquireError::Input)?;
+        let named = openat2_input(
+            self.directory.as_raw_fd(),
+            &name,
+            libc::O_RDONLY | libc::O_CLOEXEC,
+            0x02 | 0x04 | 0x08,
+        )?
+        .metadata()
+        .map_err(|_| AcquireError::Input)?;
+        if bytes.len() as u64 != before.len()
+            || before.dev() != after.dev()
+            || before.ino() != after.ino()
+            || before.len() != after.len()
+            || before.dev() != named.dev()
+            || before.ino() != named.ino()
+        {
+            return Err(AcquireError::Input);
+        }
+        Ok(bytes)
+    }
+}
+
+#[repr(C)]
+struct OpenHow {
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+}
+
+fn openat2_input(
+    directory: i32,
+    name: &CString,
+    flags: i32,
+    resolve: u64,
+) -> Result<fs::File, AcquireError> {
+    let how = OpenHow {
+        flags: flags as u64,
+        mode: 0,
+        resolve,
+    };
+    // SAFETY: all pointers reference initialized values for the duration of the syscall.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            directory,
+            name.as_ptr(),
+            &raw const how,
+            std::mem::size_of::<OpenHow>(),
+        )
+    } as i32;
+    if fd < 0 {
+        return Err(AcquireError::Input);
+    }
+    // SAFETY: successful openat2 returns one owned descriptor.
+    Ok(unsafe { fs::File::from_raw_fd(fd) })
+}
+
+fn safe_relative(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_PATH_BYTES
+        && !value.starts_with('/')
+        && !value.contains('\\')
+        && !value.bytes().any(|byte| byte.is_ascii_control())
+        && value
+            .split('/')
+            .all(|component| !component.is_empty() && component != "." && component != "..")
+}
+
 fn read_input(path: &Path) -> Result<Vec<u8>, AcquireError> {
     if path.as_os_str().as_encoded_bytes().len() > MAX_PATH_BYTES {
         return Err(AcquireError::Input);
@@ -250,5 +388,149 @@ impl TemporaryCache {
 impl Drop for TemporaryCache {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        os::unix::fs::{DirBuilderExt, symlink},
+        path::PathBuf,
+        sync::{Mutex, MutexGuard},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use super::RetainedInputRoot;
+
+    static CWD_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn qualification_is_read_beneath_the_source_directory_not_cwd() {
+        let _lock = lock_cwd();
+        let temp = TempDirectory::new();
+        let source_directory = temp.path.join("source-root");
+        let other_cwd = temp.path.join("other-cwd");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&source_directory)
+            .unwrap();
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&other_cwd)
+            .unwrap();
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(source_directory.join("qualifications"))
+            .unwrap();
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(other_cwd.join("qualifications"))
+            .unwrap();
+        fs::write(source_directory.join("source.json"), b"source").unwrap();
+        fs::write(
+            source_directory.join("qualifications/record.json"),
+            b"source-relative",
+        )
+        .unwrap();
+        fs::write(
+            other_cwd.join("qualifications/record.json"),
+            b"cwd-controlled",
+        )
+        .unwrap();
+        let original_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&other_cwd).unwrap();
+        let _restore = RestoreCwd(original_cwd);
+
+        let root = RetainedInputRoot::open(&source_directory.join("source.json")).unwrap();
+        assert_eq!(root.read_source().unwrap(), b"source");
+        assert_eq!(
+            root.read_relative("qualifications/record.json").unwrap(),
+            b"source-relative"
+        );
+    }
+
+    #[test]
+    fn qualification_rejects_traversal_absolute_empty_and_symlink_paths() {
+        let temp = TempDirectory::new();
+        let root_path = temp.path.join("root");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root_path)
+            .unwrap();
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(root_path.join("qualifications"))
+            .unwrap();
+        fs::write(root_path.join("source.json"), b"source").unwrap();
+        fs::write(temp.path.join("outside.json"), b"outside").unwrap();
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(temp.path.join("outside-directory"))
+            .unwrap();
+        fs::write(temp.path.join("outside-directory/record.json"), b"outside").unwrap();
+        symlink(
+            temp.path.join("outside.json"),
+            root_path.join("qualifications/link.json"),
+        )
+        .unwrap();
+        symlink(
+            temp.path.join("outside-directory"),
+            root_path.join("linked-directory"),
+        )
+        .unwrap();
+        let root = RetainedInputRoot::open(&root_path.join("source.json")).unwrap();
+
+        for relative in [
+            "",
+            "/absolute.json",
+            "../outside.json",
+            "qualifications/../source.json",
+            "qualifications//record.json",
+            "qualifications/./record.json",
+            "qualifications/link.json",
+            "linked-directory/record.json",
+        ] {
+            assert!(root.read_relative(relative).is_err(), "{relative}");
+        }
+    }
+
+    fn lock_cwd() -> MutexGuard<'static, ()> {
+        CWD_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    struct RestoreCwd(PathBuf);
+
+    impl Drop for RestoreCwd {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.0).unwrap();
+        }
+    }
+
+    struct TempDirectory {
+        path: PathBuf,
+    }
+
+    impl TempDirectory {
+        fn new() -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "catalog-source-input-test-{}-{nanos}",
+                std::process::id()
+            ));
+            fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for TempDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
     }
 }

@@ -24,6 +24,7 @@ const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 const MAX_SHRINKWRAP_BYTES: u64 = 1024 * 1024;
 
 const NODE_ROOT: &str = "node-v22.19.0-linux-x64";
+const PINNED_NODE_URL: &str = "https://nodejs.org/dist/v22.19.0/node-v22.19.0-linux-x64.tar.xz";
 const PINNED_NODE_SHA256: &str = "c0649af18e6a24f6fe5535a3e86b341dd49a8e71117c8b68bde973ef834f16f2";
 const PINNED_NODE_SIZE: u64 = 30_479_988;
 const LEGACY_STAR_NODE_TYPES_SHA256: &str =
@@ -254,21 +255,31 @@ pub(crate) fn inspect_npm_archive(
 pub(crate) fn inspect_node_archive(
     archive: &mut VerifiedArchive,
 ) -> Result<NodeArchiveInspection, AcquireError> {
+    require_pinned_node_identity(archive.source_url(), archive.size(), archive.sha256())?;
     let parsed = read_compressed_tar(archive, Compression::Xz, ArchivePolicy::ExactNode)?;
-    if archive.sha256() == PINNED_NODE_SHA256
-        && (archive.size() != PINNED_NODE_SIZE
-            || parsed.physical_header_count != 7_013
-            || parsed.member_count != 5_780
-            || parsed.gnu_long_name_count != 1_233
-            || parsed.regular_count != 4_673
-            || parsed.directory_count != 1_104
-            || parsed.symlink_count != 3)
+    if parsed.physical_header_count != 7_013
+        || parsed.member_count != 5_780
+        || parsed.gnu_long_name_count != 1_233
+        || parsed.regular_count != 4_673
+        || parsed.directory_count != 1_104
+        || parsed.symlink_count != 3
     {
         return Err(AcquireError::Archive);
     }
     Ok(NodeArchiveInspection {
         member_count: parsed.member_count,
     })
+}
+
+pub(crate) fn require_pinned_node_identity(
+    url: &str,
+    size: u64,
+    sha256: &str,
+) -> Result<(), AcquireError> {
+    if url != PINNED_NODE_URL || size != PINNED_NODE_SIZE || sha256 != PINNED_NODE_SHA256 {
+        return Err(AcquireError::Archive);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -1065,4 +1076,197 @@ fn hex_lower(bytes: &[u8]) -> String {
 fn current_euid() -> u32 {
     // SAFETY: geteuid has no preconditions and no side effects.
     unsafe { libc::geteuid() }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::{ArchivePolicy, NODE_LINKS, parse_tar, require_pinned_node_identity};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum LinkMutation {
+        None,
+        WrongTarget,
+        AbsoluteTarget,
+        ParentEscape,
+        MissingTarget,
+        TargetDirectory,
+        Hardlink,
+        MissingLink,
+        ExtraLink,
+    }
+
+    #[test]
+    fn exact_node_parser_keeps_link_mutations_on_a_non_production_seam() {
+        let parsed = parse_tar(
+            &mut Cursor::new(node_tar(LinkMutation::None)),
+            ArchivePolicy::ExactNode,
+        )
+        .expect("internal parser fixture");
+        assert_eq!(parsed.member_count, 7);
+        assert_eq!(parsed.symlink_count, 3);
+
+        for mutation in [
+            LinkMutation::WrongTarget,
+            LinkMutation::AbsoluteTarget,
+            LinkMutation::ParentEscape,
+            LinkMutation::MissingTarget,
+            LinkMutation::TargetDirectory,
+            LinkMutation::Hardlink,
+            LinkMutation::MissingLink,
+            LinkMutation::ExtraLink,
+        ] {
+            assert!(
+                parse_tar(
+                    &mut Cursor::new(node_tar(mutation)),
+                    ArchivePolicy::ExactNode,
+                )
+                .is_err(),
+                "{mutation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn node_identity_is_one_exact_tuple() {
+        let url = "https://nodejs.org/dist/v22.19.0/node-v22.19.0-linux-x64.tar.xz";
+        let digest = "c0649af18e6a24f6fe5535a3e86b341dd49a8e71117c8b68bde973ef834f16f2";
+        assert!(require_pinned_node_identity(url, 30_479_988, digest).is_ok());
+        assert!(require_pinned_node_identity(&format!("{url}/"), 30_479_988, digest).is_err());
+        assert!(require_pinned_node_identity(url, 30_479_987, digest).is_err());
+        assert!(require_pinned_node_identity(url, 30_479_988, &"0".repeat(64)).is_err());
+    }
+
+    fn node_tar(mutation: LinkMutation) -> Vec<u8> {
+        let root = "node-v22.19.0-linux-x64";
+        let targets = [
+            (
+                format!("{root}/lib/node_modules/corepack/dist/corepack.js"),
+                b"corepack".as_slice(),
+            ),
+            (
+                format!("{root}/lib/node_modules/npm/bin/npm-cli.js"),
+                b"npm".as_slice(),
+            ),
+            (
+                format!("{root}/lib/node_modules/npm/bin/npx-cli.js"),
+                b"npx".as_slice(),
+            ),
+        ];
+        let mut entries = vec![TarEntry::directory(root)];
+        for (index, (path, bytes)) in targets.iter().enumerate() {
+            if mutation == LinkMutation::MissingTarget && index == 0 {
+                continue;
+            }
+            if mutation == LinkMutation::TargetDirectory && index == 0 {
+                entries.push(TarEntry::directory(path));
+            } else {
+                entries.push(TarEntry::file(path, bytes));
+            }
+        }
+        for (index, (path, expected_target)) in NODE_LINKS.iter().enumerate() {
+            if mutation == LinkMutation::MissingLink && index == 0 {
+                continue;
+            }
+            let target = if index == 0 {
+                match mutation {
+                    LinkMutation::WrongTarget => "../wrong",
+                    LinkMutation::AbsoluteTarget => "/absolute",
+                    LinkMutation::ParentEscape => "../../../escape",
+                    _ => expected_target,
+                }
+            } else {
+                expected_target
+            };
+            entries.push(if mutation == LinkMutation::Hardlink && index == 0 {
+                TarEntry::hardlink(path, target)
+            } else {
+                TarEntry::link(path, target)
+            });
+        }
+        if mutation == LinkMutation::ExtraLink {
+            entries.push(TarEntry::link(
+                &format!("{root}/bin/extra"),
+                "../lib/node_modules/npm/bin/npm-cli.js",
+            ));
+        }
+        tar(&entries)
+    }
+
+    struct TarEntry {
+        path: String,
+        bytes: Vec<u8>,
+        kind: u8,
+        target: String,
+    }
+
+    impl TarEntry {
+        fn file(path: &str, bytes: &[u8]) -> Self {
+            Self {
+                path: path.to_owned(),
+                bytes: bytes.to_vec(),
+                kind: b'0',
+                target: String::new(),
+            }
+        }
+
+        fn directory(path: &str) -> Self {
+            Self {
+                path: path.to_owned(),
+                bytes: Vec::new(),
+                kind: b'5',
+                target: String::new(),
+            }
+        }
+
+        fn link(path: &str, target: &str) -> Self {
+            Self {
+                path: path.to_owned(),
+                bytes: Vec::new(),
+                kind: b'2',
+                target: target.to_owned(),
+            }
+        }
+
+        fn hardlink(path: &str, target: &str) -> Self {
+            Self {
+                path: path.to_owned(),
+                bytes: Vec::new(),
+                kind: b'1',
+                target: target.to_owned(),
+            }
+        }
+    }
+
+    fn tar(entries: &[TarEntry]) -> Vec<u8> {
+        let mut output = Vec::new();
+        for entry in entries {
+            let mut header = [0_u8; 512];
+            header[..entry.path.len()].copy_from_slice(entry.path.as_bytes());
+            write_octal(&mut header[100..108], 0o644);
+            write_octal(&mut header[108..116], 0);
+            write_octal(&mut header[116..124], 0);
+            write_octal(&mut header[124..136], entry.bytes.len() as u64);
+            write_octal(&mut header[136..148], 0);
+            header[148..156].fill(b' ');
+            header[156] = entry.kind;
+            header[157..157 + entry.target.len()].copy_from_slice(entry.target.as_bytes());
+            header[257..263].copy_from_slice(b"ustar\0");
+            header[263..265].copy_from_slice(b"00");
+            let checksum = header.iter().map(|byte| u64::from(*byte)).sum::<u64>();
+            header[148..156].copy_from_slice(format!("{checksum:06o}\0 ").as_bytes());
+            output.extend_from_slice(&header);
+            output.extend_from_slice(&entry.bytes);
+            output.resize(output.len().div_ceil(512) * 512, 0);
+        }
+        output.resize(output.len() + 1024, 0);
+        output
+    }
+
+    fn write_octal(field: &mut [u8], value: u64) {
+        let width = field.len() - 1;
+        field.fill(0);
+        field[..width].copy_from_slice(format!("{value:0width$o}").as_bytes());
+    }
 }

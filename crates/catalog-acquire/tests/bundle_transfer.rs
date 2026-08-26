@@ -169,7 +169,12 @@ fn failed_bundle_write_cleans_a_fresh_output_without_clobbering_existing_roots()
         &fresh,
     );
     assert!(result.is_err());
-    assert!(!fresh.exists(), "failed fresh output must be removed");
+    assert!(
+        fresh.is_dir(),
+        "uncertain root identity leaves the private root"
+    );
+    assert_eq!(mode(&fresh), 0o700);
+    assert_eq!(fs::read_dir(&fresh).unwrap().count(), 0);
 
     let existing = root.path.join("existing");
     fs::DirBuilder::new().mode(0o700).create(&existing).unwrap();

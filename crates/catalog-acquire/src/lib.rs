@@ -640,7 +640,13 @@ fn node_artifact(intent: &InitialPiReleaseIntentV1) -> Result<&ArtifactDescripto
     if component.artifacts().len() != 1 {
         return Err(AcquireError::Input);
     }
-    component.artifacts().first().ok_or(AcquireError::Input)
+    let artifact = component.artifacts().first().ok_or(AcquireError::Input)?;
+    archive::require_pinned_node_identity(
+        artifact.url().as_str(),
+        artifact.size_bytes().get(),
+        artifact.sha256().as_str(),
+    )?;
+    Ok(artifact)
 }
 
 fn write_discovery(
@@ -648,59 +654,28 @@ fn write_discovery(
     manifest: &PackageInputManifestV1,
     decide_publication: impl FnOnce() -> bool,
 ) -> Result<(), AcquireError> {
-    match std::fs::symlink_metadata(output) {
-        Ok(_) => return Err(AcquireError::Bundle),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => return Err(AcquireError::Bundle),
+    const DISCOVERY_NAME: &str = "observed-package-inputs-v1.json";
+
+    let bytes = manifest.canonical_bytes()?;
+    let mut output_root = bundle_writer::OutputRoot::create_new(output)?;
+    output_root.write_file(DISCOVERY_NAME, &bytes)?;
+    let (mut reopened, metadata) = output_root.open_file(DISCOVERY_NAME)?;
+    if metadata.len() != bytes.len() as u64 {
+        return Err(AcquireError::Bundle);
     }
-    use std::os::unix::fs::DirBuilderExt as _;
-    std::fs::DirBuilder::new()
-        .recursive(false)
-        .mode(0o700)
-        .create(output)
+    use std::io::Read as _;
+    let mut observed = Vec::with_capacity(bytes.len());
+    reopened
+        .read_to_end(&mut observed)
         .map_err(|_| AcquireError::Bundle)?;
-    let mut cleanup = DiscoveryCleanup {
-        path: output.to_owned(),
-        committed: false,
-    };
-    let path = output.join("observed-package-inputs-v1.json");
-    let mut options = std::fs::OpenOptions::new();
-    use std::io::Write as _;
-    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
-    let mut file = options
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-        .map_err(|_| AcquireError::Bundle)?;
-    file.write_all(&manifest.canonical_bytes()?)
-        .map_err(|_| AcquireError::Bundle)?;
-    file.sync_all().map_err(|_| AcquireError::Bundle)?;
-    file.set_permissions(std::fs::Permissions::from_mode(0o400))
-        .map_err(|_| AcquireError::Bundle)?;
-    file.sync_all().map_err(|_| AcquireError::Bundle)?;
-    std::fs::File::open(output)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|_| AcquireError::Bundle)?;
+    if observed != bytes {
+        return Err(AcquireError::Bundle);
+    }
+    output_root.sync()?;
     if !decide_publication() {
         return Err(AcquireError::Cancelled);
     }
-    cleanup.committed = true;
-    Ok(())
-}
-
-struct DiscoveryCleanup {
-    path: PathBuf,
-    committed: bool,
-}
-
-impl Drop for DiscoveryCleanup {
-    fn drop(&mut self) {
-        if !self.committed {
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-    }
+    output_root.commit()
 }
 
 fn intent_semantic_digest(intent: &InitialPiReleaseIntentV1) -> Result<String, AcquireError> {
@@ -741,4 +716,250 @@ fn valid_sha256(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        os::unix::fs::{DirBuilderExt, symlink},
+        path::PathBuf,
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
+
+    use serde_json::json;
+
+    use super::{
+        AcquireError, AcquisitionCancellation, PackageInputManifestV1, run_publication_blocking,
+        write_discovery,
+    };
+
+    const PRUNED: [(&str, &[&str]); 9] = [
+        (
+            "node_modules/@mariozechner/clipboard-darwin-arm64",
+            &["declaration.cpu", "declaration.os", "lock.cpu", "lock.os"],
+        ),
+        (
+            "node_modules/@mariozechner/clipboard-darwin-universal",
+            &["declaration.os", "lock.os"],
+        ),
+        (
+            "node_modules/@mariozechner/clipboard-darwin-x64",
+            &["declaration.os", "lock.os"],
+        ),
+        (
+            "node_modules/@mariozechner/clipboard-linux-arm64-gnu",
+            &["declaration.cpu", "lock.cpu"],
+        ),
+        (
+            "node_modules/@mariozechner/clipboard-linux-arm64-musl",
+            &["declaration.cpu", "declaration.libc", "lock.cpu"],
+        ),
+        (
+            "node_modules/@mariozechner/clipboard-linux-riscv64-gnu",
+            &["declaration.cpu", "lock.cpu"],
+        ),
+        (
+            "node_modules/@mariozechner/clipboard-linux-x64-musl",
+            &["declaration.libc"],
+        ),
+        (
+            "node_modules/@mariozechner/clipboard-win32-arm64-msvc",
+            &["declaration.cpu", "declaration.os", "lock.cpu", "lock.os"],
+        ),
+        (
+            "node_modules/@mariozechner/clipboard-win32-x64-msvc",
+            &["declaration.os", "lock.os"],
+        ),
+    ];
+
+    #[test]
+    fn discovery_cleanup_stays_on_the_original_root_after_directory_replacement() {
+        let parent = TempDirectory::new();
+        let output = parent.path.join("discovery");
+        let moved = parent.path.join("original");
+        let result = write_discovery(&output, &manifest(), || {
+            fs::rename(&output, &moved).unwrap();
+            fs::DirBuilder::new().mode(0o700).create(&output).unwrap();
+            fs::write(output.join("sentinel"), b"replacement").unwrap();
+            false
+        });
+        assert_eq!(result, Err(AcquireError::Cancelled));
+        assert_eq!(fs::read(output.join("sentinel")).unwrap(), b"replacement");
+        assert_eq!(fs::read_dir(&moved).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn discovery_cleanup_stays_on_the_original_root_after_symlink_replacement() {
+        let parent = TempDirectory::new();
+        let output = parent.path.join("discovery");
+        let moved = parent.path.join("original");
+        let outside = parent.path.join("outside");
+        fs::DirBuilder::new().mode(0o700).create(&outside).unwrap();
+        fs::write(outside.join("sentinel"), b"outside").unwrap();
+        let result = write_discovery(&output, &manifest(), || {
+            fs::rename(&output, &moved).unwrap();
+            symlink(&outside, &output).unwrap();
+            false
+        });
+        assert_eq!(result, Err(AcquireError::Cancelled));
+        assert_eq!(fs::read(outside.join("sentinel")).unwrap(), b"outside");
+        assert!(!outside.join("observed-package-inputs-v1.json").exists());
+        assert_eq!(fs::read_dir(&moved).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn discovery_cancellation_settles_cleanup_on_the_retained_root() {
+        let parent = TempDirectory::new();
+        let output = parent.path.join("discovery");
+        let moved = parent.path.join("original");
+        let replacement = output.clone();
+        let operation_output = output.clone();
+        let cancellation = AcquisitionCancellation::new();
+        let operation_cancellation = cancellation.clone();
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            run_publication_blocking(&operation_cancellation, move |control| {
+                write_discovery(&operation_output, &manifest(), || {
+                    let _ = reached_tx.send(());
+                    control.wait_for_decision()
+                })
+            })
+            .await
+        });
+        reached_rx.await.unwrap();
+        fs::rename(&output, &moved).unwrap();
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&replacement)
+            .unwrap();
+        fs::write(replacement.join("sentinel"), b"replacement").unwrap();
+        cancellation.cancel();
+
+        assert_eq!(task.await.unwrap(), Err(AcquireError::Cancelled));
+        assert_eq!(
+            fs::read(replacement.join("sentinel")).unwrap(),
+            b"replacement"
+        );
+        assert_eq!(fs::read_dir(&moved).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn dropping_discovery_future_aborts_and_settles_without_late_publication() {
+        let parent = TempDirectory::new();
+        let output = parent.path.join("discovery");
+        let moved = parent.path.join("original");
+        let outside = parent.path.join("outside");
+        fs::DirBuilder::new().mode(0o700).create(&outside).unwrap();
+        fs::write(outside.join("sentinel"), b"outside").unwrap();
+        let operation_output = output.clone();
+        let cancellation = AcquisitionCancellation::new();
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (settled_tx, settled_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            run_publication_blocking(&cancellation, move |control| {
+                let result = write_discovery(&operation_output, &manifest(), || {
+                    let _ = reached_tx.send(());
+                    control.wait_for_decision()
+                });
+                let _ = settled_tx.send(());
+                result
+            })
+            .await
+        });
+        reached_rx.await.unwrap();
+        fs::rename(&output, &moved).unwrap();
+        symlink(&outside, &output).unwrap();
+
+        task.abort();
+        let _ = task.await;
+        tokio::time::timeout(Duration::from_secs(5), settled_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(fs::read(outside.join("sentinel")).unwrap(), b"outside");
+        assert!(!outside.join("observed-package-inputs-v1.json").exists());
+        assert_eq!(fs::read_dir(&moved).unwrap().count(), 0);
+    }
+
+    fn manifest() -> PackageInputManifestV1 {
+        let mut packages = PRUNED
+            .into_iter()
+            .map(|(locator, reasons)| {
+                json!({
+                    "locator": locator,
+                    "name": "package",
+                    "version": "1.0.0",
+                    "resolved_url": "https://registry.npmjs.org/package/-/package-1.0.0.tgz",
+                    "registry_integrity": format!("sha512-{}", "A".repeat(88)),
+                    "archive_size": 1,
+                    "archive_sha256": "1".repeat(64),
+                    "declaration_sha256": "2".repeat(64),
+                    "archive_member_count": 1,
+                    "applicability": {"kind":"pruned", "reasons": reasons},
+                })
+            })
+            .collect::<Vec<_>>();
+        packages.extend((0..130).map(|index| {
+            json!({
+                "locator": format!("node_modules/package-{index:03}"),
+                "name": format!("package-{index:03}"),
+                "version": "1.0.0",
+                "resolved_url": format!("https://registry.npmjs.org/package-{index:03}/-/package-{index:03}-1.0.0.tgz"),
+                "registry_integrity": format!("sha512-{}", "A".repeat(88)),
+                "archive_size": 1,
+                "archive_sha256": "1".repeat(64),
+                "declaration_sha256": "2".repeat(64),
+                "archive_member_count": 1,
+                "applicability": {"kind":"applicable"},
+            })
+        }));
+        let value = json!({
+            "schema_version": 1,
+            "target_os": "linux",
+            "target_cpu": "x64",
+            "target_libc": "glibc",
+            "root": {
+                "name": "@earendil-works/pi-coding-agent",
+                "version": "0.83.0",
+                "archive_size": 1,
+                "archive_sha256": "1".repeat(64),
+                "manifest_size": 1,
+                "manifest_sha256": "2".repeat(64),
+                "shrinkwrap_size": 1,
+                "shrinkwrap_sha256": "3".repeat(64),
+                "archive_member_count": 1
+            },
+            "locked_packages": packages,
+            "pre_prune_package_count": 131,
+            "applicable_package_count": 130
+        });
+        PackageInputManifestV1::from_json(&serde_json::to_vec(&value).unwrap()).unwrap()
+    }
+
+    struct TempDirectory {
+        path: PathBuf,
+    }
+
+    impl TempDirectory {
+        fn new() -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "catalog-discovery-test-{}-{nanos}",
+                std::process::id()
+            ));
+            fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for TempDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
 }

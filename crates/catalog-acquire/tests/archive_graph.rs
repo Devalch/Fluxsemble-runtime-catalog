@@ -63,12 +63,13 @@ const MISSING: [&str; 3] = [
 ];
 
 #[test]
-fn exact_initial_graph_requires_root_plus_139_locked_archives() {
+fn generated_node_lookalike_cannot_satisfy_the_complete_graph() {
     let fixture = GraphFixture::new();
-    let verified = verify_npm_graph(fixture.request()).unwrap();
-    assert_eq!(verified.root_package_count(), 1);
-    assert_eq!(verified.locked_package_count(), 139);
-    assert_eq!(verified.total_archive_count(), 140);
+    assert_eq!(fixture.inputs.locked_package_count(), 139);
+    assert!(
+        verify_npm_graph(fixture.request()).is_err(),
+        "a descriptor-consistent generated Node lookalike must not mint production authority"
+    );
 }
 
 #[test]
@@ -157,34 +158,17 @@ fn transitive_npm_shape_accepts_one_safe_custom_root_and_one_exact_dot_alias() {
 }
 
 #[test]
-fn exact_node_links_are_inert_and_every_mutation_is_rejected() {
-    let valid = node_archive(NodeMutation::None);
+fn standalone_node_shape_rejects_a_self_consistent_generated_lookalike() {
+    let bytes = node_archive();
     let mut archive = verified(
-        valid,
+        bytes,
         "https://nodejs.org/dist/v22.19.0/node-v22.19.0-linux-x64.tar.xz",
         None,
     );
-    assert_eq!(verify_node_archive_shape(&mut archive).unwrap(), 5_780);
-    for mutation in [
-        NodeMutation::WrongTarget,
-        NodeMutation::AbsoluteTarget,
-        NodeMutation::ParentEscape,
-        NodeMutation::MissingTarget,
-        NodeMutation::TargetDirectory,
-        NodeMutation::Hardlink,
-        NodeMutation::MissingLink,
-        NodeMutation::ExtraLink,
-    ] {
-        let mut archive = verified(
-            node_archive(mutation),
-            "https://nodejs.org/dist/v22.19.0/node-v22.19.0-linux-x64.tar.xz",
-            None,
-        );
-        assert!(
-            verify_node_archive_shape(&mut archive).is_err(),
-            "{mutation:?}"
-        );
-    }
+    assert!(
+        verify_node_archive_shape(&mut archive).is_err(),
+        "the three-link policy is authority only for the exact pinned Node object"
+    );
 }
 
 struct GraphFixture {
@@ -266,7 +250,7 @@ impl GraphFixture {
         ]));
         let root_digest = sha256(&root_bytes);
         let root_integrity = sri(&root_bytes);
-        let node_bytes = node_archive(NodeMutation::None);
+        let node_bytes = node_archive();
         let node_digest = sha256(&node_bytes);
         let intent_json = json!({
             "sequence":"1","tag":"catalog-v1-sequence-1","generated_at":"2026-08-26T00:00:00Z","expires_at":"2026-09-26T00:00:00Z","fluxsemble_requirement":"=0.1.0",
@@ -343,85 +327,35 @@ fn selectors(locator: &str, source: &str) -> Map<String, Value> {
     result
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NodeMutation {
-    None,
-    WrongTarget,
-    AbsoluteTarget,
-    ParentEscape,
-    MissingTarget,
-    TargetDirectory,
-    Hardlink,
-    MissingLink,
-    ExtraLink,
-}
-
-fn node_archive(mutation: NodeMutation) -> Vec<u8> {
+fn node_archive() -> Vec<u8> {
     let root = "node-v22.19.0-linux-x64";
-    let targets = [
-        (
-            format!("{root}/lib/node_modules/corepack/dist/corepack.js"),
-            "corepack",
+    let mut entries = vec![
+        TarEntry::directory(&format!("{root}/")),
+        TarEntry::file(
+            &format!("{root}/lib/node_modules/corepack/dist/corepack.js"),
+            b"corepack",
         ),
-        (format!("{root}/lib/node_modules/npm/bin/npm-cli.js"), "npm"),
-        (format!("{root}/lib/node_modules/npm/bin/npx-cli.js"), "npx"),
-    ];
-    let mut entries = vec![TarEntry::directory(&format!("{root}/"))];
-    for (index, (path, bytes)) in targets.iter().enumerate() {
-        if mutation == NodeMutation::MissingTarget && index == 0 {
-            continue;
-        }
-        if mutation == NodeMutation::TargetDirectory && index == 0 {
-            entries.push(TarEntry::directory(path));
-        } else {
-            entries.push(TarEntry::file(path, bytes.as_bytes()));
-        }
-    }
-    let links = [
-        (
-            format!("{root}/bin/corepack"),
+        TarEntry::file(
+            &format!("{root}/lib/node_modules/npm/bin/npm-cli.js"),
+            b"npm",
+        ),
+        TarEntry::file(
+            &format!("{root}/lib/node_modules/npm/bin/npx-cli.js"),
+            b"npx",
+        ),
+        TarEntry::link(
+            &format!("{root}/bin/corepack"),
             "../lib/node_modules/corepack/dist/corepack.js",
         ),
-        (
-            format!("{root}/bin/npm"),
+        TarEntry::link(
+            &format!("{root}/bin/npm"),
             "../lib/node_modules/npm/bin/npm-cli.js",
         ),
-        (
-            format!("{root}/bin/npx"),
+        TarEntry::link(
+            &format!("{root}/bin/npx"),
             "../lib/node_modules/npm/bin/npx-cli.js",
         ),
     ];
-    for (index, (path, target)) in links.iter().enumerate() {
-        if mutation == NodeMutation::MissingLink && index == 0 {
-            continue;
-        }
-        let target = if index == 0 {
-            match mutation {
-                NodeMutation::WrongTarget => "../wrong",
-                NodeMutation::AbsoluteTarget => "/absolute",
-                NodeMutation::ParentEscape => "../../../escape",
-                _ => target,
-            }
-        } else {
-            target
-        };
-        if mutation == NodeMutation::Hardlink && index == 0 {
-            entries.push(TarEntry {
-                path: path.clone(),
-                data: vec![],
-                kind: b'1',
-                link: target.into(),
-            });
-        } else {
-            entries.push(TarEntry::link(path, target));
-        }
-    }
-    if mutation == NodeMutation::ExtraLink {
-        entries.push(TarEntry::link(
-            &format!("{root}/bin/extra"),
-            "../lib/node_modules/npm/bin/npm-cli.js",
-        ));
-    }
     while entries.len() < 5_780 {
         let index = entries.len();
         entries.push(TarEntry::file(
