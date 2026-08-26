@@ -3,7 +3,10 @@ use std::{
     ffi::CString,
     fs::{self, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
-    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    },
     path::{Path, PathBuf},
 };
 
@@ -14,6 +17,7 @@ use crate::{SignError, signing::VerifiedTransferredBundle, verify_transferred_bu
 
 const MARKER: &str = "launcher-v1";
 const OUTPUT_MANIFEST: &str = "/output/transfer-manifest-v1.json";
+const RECOVERY_BINDING: &str = "/output/sign-recovery-binding-v1.json";
 const MAX_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_OUTPUT_ENTRIES: usize = 64;
 const MAX_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
@@ -24,6 +28,7 @@ pub enum IsolationMode {
     AssembleIntent,
     Finalize,
     Sign,
+    RecoverSign,
     IsolationProbe,
 }
 
@@ -33,6 +38,7 @@ impl IsolationMode {
             "assemble-intent" => Ok(Self::AssembleIntent),
             "finalize" => Ok(Self::Finalize),
             "sign" => Ok(Self::Sign),
+            "recover-sign" => Ok(Self::RecoverSign),
             "isolation-probe" => Ok(Self::IsolationProbe),
             _ => Err(rejected()),
         }
@@ -56,6 +62,8 @@ pub struct IsolationAttestationV1 {
     schema_version: u16,
     mode: IsolationMode,
     input_transfer_sha256: String,
+    launcher_config_sha256: String,
+    signer_sha256: String,
     no_new_privileges: bool,
     launcher_seccomp_filter: bool,
     launcher_prefilter_errno: BTreeMap<String, i32>,
@@ -132,7 +140,12 @@ pub fn enter_signer_isolation() -> Result<SignerIsolation, SignError> {
     let environment = exact_environment()?;
     let mode = IsolationMode::parse(value(&environment, "CATALOG_SIGN_MODE")?)?;
     let expected_input_digest = value(&environment, "CATALOG_SIGN_INPUT_SHA256")?;
-    if !valid_sha256(expected_input_digest) {
+    let launcher_config_sha256 = value(&environment, "CATALOG_SIGN_CONFIG_SHA256")?;
+    let signer_sha256 = value(&environment, "CATALOG_SIGN_SIGNER_SHA256")?;
+    if !valid_sha256(expected_input_digest)
+        || !valid_sha256(launcher_config_sha256)
+        || !valid_sha256(signer_sha256)
+    {
         return Err(rejected());
     }
 
@@ -176,6 +189,8 @@ pub fn enter_signer_isolation() -> Result<SignerIsolation, SignError> {
             schema_version: 1,
             mode,
             input_transfer_sha256,
+            launcher_config_sha256: launcher_config_sha256.to_owned(),
+            signer_sha256: signer_sha256.to_owned(),
             no_new_privileges,
             launcher_seccomp_filter,
             launcher_prefilter_errno,
@@ -204,7 +219,9 @@ fn exact_environment() -> Result<BTreeMap<String, String>, SignError> {
         "CATALOG_SIGN_HOST_NETWORK_NS",
         "CATALOG_SIGN_HOST_PID_NS",
         "CATALOG_SIGN_HOST_USER_NS",
+        "CATALOG_SIGN_CONFIG_SHA256",
         "CATALOG_SIGN_INPUT_SHA256",
+        "CATALOG_SIGN_SIGNER_SHA256",
         "CATALOG_SIGN_ISOLATION",
         "CATALOG_SIGN_MODE",
         "HOME",
@@ -886,12 +903,31 @@ pub fn emit_reverse_transfer_manifest(isolation: &SignerIsolation) -> Result<(),
     let attestation = isolation.attestation();
     let expected_top = match attestation.mode {
         IsolationMode::AssembleIntent | IsolationMode::Finalize => "candidate.json",
-        IsolationMode::Sign => "signed-release-bundle",
+        IsolationMode::Sign | IsolationMode::RecoverSign => "signed-release-bundle",
         IsolationMode::IsolationProbe => "isolation-probe-v1.json",
     };
     let output = Path::new("/output");
     let names = directory_names(output)?;
-    if names != BTreeSet::from([expected_top.to_owned()]) {
+    let manifest_exists = names.contains("transfer-manifest-v1.json");
+    let recovery_binding_exists = names.contains("sign-recovery-binding-v1.json");
+    let mut expected_names = BTreeSet::from([expected_top.to_owned()]);
+    if manifest_exists {
+        expected_names.insert("transfer-manifest-v1.json".to_owned());
+    }
+    if recovery_binding_exists {
+        expected_names.insert("sign-recovery-binding-v1.json".to_owned());
+    }
+    if names != expected_names
+        || (matches!(
+            attestation.mode,
+            IsolationMode::Sign | IsolationMode::RecoverSign
+        ) && !manifest_exists
+            && !recovery_binding_exists)
+        || (!matches!(
+            attestation.mode,
+            IsolationMode::Sign | IsolationMode::RecoverSign
+        ) && recovery_binding_exists)
+    {
         return Err(rejected());
     }
     let mut paths = Vec::new();
@@ -931,18 +967,112 @@ pub fn emit_reverse_transfer_manifest(isolation: &SignerIsolation) -> Result<(),
             sha256: hash_descriptor(&file, metadata.len())?,
         });
     }
-    let manifest = ReverseTransferManifestV1 {
-        schema_version: 1,
-        kind: "signer_output",
-        input_transfer_sha256: attestation.input_transfer_sha256(),
-        isolation_attestation: attestation,
-        entries,
-    };
-    let bytes = serde_jcs::to_vec(&manifest).map_err(|_| rejected())?;
-    write_fresh_public_file(Path::new(OUTPUT_MANIFEST), &bytes)?;
+    if manifest_exists {
+        verify_existing_reverse_manifest(attestation, &entries)?;
+    } else {
+        let manifest = ReverseTransferManifestV1 {
+            schema_version: 1,
+            kind: "signer_output",
+            input_transfer_sha256: attestation.input_transfer_sha256(),
+            isolation_attestation: attestation,
+            entries,
+        };
+        let bytes = serde_jcs::to_vec(&manifest).map_err(|_| rejected())?;
+        write_fresh_public_file(Path::new(OUTPUT_MANIFEST), &bytes)?;
+    }
+    if recovery_binding_exists {
+        settle_recovery_binding(attestation)?;
+    }
     fs::File::open(output)
         .and_then(|directory| directory.sync_all())
         .map_err(|_| rejected())
+}
+
+fn settle_recovery_binding(attestation: &IsolationAttestationV1) -> Result<(), SignError> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(RECOVERY_BINDING)
+        .map_err(|_| rejected())?;
+    let metadata = file.metadata().map_err(|_| rejected())?;
+    if metadata.uid() != current_euid()
+        || metadata.nlink() != 1
+        || metadata.permissions().mode() & 0o7777 != 0o400
+        || metadata.len() == 0
+        || metadata.len() > MAX_MANIFEST_BYTES
+    {
+        return Err(rejected());
+    }
+    let mut retained = file.try_clone().map_err(|_| rejected())?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    retained.read_to_end(&mut bytes).map_err(|_| rejected())?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| rejected())?;
+    if serde_jcs::to_vec(&value).map_err(|_| rejected())? != bytes
+        || value.as_object().is_none_or(|object| object.len() != 5)
+        || value["schema_version"] != 1
+        || value["kind"] != "sign_recovery_binding"
+        || value["input_transfer_sha256"] != attestation.input_transfer_sha256
+        || value["launcher_config_sha256"] != attestation.launcher_config_sha256
+        || value["signer_sha256"] != attestation.signer_sha256
+    {
+        return Err(rejected());
+    }
+    let output = fs::File::open("/output").map_err(|_| rejected())?;
+    let name = CString::new("sign-recovery-binding-v1.json").expect("fixed recovery binding");
+    // SAFETY: retained output and exact verified one-link regular name are valid.
+    if unsafe { libc::unlinkat(output.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+        return Err(SignError::OutputDurabilityUncertain);
+    }
+    output
+        .sync_all()
+        .map_err(|_| SignError::OutputDurabilityUncertain)
+}
+
+fn verify_existing_reverse_manifest(
+    current: &IsolationAttestationV1,
+    expected_entries: &[ReverseTransferEntryV1],
+) -> Result<(), SignError> {
+    let path = Path::new(OUTPUT_MANIFEST);
+    let metadata = fs::symlink_metadata(path).map_err(|_| rejected())?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != current_euid()
+        || metadata.nlink() != 1
+        || metadata.permissions().mode() & 0o7777 != 0o400
+        || metadata.len() == 0
+        || metadata.len() > MAX_MANIFEST_BYTES
+    {
+        return Err(rejected());
+    }
+    let bytes = fs::read(path).map_err(|_| rejected())?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| rejected())?;
+    if serde_jcs::to_vec(&value).map_err(|_| rejected())? != bytes
+        || value.as_object().is_none_or(|object| object.len() != 5)
+        || value["schema_version"] != 1
+        || value["kind"] != "signer_output"
+        || value["input_transfer_sha256"] != current.input_transfer_sha256()
+        || value["isolation_attestation"]["launcher_config_sha256"]
+            != current.launcher_config_sha256
+        || value["isolation_attestation"]["signer_sha256"] != current.signer_sha256
+        || value["entries"] != serde_json::to_value(expected_entries).map_err(|_| rejected())?
+    {
+        return Err(rejected());
+    }
+    let historical_mode = value
+        .pointer("/isolation_attestation/mode")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(rejected)?;
+    let mode_matches = historical_mode
+        == match current.mode {
+            IsolationMode::AssembleIntent => "assemble-intent",
+            IsolationMode::Finalize => "finalize",
+            IsolationMode::Sign | IsolationMode::RecoverSign => "sign",
+            IsolationMode::IsolationProbe => "isolation-probe",
+        };
+    if !mode_matches {
+        return Err(rejected());
+    }
+    Ok(())
 }
 
 fn collect_output_paths(
@@ -983,29 +1113,122 @@ fn directory_names(path: &Path) -> Result<BTreeSet<String>, SignError> {
     Ok(names)
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReverseManifestCheckpoint {
+    Link,
+    ParentFsync,
+    Reopen,
+}
+
+#[cfg(test)]
+thread_local! {
+    static REVERSE_MANIFEST_FAULT: std::cell::Cell<Option<ReverseManifestCheckpoint>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+fn set_reverse_manifest_fault(checkpoint: ReverseManifestCheckpoint) {
+    REVERSE_MANIFEST_FAULT.set(Some(checkpoint));
+}
+
+#[cfg(test)]
+fn take_reverse_manifest_fault(checkpoint: ReverseManifestCheckpoint) -> bool {
+    REVERSE_MANIFEST_FAULT.with(|fault| {
+        if fault.get() == Some(checkpoint) {
+            fault.set(None);
+            true
+        } else {
+            false
+        }
+    })
+}
+
 fn write_fresh_public_file(path: &Path, bytes: &[u8]) -> Result<(), SignError> {
     if bytes.is_empty() || bytes.len() as u64 > MAX_MANIFEST_BYTES {
         return Err(rejected());
     }
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(path)
-        .map_err(|_| rejected())?;
+    let parent_path = path.parent().ok_or_else(rejected)?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| safe_component(name))
+        .ok_or_else(rejected)?;
+    let parent = fs::File::open(parent_path).map_err(|_| rejected())?;
+    let dot = CString::new(".").expect("fixed temporary path");
+    // SAFETY: retained directory and fixed path are valid; O_TMPFILE has no visible partial name.
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            dot.as_ptr(),
+            libc::O_TMPFILE | libc::O_RDWR | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if descriptor < 0 {
+        return Err(rejected());
+    }
+    // SAFETY: openat returned one owned descriptor.
+    let mut file = unsafe { fs::File::from_raw_fd(descriptor) };
     file.write_all(bytes).map_err(|_| rejected())?;
     file.flush().map_err(|_| rejected())?;
     file.set_permissions(fs::Permissions::from_mode(0o400))
         .map_err(|_| rejected())?;
     file.sync_all().map_err(|_| rejected())?;
+    verify_exact_public_file(&file, bytes, 0)?;
+    #[cfg(test)]
+    if take_reverse_manifest_fault(ReverseManifestCheckpoint::Link) {
+        return Err(rejected());
+    }
+    let name = CString::new(name).map_err(|_| rejected())?;
+    // SAFETY: AT_EMPTY_PATH links the exact settled unnamed inode without replacement.
+    if unsafe {
+        libc::linkat(
+            file.as_raw_fd(),
+            c"".as_ptr(),
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::AT_EMPTY_PATH,
+        )
+    } != 0
+    {
+        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
+            return Err(rejected());
+        }
+        let existing = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|_| rejected())?;
+        return verify_exact_public_file(&existing, bytes, 1);
+    }
+    #[cfg(test)]
+    if take_reverse_manifest_fault(ReverseManifestCheckpoint::ParentFsync) {
+        return Err(SignError::OutputDurabilityUncertain);
+    }
+    parent
+        .sync_all()
+        .map_err(|_| SignError::OutputDurabilityUncertain)?;
+    #[cfg(test)]
+    if take_reverse_manifest_fault(ReverseManifestCheckpoint::Reopen) {
+        return Err(SignError::OutputDurabilityUncertain);
+    }
+    let reopened = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|_| rejected())?;
+    verify_exact_public_file(&reopened, bytes, 1)
+}
+
+fn verify_exact_public_file(file: &fs::File, expected: &[u8], links: u64) -> Result<(), SignError> {
     let metadata = file.metadata().map_err(|_| rejected())?;
-    if metadata.len() != bytes.len() as u64
+    if metadata.len() != expected.len() as u64
         || metadata.uid() != current_euid()
-        || metadata.nlink() != 1
+        || metadata.nlink() != links
         || metadata.permissions().mode() & 0o7777 != 0o400
-        || hash_descriptor(&file, metadata.len())? != sha256(bytes)
+        || hash_descriptor(file, metadata.len())? != sha256(expected)
     {
         return Err(rejected());
     }
@@ -1068,4 +1291,71 @@ fn current_egid() -> u32 {
 
 const fn rejected() -> SignError {
     SignError::IsolationRejected
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        os::unix::fs::{DirBuilderExt, PermissionsExt},
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use super::*;
+
+    #[test]
+    fn reverse_manifest_visibility_faults_are_atomic_and_idempotently_completable() {
+        let root = TempDirectory::new();
+        let bytes = br#"{"kind":"signer_output","schema_version":1}"#;
+        for checkpoint in [
+            ReverseManifestCheckpoint::Link,
+            ReverseManifestCheckpoint::ParentFsync,
+            ReverseManifestCheckpoint::Reopen,
+        ] {
+            let path = root
+                .path
+                .join(format!("manifest-{}.json", checkpoint as u8));
+            set_reverse_manifest_fault(checkpoint);
+            assert!(write_fresh_public_file(&path, bytes).is_err());
+            if checkpoint == ReverseManifestCheckpoint::Link {
+                assert!(!path.exists());
+            } else {
+                assert_eq!(fs::read(&path).unwrap(), bytes);
+                write_fresh_public_file(&path, bytes).unwrap();
+                assert_eq!(fs::read(&path).unwrap(), bytes);
+            }
+        }
+
+        let conflicting = root.path.join("conflicting.json");
+        fs::write(&conflicting, b"conflicting-partial").unwrap();
+        fs::set_permissions(&conflicting, fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(write_fresh_public_file(&conflicting, bytes).is_err());
+        assert_eq!(fs::read(conflicting).unwrap(), b"conflicting-partial");
+    }
+
+    struct TempDirectory {
+        path: PathBuf,
+    }
+
+    impl TempDirectory {
+        fn new() -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "catalog-reverse-manifest-test-{}-{nonce}",
+                std::process::id()
+            ));
+            fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for TempDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
 }

@@ -705,8 +705,8 @@ def isolation_boundary_errors(sources):
             errors.append(f"inner isolation does not precede {later}")
     if main.count("catalog_sign::enter_signer_isolation()") != 1:
         errors.append("inner main isolation entry count changed")
-    if "catalog_sign::emit_reverse_transfer_manifest(&isolation)?;" not in main:
-        errors.append("reverse transfer manifest is not mandatory after inner success")
+    if main.count("catalog_sign::emit_reverse_transfer_manifest(&isolation)") != 2:
+        errors.append("reverse transfer completion is not mandatory after success and uncertainty")
 
     inner_sources = main + inner + signing + lib
     for forbidden in ["std::process::Command", "Command::new(", "std::net::", "TcpStream", "UdpSocket"]:
@@ -833,7 +833,7 @@ def isolation_boundary_errors(sources):
     if "pub fn run_cli(" in lib or "pub fn sign_release(" in signing or "pub fn sign_release_from_path(" in signing:
         errors.append("raw CLI/signing authority is publicly exported")
     for required in [
-        "isolation: &SignerIsolation", "signing::run_isolated_cli(isolation.verified_transfer(), args)",
+        "pub fn run_isolated_cli(isolation: &SignerIsolation", "signing::run_isolated_cli(isolation.verified_transfer(), args)",
     ]:
         if required not in lib:
             errors.append(f"production CLI lost isolation capability requirement: {required}")
@@ -937,7 +937,8 @@ if errors:
 # One-at-a-time removals target the actual enforcement expressions rather than documentation tokens.
 mutations = [
     (0, "catalog_sign::enter_signer_isolation()", "catalog_sign::enter_signer_isolation_removed()", "first-operation isolation", 1),
-    (0, "catalog_sign::emit_reverse_transfer_manifest(&isolation)?;", "", "reverse transfer emission", 1),
+    (0, "catalog_sign::emit_reverse_transfer_manifest(&isolation)", "catalog_sign::removed_reverse_transfer_manifest(&isolation)", "successful reverse transfer emission", 1),
+    (0, "catalog_sign::emit_reverse_transfer_manifest(&isolation)", "catalog_sign::removed_reverse_transfer_manifest(&isolation)", "uncertain reverse transfer completion", 2),
     (1, 'verify_empty_directory(Path::new("/home/signer"))?;', "", "empty private home", 1),
     (1, "verify_open_descriptors()?;", "", "ambient descriptor rejection", 1),
     (3, "hash_descriptor(&file, metadata.len())? != config.signer_sha256", "false", "signer descriptor hash", 1),
@@ -983,7 +984,7 @@ mutations = [
     (1, "pub struct SignerIsolation", "pub struct RemovedSignerIsolation", "isolation capability", 1),
     (1, "#[derive(Debug, Clone, PartialEq, Eq, Serialize)]", "#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]", "non-deserializable attestation", 1),
     (2, "fn sign_release(request: SignReleaseRequest", "pub fn sign_release(request: SignReleaseRequest", "private raw signing seam", 1),
-    (4, "isolation: &SignerIsolation", "isolation: &IsolationAttestationV1", "CLI capability signature", 1),
+    (4, "pub fn run_isolated_cli(isolation: &SignerIsolation", "pub fn run_isolated_cli(isolation: &IsolationAttestationV1", "CLI capability signature", 1),
     (4, "signing::run_isolated_cli(isolation.verified_transfer(), args)", "signing::run_isolated_cli_removed(args)", "retained CLI consumption", 1),
     (1, 'verify_transferred_bundle(Path::new("/input"))?', 'verify_transferred_bundle(Path::new("/other"))?', "exact isolated transfer verification", 1),
     (1, "if input_transfer_sha256 != expected_input_digest", "if false", "attested digest comparison", 1),
@@ -1049,5 +1050,172 @@ for index, old, new, label, occurrence in mutations:
         sys.exit(1)
     if not isolation_boundary_errors(tuple(mutated)):
         print(f"isolation boundary scanner accepted removed enforcement: {label}", file=sys.stderr)
+        sys.exit(1)
+PY
+
+python3 - <<'PY'
+from pathlib import Path
+import sys
+
+paths = {
+    "manifest": "crates/catalog-sign/Cargo.toml",
+    "production_main": "crates/catalog-sign/src/main.rs",
+    "fixture_main": "crates/catalog-sign/src/bin/catalog-sign-fixture.rs",
+    "launcher": "crates/catalog-sign/src/bin/catalog-sign-launcher.rs",
+    "inner": "crates/catalog-sign/src/isolation.rs",
+    "key": "crates/catalog-sign/src/key.rs",
+    "signing": "crates/catalog-sign/src/signing.rs",
+    "launcher_test": "crates/catalog-sign/tests/launcher_contract.rs",
+}
+sources = {name: Path(path).read_text(encoding="utf-8") for name, path in paths.items()}
+
+
+def round2_errors(source):
+    errors = []
+    required = {
+        "manifest": [
+            'name = "catalog-sign-fixture"',
+        ],
+        "fixture_main": [
+            "run_fixture_isolated_cli(&isolation, &arguments)",
+            "recover_fixture_isolated_output(&isolation)",
+            "emit_reverse_transfer_manifest(&isolation)",
+        ],
+        "key": [
+            "read_fixture_signing_key(",
+            "FIXTURE_RUNTIME_KEY_ID",
+        ],
+        "launcher": [
+            "#[cfg(test)]\npub(crate) trait LauncherTestCheckpoints",
+            "checkpoints.before_signer_open();",
+            "checkpoints.after_signer_open();",
+            "checkpoints.before_bwrap_bind();",
+            "rebind_executable(&signer, FilePolicy::Signer)?;",
+            "Ceremony::RecoverSign",
+            "open_existing_output(&request.output)?",
+            '"CATALOG_SIGN_CONFIG_SHA256"',
+            '"CATALOG_SIGN_SIGNER_SHA256"',
+            '"recover-sign",\n                "--input"',
+        ],
+        "signing": [
+            "PublicationDurability::Uncertain",
+            "self.published = true;",
+            "container_metadata.nlink() != 2",
+            "SignError::OutputDurabilityUncertain",
+            "fn recover_signed_output(",
+            "settle_exact_empty_staging(",
+            "verify_signed_bytes(&signed, verification_policy)?;",
+            "PublishCheckpoint::RenameVisibility",
+            "PublishCheckpoint::FirstParentFsync",
+            "PublishCheckpoint::EmptyContainerUnlink",
+            "PublishCheckpoint::FinalParentFsync",
+            "PublishCheckpoint::FinalReopen",
+        ],
+        "inner": [
+            "verify_existing_reverse_manifest(attestation, &entries)?;",
+            "settle_recovery_binding(attestation)?;",
+            "launcher_config_sha256: String",
+            "signer_sha256: String",
+            "current.launcher_config_sha256",
+            "current.signer_sha256",
+            "libc::O_TMPFILE | libc::O_RDWR | libc::O_CLOEXEC",
+            "libc::AT_EMPTY_PATH",
+            "Some(libc::EEXIST)",
+            "verify_exact_public_file(&existing, bytes, 1)",
+            "ReverseManifestCheckpoint::Link",
+            "ReverseManifestCheckpoint::ParentFsync",
+            "ReverseManifestCheckpoint::Reopen",
+        ],
+        "production_main": [
+            "Err(catalog_sign::SignError::OutputDurabilityUncertain)",
+            "recover_production_isolated_output(&isolation)",
+        ],
+        "launcher_test": [
+            "fixture_authority_signs_through_real_launcher_and_reverse_transfer",
+            "synchronized_signer_substitution_uniquely_converts_fixture_success_to_failure",
+            "verify_fixture_catalog(&catalog_bytes)",
+            "verify_fixture_manifest(&manifest_bytes)",
+            "verify_signed_catalog(&catalog_bytes).is_err()",
+            "Checkpoint::BeforeOpen",
+            "Checkpoint::AfterOpen",
+            "Checkpoint::BeforeBind",
+            "!key_witness.observed_open()",
+            "launch_recover(&config, &input, &output)",
+            "!recovery_key_witness.observed_open()",
+            "recovery admitted a different launcher config/signer identity",
+        ],
+    }
+    for name, tokens in required.items():
+        for token in tokens:
+            if token not in source[name]:
+                errors.append(f"missing round-2 enforcement in {name}: {token.splitlines()[0]}")
+    fixture_bin = source["manifest"].split('name = "catalog-sign-fixture"', 1)[-1].split("[[example]]", 1)[0]
+    if 'required-features = ["fixture-tools"]' not in fixture_bin:
+        errors.append("fixture signer binary lost its nondefault feature gate")
+    fixture_key_reader = source["key"].split("pub(crate) fn read_fixture_signing_key", 1)[-1].split("pub(crate) fn fixture_signing_key", 1)[0]
+    if "public_key: &FIXTURE_PUBLIC" not in fixture_key_reader:
+        errors.append("fixture signer key reader lost its fixture-only public identity")
+    production_surface = source["production_main"] + source["launcher"]
+    for forbidden in ["catalog-test-key-v1", "FIXTURE_PUBLIC", "read_fixture_signing_key"]:
+        if forbidden in production_surface:
+            errors.append(f"fixture authority crossed into production surface: {forbidden}")
+    if source["launcher"].count("write_recovery_binding(") != 2:
+        errors.append("fresh sign does not invoke exactly one persisted recovery binding writer")
+    if source["launcher"].count("verify_recovery_binding(") != 2:
+        errors.append("recovery does not invoke exactly one config/signer binding verifier")
+    if source["signing"].count("self.parent.sync_all().is_err()") != 2:
+        errors.append("both signed-output parent fsync uncertainty checks are not enforced")
+    publish_region = source["signing"].split("fn publish(&mut self)", 1)[-1].split("fn create_staging_container", 1)[0]
+    if "enumerate_names(&self.container)" not in publish_region:
+        errors.append("published staging cleanup no longer rejects nonempty retained evidence")
+    checkpoint_region = source["launcher"].split("fn launch_impl(", 1)[-1].split("#[derive(Clone, Copy)]", 1)[0]
+    if checkpoint_region.count("#[cfg(test)]\n    checkpoints.") != 3:
+        errors.append("test checkpoints are not exactly cfg(test)-confined")
+    if "CATALOG_SIGN_TEST" in source["launcher"] or "test-checkpoint" in source["launcher"]:
+        errors.append("launcher gained an ambient production checkpoint hook")
+    if source["launcher_test"].count("assert_eq!(snapshot_tree(&output), first_snapshot)") != 3:
+        errors.append("no-clobber, recovery, and recovery rejection do not preserve exact first output bytes")
+    return errors
+
+errors = round2_errors(sources)
+if errors:
+    print(errors[0], file=sys.stderr)
+    sys.exit(1)
+
+mutations = [
+    ("manifest", 'required-features = ["fixture-tools"]', 'required-features = []', "fixture feature gate"),
+    ("fixture_main", "run_fixture_isolated_cli(&isolation, &arguments)", "run_isolated_cli(&isolation, &arguments)", "fixture/production signer separation"),
+    ("key", "public_key: &FIXTURE_PUBLIC", "public_key: production_key_identity().public_key_bytes()", "fixture public identity"),
+    ("launcher", "checkpoints.before_signer_open();", "", "before-open checkpoint"),
+    ("launcher", "checkpoints.after_signer_open();", "", "after-open checkpoint"),
+    ("launcher", "checkpoints.before_bwrap_bind();", "", "before-bind checkpoint"),
+    ("launcher", "open_existing_output(&request.output)?", "create_fresh_output(&request.output)?", "closed recovery output"),
+    ("launcher", "write_recovery_binding(", "removed_binding_write(", "persisted recovery binding"),
+    ("launcher", "verify_recovery_binding(", "removed_binding_verify(", "recovery config/signer binding"),
+    ("signing", "self.published = true;", "", "payload visibility state"),
+    ("signing", "self.parent.sync_all().is_err()", "false", "first/final fsync uncertainty"),
+    ("signing", "container_metadata.nlink() != 2", "false", "exact empty cleanup identity"),
+    ("signing", "if !secure_directory(&container_metadata)\n            || container_metadata.nlink() != 2\n            || !enumerate_names(&self.container)", "if !secure_directory(&container_metadata)\n            || container_metadata.nlink() != 2\n            || !removed_container_enumeration()", "nonempty cleanup rejection"),
+    ("signing", "fn recover_signed_output(", "fn removed_public_recovery(", "exact public recovery"),
+    ("signing", "verify_signed_bytes(&signed, verification_policy)?;", "", "recovery public verification"),
+    ("inner", "verify_existing_reverse_manifest(attestation, &entries)?;", "", "idempotent reverse completion"),
+    ("inner", "settle_recovery_binding(attestation)?;", "", "recovery binding settlement"),
+    ("inner", "current.launcher_config_sha256", "removed_config_identity", "historical config identity"),
+    ("inner", "current.signer_sha256", "removed_signer_identity", "historical signer identity"),
+    ("inner", "libc::O_TMPFILE | libc::O_RDWR | libc::O_CLOEXEC", "libc::O_RDWR | libc::O_CREAT", "partial reverse visibility"),
+    ("inner", "verify_exact_public_file(&existing, bytes, 1)", "Ok(())", "conflicting reverse rejection"),
+    ("production_main", "recover_production_isolated_output(&isolation)", "Ok(())", "post-visibility completion"),
+    ("launcher_test", "!key_witness.observed_open()", "true", "substitution zero-key-open witness"),
+    ("launcher_test", "assert_eq!(snapshot_tree(&output), first_snapshot)", "", "no-clobber byte preservation"),
+    ("launcher_test", "verify_signed_catalog(&catalog_bytes).is_err()", "true", "fixture cannot production-verify"),
+]
+for name, old, new, label in mutations:
+    mutated = dict(sources)
+    mutated[name] = mutated[name].replace(old, new, 1)
+    if mutated[name] == sources[name]:
+        print(f"round-2 mutation could not be applied: {label}", file=sys.stderr)
+        sys.exit(1)
+    if not round2_errors(mutated):
+        print(f"round-2 scanner accepted removed enforcement: {label}", file=sys.stderr)
         sys.exit(1)
 PY

@@ -327,7 +327,9 @@ fn complete_marker_environment() -> Vec<(&'static str, String)> {
         ("TZ", "UTC".to_owned()),
         ("CATALOG_SIGN_ISOLATION", "launcher-v1".to_owned()),
         ("CATALOG_SIGN_MODE", "sign".to_owned()),
+        ("CATALOG_SIGN_CONFIG_SHA256", "01".repeat(32)),
         ("CATALOG_SIGN_INPUT_SHA256", "00".repeat(32)),
+        ("CATALOG_SIGN_SIGNER_SHA256", "02".repeat(32)),
         (
             "CATALOG_SIGN_EUID",
             // SAFETY: geteuid has no preconditions.

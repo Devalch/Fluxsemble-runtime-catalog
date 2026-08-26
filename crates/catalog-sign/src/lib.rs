@@ -26,6 +26,7 @@ pub enum SignError {
     CandidateRejected,
     SigningKeyRejected,
     OutputRejected,
+    OutputDurabilityUncertain,
     VerificationFailed,
 }
 
@@ -75,6 +76,13 @@ pub fn run_isolated_cli(isolation: &SignerIsolation, args: &[String]) -> Result<
             "--output",
             "/output/signed-release-bundle",
         ][..],
+        IsolationMode::RecoverSign => &[
+            "recover-sign",
+            "--input",
+            "/input",
+            "--output",
+            "/output/signed-release-bundle",
+        ][..],
         IsolationMode::IsolationProbe => &["__isolation-probe"][..],
     };
     if args.iter().map(String::as_str).ne(expected.iter().copied()) {
@@ -86,6 +94,57 @@ pub fn run_isolated_cli(isolation: &SignerIsolation, args: &[String]) -> Result<
     } else {
         signing::run_isolated_cli(isolation.verified_transfer(), args)
     }
+}
+
+pub fn recover_production_isolated_output(isolation: &SignerIsolation) -> Result<(), SignError> {
+    if !matches!(
+        isolation.attestation().mode(),
+        IsolationMode::Sign | IsolationMode::RecoverSign
+    ) {
+        return Err(SignError::ArgumentRejected);
+    }
+    signing::recover_production_isolated_output(isolation.verified_transfer())
+}
+
+#[cfg(feature = "fixture-tools")]
+pub fn run_fixture_isolated_cli(
+    isolation: &SignerIsolation,
+    args: &[String],
+) -> Result<String, SignError> {
+    let expected = match isolation.attestation().mode() {
+        IsolationMode::Sign => &[
+            "sign",
+            "--input",
+            "/input",
+            "--key",
+            "/key/runtime-catalog-private.pem",
+            "--output",
+            "/output/signed-release-bundle",
+        ][..],
+        IsolationMode::RecoverSign => &[
+            "recover-sign",
+            "--input",
+            "/input",
+            "--output",
+            "/output/signed-release-bundle",
+        ][..],
+        _ => return Err(SignError::ArgumentRejected),
+    };
+    if args.iter().map(String::as_str).ne(expected.iter().copied()) {
+        return Err(SignError::ArgumentRejected);
+    }
+    signing::run_fixture_isolated_cli(isolation.verified_transfer(), args)
+}
+
+#[cfg(feature = "fixture-tools")]
+pub fn recover_fixture_isolated_output(isolation: &SignerIsolation) -> Result<(), SignError> {
+    if !matches!(
+        isolation.attestation().mode(),
+        IsolationMode::Sign | IsolationMode::RecoverSign
+    ) {
+        return Err(SignError::ArgumentRejected);
+    }
+    signing::recover_fixture_isolated_output(isolation.verified_transfer())
 }
 
 #[must_use]

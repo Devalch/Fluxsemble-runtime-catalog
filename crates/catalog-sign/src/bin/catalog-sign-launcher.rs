@@ -21,6 +21,7 @@ const MAX_CONFIG_BYTES: u64 = 16 * 1024;
 const MAX_BWRAP_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_SIGNER_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_KEY_BYTES: u64 = 16 * 1024;
+const RECOVERY_BINDING_NAME: &str = "sign-recovery-binding-v1.json";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -37,6 +38,7 @@ enum Ceremony {
     AssembleIntent,
     Finalize,
     Sign,
+    RecoverSign,
     IsolationProbe,
 }
 
@@ -46,6 +48,7 @@ impl Ceremony {
             Self::AssembleIntent => "assemble-intent",
             Self::Finalize => "finalize",
             Self::Sign => "sign",
+            Self::RecoverSign => "recover-sign",
             Self::IsolationProbe => "isolation-probe",
         }
     }
@@ -119,7 +122,12 @@ fn parse_request(args: &[std::ffi::OsString]) -> Result<Request, SignError> {
             .ok_or_else(rejected)
     };
     match args.first().and_then(|value| value.to_str()) {
-        Some("assemble-intent") | Some("finalize") | Some("isolation-probe") if args.len() == 7 => {
+        Some("assemble-intent")
+        | Some("finalize")
+        | Some("recover-sign")
+        | Some("isolation-probe")
+            if args.len() == 7 =>
+        {
             if args[1] != "--config" || args[3] != "--input" || args[5] != "--output" {
                 return Err(rejected());
             }
@@ -128,6 +136,8 @@ fn parse_request(args: &[std::ffi::OsString]) -> Result<Request, SignError> {
                     Ceremony::AssembleIntent
                 } else if args[0] == "finalize" {
                     Ceremony::Finalize
+                } else if args[0] == "recover-sign" {
+                    Ceremony::RecoverSign
                 } else {
                     Ceremony::IsolationProbe
                 },
@@ -157,10 +167,48 @@ fn parse_request(args: &[std::ffi::OsString]) -> Result<Request, SignError> {
     }
 }
 
+#[cfg(test)]
+pub(crate) trait LauncherTestCheckpoints {
+    fn before_signer_open(&mut self) {}
+    fn after_signer_open(&mut self) {}
+    fn before_bwrap_bind(&mut self) {}
+}
+
+#[cfg(test)]
+struct NoopTestCheckpoints;
+#[cfg(test)]
+impl LauncherTestCheckpoints for NoopTestCheckpoints {}
+
+#[cfg(not(test))]
 fn launch(request: Request) -> Result<(), SignError> {
+    launch_impl(request)
+}
+
+#[cfg(test)]
+fn launch(request: Request) -> Result<(), SignError> {
+    launch_impl(request, &mut NoopTestCheckpoints)
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn launch_with_test_checkpoints(
+    arguments: &[std::ffi::OsString],
+    checkpoints: &mut dyn LauncherTestCheckpoints,
+) -> Result<(), SignError> {
+    launch_impl(parse_request(arguments)?, checkpoints)
+}
+
+fn launch_impl(
+    request: Request,
+    #[cfg(test)] checkpoints: &mut dyn LauncherTestCheckpoints,
+) -> Result<(), SignError> {
     let (config, config_file, config_identity, config_sha256) = read_config(&request.config)?;
     let bwrap = verify_bwrap(&config)?;
+    #[cfg(test)]
+    checkpoints.before_signer_open();
     let signer = verify_static_signer(&config)?;
+    #[cfg(test)]
+    checkpoints.after_signer_open();
     rebind_exact(
         &request.config,
         &config_file,
@@ -199,16 +247,37 @@ fn launch(request: Request) -> Result<(), SignError> {
         rebind_exact(path, file, *identity, FilePolicy::Key)?;
     }
 
-    let output = create_fresh_output(&request.output)?;
+    let output = if request.ceremony == Ceremony::RecoverSign {
+        open_existing_output(&request.output)?
+    } else {
+        create_fresh_output(&request.output)?
+    };
     let output_identity = Identity::from_metadata(&output.metadata().map_err(|_| rejected())?);
     verify_output_capability(&output, output_identity)?;
     rebind_executable(&bwrap, FilePolicy::Bwrap)?;
     rebind_executable(&signer, FilePolicy::Signer)?;
     verified_input.isolated_launch_capability()?;
-    rebind_executable(&signer, FilePolicy::Signer)?;
     verify_input_capability(&input, input_identity)?;
     if let Some((path, file, identity)) = &key {
         rebind_exact(path, file, *identity, FilePolicy::Key)?;
+    }
+    #[cfg(test)]
+    checkpoints.before_bwrap_bind();
+    rebind_executable(&signer, FilePolicy::Signer)?;
+    if request.ceremony == Ceremony::Sign {
+        write_recovery_binding(
+            &output,
+            &config_sha256,
+            &signer.sha256,
+            &input_transfer_sha256,
+        )?;
+    } else if request.ceremony == Ceremony::RecoverSign {
+        verify_recovery_binding(
+            &output,
+            &config_sha256,
+            &signer.sha256,
+            &input_transfer_sha256,
+        )?;
     }
 
     let seccomp = create_launcher_seccomp()?;
@@ -262,6 +331,12 @@ fn launch(request: Request) -> Result<(), SignError> {
             "--setenv",
             "CATALOG_SIGN_INPUT_SHA256",
             &input_transfer_sha256,
+            "--setenv",
+            "CATALOG_SIGN_CONFIG_SHA256",
+            &config_sha256,
+            "--setenv",
+            "CATALOG_SIGN_SIGNER_SHA256",
+            &signer.sha256,
             "--setenv",
             "CATALOG_SIGN_EUID",
             &current_euid().to_string(),
@@ -351,6 +426,15 @@ fn launch(request: Request) -> Result<(), SignError> {
                 "/output/signed-release-bundle",
             ]);
         }
+        Ceremony::RecoverSign => {
+            command.args([
+                "recover-sign",
+                "--input",
+                "/input",
+                "--output",
+                "/output/signed-release-bundle",
+            ]);
+        }
         Ceremony::IsolationProbe => {
             command.arg("__isolation-probe");
         }
@@ -358,6 +442,9 @@ fn launch(request: Request) -> Result<(), SignError> {
 
     let status = command.status().map_err(|_| rejected())?;
     if !status.success() {
+        if request.ceremony == Ceremony::Sign {
+            settle_previsibility_recovery_binding(&output)?;
+        }
         return Err(rejected());
     }
     verify_output_capability(&output, output_identity)?;
@@ -567,6 +654,145 @@ impl OutputCapability {
     }
 }
 
+fn write_recovery_binding(
+    output: &OutputCapability,
+    config_sha256: &str,
+    signer_sha256: &str,
+    input_transfer_sha256: &str,
+) -> Result<(), SignError> {
+    let bytes = serde_jcs::to_vec(&serde_json::json!({
+        "schema_version": 1,
+        "kind": "sign_recovery_binding",
+        "input_transfer_sha256": input_transfer_sha256,
+        "launcher_config_sha256": config_sha256,
+        "signer_sha256": signer_sha256,
+    }))
+    .map_err(|_| rejected())?;
+    let name = CString::new(RECOVERY_BINDING_NAME).expect("fixed recovery binding name");
+    // SAFETY: retained output, fixed name, flags, and mode are valid; O_EXCL forbids replacement.
+    let descriptor = unsafe {
+        libc::openat(
+            output.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0o600,
+        )
+    };
+    if descriptor < 0 {
+        return Err(rejected());
+    }
+    // SAFETY: openat returned one owned descriptor.
+    let mut file = unsafe { fs::File::from_raw_fd(descriptor) };
+    file.write_all(&bytes).map_err(|_| rejected())?;
+    file.flush().map_err(|_| rejected())?;
+    file.set_permissions(fs::Permissions::from_mode(0o400))
+        .map_err(|_| rejected())?;
+    file.sync_all().map_err(|_| rejected())?;
+    if hash_descriptor(&file, bytes.len() as u64)? != sha256(&bytes) {
+        return Err(rejected());
+    }
+    output.file.sync_all().map_err(|_| rejected())
+}
+
+fn settle_previsibility_recovery_binding(output: &OutputCapability) -> Result<(), SignError> {
+    let descriptor_path = format!("/proc/self/fd/{}", output.as_raw_fd());
+    let names = fs::read_dir(descriptor_path)
+        .map_err(|_| rejected())?
+        .map(|entry| {
+            entry
+                .map_err(|_| rejected())?
+                .file_name()
+                .into_string()
+                .map_err(|_| rejected())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if names != [RECOVERY_BINDING_NAME] {
+        return Ok(());
+    }
+    let name = CString::new(RECOVERY_BINDING_NAME).expect("fixed recovery binding");
+    // SAFETY: retained output and exact sole binding name are valid.
+    if unsafe { libc::unlinkat(output.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+        return Err(rejected());
+    }
+    output.file.sync_all().map_err(|_| rejected())
+}
+
+fn verify_recovery_binding(
+    output: &OutputCapability,
+    config_sha256: &str,
+    signer_sha256: &str,
+    input_transfer_sha256: &str,
+) -> Result<(), SignError> {
+    let (file, historical) = if let Some(file) =
+        open_optional_output_file(output, RECOVERY_BINDING_NAME)?
+    {
+        (file, false)
+    } else {
+        (
+            open_optional_output_file(output, "transfer-manifest-v1.json")?.ok_or_else(rejected)?,
+            true,
+        )
+    };
+    let metadata = file.metadata().map_err(|_| rejected())?;
+    if !secure_regular(&metadata, current_euid(), 0o400, MAX_CONFIG_BYTES * 64) {
+        return Err(rejected());
+    }
+    let bytes = read_bounded(&file, metadata.len())?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| rejected())?;
+    if serde_jcs::to_vec(&value).map_err(|_| rejected())? != bytes {
+        return Err(rejected());
+    }
+    let prefix = if historical {
+        "/isolation_attestation"
+    } else {
+        ""
+    };
+    let field = |name: &str| {
+        value
+            .pointer(&format!("{prefix}/{name}"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(rejected)
+    };
+    if field("input_transfer_sha256")? != input_transfer_sha256
+        || field("launcher_config_sha256")? != config_sha256
+        || field("signer_sha256")? != signer_sha256
+        || (historical
+            && value
+                .pointer("/isolation_attestation/mode")
+                .and_then(serde_json::Value::as_str)
+                != Some("sign"))
+    {
+        return Err(rejected());
+    }
+    Ok(())
+}
+
+fn open_optional_output_file(
+    output: &OutputCapability,
+    name: &str,
+) -> Result<Option<fs::File>, SignError> {
+    let name = CString::new(name).map_err(|_| rejected())?;
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: retained directory, fixed name, and writable stat are valid.
+    if unsafe {
+        libc::fstatat(
+            output.as_raw_fd(),
+            name.as_ptr(),
+            metadata.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) {
+            return Ok(None);
+        }
+        return Err(rejected());
+    }
+    output
+        .join_path(name.to_str().map_err(|_| rejected())?)
+        .map(Some)
+}
+
 fn create_fresh_output(path: &Path) -> Result<OutputCapability, SignError> {
     if !path.is_absolute() || path.as_os_str().as_bytes().len() > 4_096 {
         return Err(rejected());
@@ -623,13 +849,49 @@ fn create_fresh_output(path: &Path) -> Result<OutputCapability, SignError> {
     Ok(output)
 }
 
+fn open_existing_output(path: &Path) -> Result<OutputCapability, SignError> {
+    if !path.is_absolute() || path.as_os_str().as_bytes().len() > 4_096 {
+        return Err(rejected());
+    }
+    let name = path
+        .file_name()
+        .filter(|name| safe_component(name))
+        .ok_or_else(rejected)?;
+    let parent_path = require_canonical_absolute(path.parent().ok_or_else(rejected)?)?;
+    let parent = open_absolute_no_links(
+        &parent_path,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+    )?;
+    if !secure_private_directory(&parent.metadata().map_err(|_| rejected())?) {
+        return Err(rejected());
+    }
+    let name = CString::new(name.as_bytes()).map_err(|_| rejected())?;
+    // SAFETY: retained parent and validated component are valid; O_NOFOLLOW rejects links.
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if descriptor < 0 {
+        return Err(rejected());
+    }
+    // SAFETY: openat returned one owned descriptor.
+    let file = unsafe { fs::File::from_raw_fd(descriptor) };
+    let output = OutputCapability { parent, name, file };
+    let identity = Identity::from_metadata(&output.metadata().map_err(|_| rejected())?);
+    verify_output_capability(&output, identity)?;
+    Ok(output)
+}
+
 fn verify_output_capability(
     output: &OutputCapability,
     identity: Identity,
 ) -> Result<(), SignError> {
     let metadata = output.file.metadata().map_err(|_| rejected())?;
     if !secure_private_directory(&metadata)
-        || !same_directory_identity(Identity::from_metadata(&metadata), identity)
+        || !same_output_directory_identity(Identity::from_metadata(&metadata), identity)
     {
         return Err(rejected());
     }
@@ -646,7 +908,7 @@ fn verify_output_capability(
     }
     // SAFETY: openat returned one owned descriptor.
     let rebound = unsafe { fs::File::from_raw_fd(descriptor) };
-    if !same_directory_identity(
+    if !same_output_directory_identity(
         Identity::from_metadata(&rebound.metadata().map_err(|_| rejected())?),
         identity,
     ) {
@@ -655,12 +917,11 @@ fn verify_output_capability(
     Ok(())
 }
 
-fn same_directory_identity(left: Identity, right: Identity) -> bool {
+fn same_output_directory_identity(left: Identity, right: Identity) -> bool {
     left.device == right.device
         && left.inode == right.inode
         && left.uid == right.uid
         && left.mode == right.mode
-        && left.links == right.links
 }
 
 fn require_canonical_absolute(path: &Path) -> Result<PathBuf, SignError> {

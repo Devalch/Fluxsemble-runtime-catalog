@@ -939,8 +939,8 @@ fn inventory_for_files(files: &BTreeMap<String, Vec<u8>>) -> Result<BundleInvent
 #[derive(Clone, Copy)]
 enum SignatureVerificationPolicy {
     Production,
-    #[cfg(test)]
-    SyntheticTestFixture,
+    #[cfg(any(test, feature = "fixture-tools"))]
+    Fixture,
 }
 
 fn verify_signed_bytes(
@@ -962,9 +962,9 @@ fn verify_signed_bytes(
             verify_signed_catalog(catalog).map_err(|_| verification_failed())?;
             verify_signed_release_bundle_manifest(manifest).map_err(|_| verification_failed())?;
         }
-        #[cfg(test)]
-        SignatureVerificationPolicy::SyntheticTestFixture => {
-            verify_fixture_signatures_for_test(catalog, manifest)?;
+        #[cfg(any(test, feature = "fixture-tools"))]
+        SignatureVerificationPolicy::Fixture => {
+            verify_fixture_signatures(catalog, manifest)?;
         }
     }
     for entry in bytes.inventory.entries() {
@@ -979,11 +979,8 @@ fn verify_signed_bytes(
     Ok(())
 }
 
-#[cfg(test)]
-fn verify_fixture_signatures_for_test(
-    catalog_bytes: &[u8],
-    manifest_bytes: &[u8],
-) -> Result<(), SignError> {
+#[cfg(any(test, feature = "fixture-tools"))]
+fn verify_fixture_signatures(catalog_bytes: &[u8], manifest_bytes: &[u8]) -> Result<(), SignError> {
     use ed25519_dalek::{Signature, VerifyingKey};
 
     const FIXTURE_PUBLIC_KEY: [u8; 32] = [
@@ -1037,7 +1034,7 @@ fn verify_fixture_signatures_for_test(
         .map_err(|_| verification_failed())
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "fixture-tools"))]
 fn decode_fixture_signature_for_test(value: &str) -> Option<[u8; 64]> {
     if value.len() != 86 || value.contains('=') {
         return None;
@@ -1084,12 +1081,22 @@ fn write_signed_output(
     }
     output.verify_files(&bytes.files)?;
     verify_signed_bytes(&bytes, verification_policy)?;
-    output.publish()?;
-    let reopened = reopen_signed_output(&output.final_path, &bytes.files)?;
-    if reopened != bytes.files {
-        return Err(verification_failed());
+    let publication = output.publish();
+    if output.published {
+        let reopened = reopen_signed_output(&output.final_path, &bytes.files)?;
+        if reopened != bytes.files {
+            return Err(verification_failed());
+        }
+        verify_signed_bytes(&bytes, verification_policy)?;
+        #[cfg(test)]
+        if take_publish_fault(PublishCheckpoint::FinalReopen).is_some() {
+            return Err(SignError::OutputDurabilityUncertain);
+        }
     }
-    verify_signed_bytes(&bytes, verification_policy)?;
+    let durability = publication?;
+    if durability == PublicationDurability::Uncertain {
+        return Err(SignError::OutputDurabilityUncertain);
+    }
     Ok(SignedReleaseBundleV1 {
         output: output.final_path,
         inventory: bytes.inventory,
@@ -1125,6 +1132,135 @@ fn reopen_signed_output(
         reopened.insert(name.clone(), actual);
     }
     Ok(reopened)
+}
+
+fn recover_signed_output(
+    path: &Path,
+    candidate: &UnsignedReleaseCandidateV1,
+    verification_policy: SignatureVerificationPolicy,
+) -> Result<SignedReleaseBundleV1, SignError> {
+    settle_exact_empty_staging(path.parent().ok_or_else(verification_failed)?)?;
+    let root = open_absolute_directory(path).map_err(|_| verification_failed())?;
+    let metadata = root.metadata().map_err(|_| verification_failed())?;
+    if !secure_directory(&metadata) || metadata.nlink() != 2 {
+        return Err(verification_failed());
+    }
+    let names = enumerate_names(&root).map_err(|_| verification_failed())?;
+    if names.len() < 3 || names.len() > MAX_ENTRIES {
+        return Err(verification_failed());
+    }
+    let mut files = BTreeMap::new();
+    for name in names {
+        if !safe_component(&name) {
+            return Err(verification_failed());
+        }
+        let file = open_regular_at(&root, &name).map_err(|_| verification_failed())?;
+        let metadata = file.metadata().map_err(|_| verification_failed())?;
+        if !secure_file(&metadata) || metadata.len() == 0 || metadata.len() > MAX_ENTRY_BYTES {
+            return Err(verification_failed());
+        }
+        files.insert(
+            name,
+            read_small_descriptor(&file, metadata.len()).map_err(|_| verification_failed())?,
+        );
+    }
+    let catalog = files.get(CATALOG_NAME).ok_or_else(verification_failed)?;
+    let envelope: Value = serde_json::from_slice(catalog).map_err(|_| verification_failed())?;
+    let payload = CatalogPayloadV1::from_json(
+        &serde_json::to_vec(&envelope["payload"]).map_err(|_| verification_failed())?,
+    )
+    .map_err(|_| verification_failed())?;
+    if canonical_catalog_payload(&payload).map_err(|_| verification_failed())?
+        != candidate.canonical_payload
+    {
+        return Err(verification_failed());
+    }
+    let manifest_bytes = files
+        .get(RELEASE_MANIFEST_NAME)
+        .ok_or_else(verification_failed)?;
+    let manifest = SignedReleaseBundleManifestV1::from_json(manifest_bytes)
+        .map_err(|_| verification_failed())?;
+    let bindings = candidate
+        .final_bindings
+        .as_ref()
+        .ok_or_else(verification_failed)?;
+    if manifest.tag().as_str() != candidate.tag
+        || manifest.source_commit().as_str() != bindings.source_commit
+        || manifest.source_tree_sha256().as_str() != bindings.source_tree_sha256
+        || manifest.qualification_sha256().as_str() != bindings.qualification_sha256
+        || manifest.assets().len() != candidate.support_assets.len()
+    {
+        return Err(verification_failed());
+    }
+    for (asset, expected) in manifest.assets().iter().zip(&candidate.support_assets) {
+        if asset.name().as_str() != expected.name
+            || asset.size() != expected.bytes.len() as u64
+            || asset.sha256().as_str() != expected.sha256
+            || files.get(&expected.name) != Some(&expected.bytes)
+        {
+            return Err(verification_failed());
+        }
+    }
+    let expected_checksums = files
+        .iter()
+        .filter(|(name, _)| name.as_str() != CHECKSUMS_NAME)
+        .map(|(name, bytes)| format!("{}  {name}\n", sha256(bytes)))
+        .collect::<String>()
+        .into_bytes();
+    if files.get(CHECKSUMS_NAME) != Some(&expected_checksums) {
+        return Err(verification_failed());
+    }
+    let inventory = inventory_for_files(&files)?;
+    let signed = SignedBytes {
+        files,
+        inventory: inventory.clone(),
+        manifest: manifest.clone(),
+    };
+    verify_signed_bytes(&signed, verification_policy)?;
+    Ok(SignedReleaseBundleV1 {
+        output: path.to_owned(),
+        inventory,
+        manifest,
+    })
+}
+
+fn settle_exact_empty_staging(parent_path: &Path) -> Result<(), SignError> {
+    let parent = open_absolute_directory(parent_path).map_err(|_| verification_failed())?;
+    let mut staging = Vec::new();
+    for name in enumerate_names(&parent).map_err(|_| verification_failed())? {
+        if name.starts_with(".catalog-sign-stage-") {
+            staging.push(name);
+        }
+    }
+    if staging.len() > 1 {
+        return Err(verification_failed());
+    }
+    let Some(name) = staging.pop() else {
+        return Ok(());
+    };
+    if name.len() != ".catalog-sign-stage-".len() + 32
+        || !name[".catalog-sign-stage-".len()..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(verification_failed());
+    }
+    let directory = open_directory_at(&parent, &name).map_err(|_| verification_failed())?;
+    let metadata = directory.metadata().map_err(|_| verification_failed())?;
+    if !secure_directory(&metadata)
+        || metadata.nlink() != 2
+        || !enumerate_names(&directory)
+            .map_err(|_| verification_failed())?
+            .is_empty()
+    {
+        return Err(verification_failed());
+    }
+    let name = CString::new(name).map_err(|_| verification_failed())?;
+    // SAFETY: retained parent and exact validated empty directory name are valid.
+    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
+        return Err(verification_failed());
+    }
+    parent.sync_all().map_err(|_| verification_failed())
 }
 
 fn catalog_payload_for_intent(
@@ -2081,6 +2217,58 @@ impl OutputPreflight {
 /// Owner-private staging follows Task 5's explicit boundary: same-euid principals that can enter
 /// this exact mode-0700 staging namespace are trusted producer principals. The random name is
 /// CSPRNG-derived, publication is one no-clobber rename, and uncertain stages are never deleted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublicationDurability {
+    Durable,
+    Uncertain,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublishCheckpoint {
+    BeforeRename,
+    RenameVisibility,
+    FirstParentFsync,
+    EmptyContainerUnlink,
+    FinalParentFsync,
+    FinalReopen,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublishFault {
+    Once,
+    Persistent,
+    Interrupt,
+}
+
+#[cfg(test)]
+thread_local! {
+    static PUBLISH_FAULT: std::cell::Cell<Option<(PublishCheckpoint, PublishFault)>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+fn set_publish_fault(checkpoint: PublishCheckpoint, fault: PublishFault) {
+    PUBLISH_FAULT.set(Some((checkpoint, fault)));
+}
+
+#[cfg(test)]
+fn take_publish_fault(checkpoint: PublishCheckpoint) -> Option<PublishFault> {
+    PUBLISH_FAULT.with(|configured| {
+        let current = configured.get();
+        if current.is_some_and(|(actual, _)| actual == checkpoint) {
+            if current.is_some_and(|(_, fault)| fault != PublishFault::Persistent) {
+                configured.set(None);
+            }
+            current.map(|(_, fault)| fault)
+        } else {
+            None
+        }
+    })
+}
+
 struct StagedOutput {
     parent: fs::File,
     final_name: CString,
@@ -2185,8 +2373,12 @@ impl StagedOutput {
         Ok(())
     }
 
-    fn publish(&mut self) -> Result<(), SignError> {
+    fn publish(&mut self) -> Result<PublicationDurability, SignError> {
         if self.published || name_exists_at(&self.parent, &self.final_name)? {
+            return Err(output_rejected());
+        }
+        #[cfg(test)]
+        if take_publish_fault(PublishCheckpoint::BeforeRename).is_some() {
             return Err(output_rejected());
         }
         let container = open_directory_at(
@@ -2219,10 +2411,46 @@ impl StagedOutput {
             return Err(output_rejected());
         }
         self.published = true;
-        self.parent.sync_all().map_err(|_| output_rejected())?;
-        // A successful isolated transfer must have no unmanifested staging namespace. The payload
-        // rename leaves this exact retained container empty, so remove only that directory name
-        // after the published payload is durable and sync the parent again.
+        let mut durability = PublicationDurability::Durable;
+        #[cfg(test)]
+        if take_publish_fault(PublishCheckpoint::RenameVisibility).is_some() {
+            return Err(SignError::OutputDurabilityUncertain);
+        }
+        #[cfg(test)]
+        let skip_first_fsync = take_publish_fault(PublishCheckpoint::FirstParentFsync).is_some();
+        #[cfg(not(test))]
+        let skip_first_fsync = false;
+        if skip_first_fsync || self.parent.sync_all().is_err() {
+            durability = PublicationDurability::Uncertain;
+        }
+
+        // Settle only the exact retained container after independently proving that the payload
+        // rename left it empty. Unknown or nonempty evidence is retained and fails closed.
+        let container_metadata = self
+            .container
+            .metadata()
+            .map_err(|_| SignError::OutputDurabilityUncertain)?;
+        if !secure_directory(&container_metadata)
+            || container_metadata.nlink() != 2
+            || !enumerate_names(&self.container)
+                .map_err(|_| SignError::OutputDurabilityUncertain)?
+                .is_empty()
+        {
+            return Err(SignError::OutputDurabilityUncertain);
+        }
+        #[cfg(test)]
+        let unlink_fault = take_publish_fault(PublishCheckpoint::EmptyContainerUnlink);
+        #[cfg(test)]
+        if matches!(
+            unlink_fault,
+            Some(PublishFault::Persistent | PublishFault::Interrupt)
+        ) {
+            return Err(SignError::OutputDurabilityUncertain);
+        }
+        #[cfg(test)]
+        if unlink_fault == Some(PublishFault::Once) {
+            durability = PublicationDurability::Uncertain;
+        }
         if unsafe {
             libc::unlinkat(
                 self.parent.as_raw_fd(),
@@ -2231,9 +2459,16 @@ impl StagedOutput {
             )
         } != 0
         {
-            return Err(output_rejected());
+            return Err(SignError::OutputDurabilityUncertain);
         }
-        self.parent.sync_all().map_err(|_| output_rejected())
+        #[cfg(test)]
+        let skip_final_fsync = take_publish_fault(PublishCheckpoint::FinalParentFsync).is_some();
+        #[cfg(not(test))]
+        let skip_final_fsync = false;
+        if skip_final_fsync || self.parent.sync_all().is_err() {
+            durability = PublicationDurability::Uncertain;
+        }
+        Ok(durability)
     }
 }
 
@@ -2468,8 +2703,133 @@ pub(crate) fn run_isolated_cli(
                 signed.manifest.tag().as_str()
             ))
         }
+        "recover-sign" => {
+            exact_flags(&args[1..], &["--input", "--output"])?;
+            recover_production_isolated_output(bundle)?;
+            Ok("signed output recovered".to_owned())
+        }
         _ => Err(SignError::ArgumentRejected),
     }
+}
+
+pub(crate) fn recover_production_isolated_output(
+    bundle: &VerifiedTransferredBundle,
+) -> Result<(), SignError> {
+    let source = CatalogSourceV1::from_json(&bundle.record_bytes("catalog_source")?)
+        .map_err(|_| candidate_rejected())?;
+    let qualification =
+        CompatibilityQualificationV1::from_json(&bundle.record_bytes("qualification")?)
+            .map_err(|_| candidate_rejected())?;
+    let candidate = finalize_candidate(bundle, &source, &qualification)?;
+    recover_signed_output(
+        Path::new("/output/signed-release-bundle"),
+        &candidate,
+        SignatureVerificationPolicy::Production,
+    )
+    .map(|_| ())
+}
+
+#[cfg(feature = "fixture-tools")]
+pub(crate) fn run_fixture_isolated_cli(
+    bundle: &VerifiedTransferredBundle,
+    args: &[String],
+) -> Result<String, SignError> {
+    if args.is_empty()
+        || args.len() > MAX_ARGUMENTS
+        || args.iter().map(String::len).sum::<usize>() > MAX_ARGUMENT_BYTES
+        || args.iter().any(|value| value.as_bytes().contains(&0))
+    {
+        return Err(SignError::ArgumentRejected);
+    }
+    let candidate = fixture_candidate(bundle)?;
+    if args[0] == "recover-sign" {
+        let values = exact_flags(&args[1..], &["--input", "--output"])?;
+        recover_signed_output(
+            Path::new(&values[1]),
+            &candidate,
+            SignatureVerificationPolicy::Fixture,
+        )?;
+        return Ok("fixture signed output recovered".to_owned());
+    }
+    if args[0] != "sign" {
+        return Err(SignError::ArgumentRejected);
+    }
+    let values = exact_flags(&args[1..], &["--input", "--key", "--output"])?;
+    let output = Path::new(&values[2]);
+    let preflight = OutputPreflight::new(output)?;
+    let signing_key = crate::key::read_fixture_signing_key(Path::new(&values[1]))?;
+    let signed_bytes = sign_candidate(&candidate, signing_key.as_dalek(), "catalog-test-key-v1")?;
+    drop(signing_key);
+    verify_signed_bytes(&signed_bytes, SignatureVerificationPolicy::Fixture)?;
+    let signed = write_signed_output(
+        preflight,
+        signed_bytes,
+        SignatureVerificationPolicy::Fixture,
+    )?;
+    Ok(format!(
+        "fixture signed key_id={} tag={}",
+        signed.manifest.signature().key_id().as_str(),
+        signed.manifest.tag().as_str()
+    ))
+}
+
+#[cfg(feature = "fixture-tools")]
+pub(crate) fn recover_fixture_isolated_output(
+    bundle: &VerifiedTransferredBundle,
+) -> Result<(), SignError> {
+    let candidate = fixture_candidate(bundle)?;
+    recover_signed_output(
+        Path::new("/output/signed-release-bundle"),
+        &candidate,
+        SignatureVerificationPolicy::Fixture,
+    )
+    .map(|_| ())
+}
+
+#[cfg(feature = "fixture-tools")]
+fn fixture_candidate(
+    bundle: &VerifiedTransferredBundle,
+) -> Result<UnsignedReleaseCandidateV1, SignError> {
+    bundle.reverify_all()?;
+    let payload = CatalogPayloadV1::from_json(include_bytes!(
+        "../../../conformance/catalog-v1/valid-payload.json"
+    ))
+    .map_err(|_| candidate_rejected())?;
+    let canonical_payload =
+        canonical_catalog_payload(&payload).map_err(|_| candidate_rejected())?;
+    let object = bundle
+        .inventory
+        .objects()
+        .first()
+        .ok_or_else(candidate_rejected)?;
+    let object_bytes = bundle.read_small_file(object.relative_path().as_str())?;
+    let qualification = bundle.record_bytes("qualification")?;
+    let source_commit = bundle
+        .source_commit()
+        .ok_or_else(candidate_rejected)?
+        .to_owned();
+    let source_tree_sha256 = bundle
+        .source_tree_sha256()
+        .ok_or_else(candidate_rejected)?
+        .to_owned();
+    let asset_name = format!("fixture-asset-{}.bin", object.sha256().as_str());
+    let candidate = UnsignedReleaseCandidateV1 {
+        runtime_semantic_sha256: sha256(&canonical_payload),
+        canonical_payload,
+        tag: "catalog-v1-sequence-42".to_owned(),
+        support_assets: vec![CandidateAsset {
+            name: asset_name,
+            bytes: object_bytes,
+            sha256: object.sha256().as_str().to_owned(),
+        }],
+        final_bindings: Some(FinalBindings {
+            source_commit,
+            source_tree_sha256,
+            qualification_sha256: sha256(&qualification),
+        }),
+    };
+    require_candidate_bounds(&candidate)?;
+    Ok(candidate)
 }
 
 fn exact_flags(args: &[String], flags: &[&str]) -> Result<Vec<String>, SignError> {
@@ -3239,10 +3599,10 @@ mod tests {
         let key = fixture_signing_key_for_test();
         let signed = sign_candidate(&candidate, key.as_dalek(), "catalog-test-key-v1").unwrap();
         drop(key);
-        verify_signed_bytes(&signed, SignatureVerificationPolicy::SyntheticTestFixture).unwrap();
+        verify_signed_bytes(&signed, SignatureVerificationPolicy::Fixture).unwrap();
         let unmodified_catalog = signed.files.get(CATALOG_NAME).unwrap();
         let unmodified_release = signed.files.get(RELEASE_MANIFEST_NAME).unwrap();
-        verify_fixture_signatures_for_test(unmodified_catalog, unmodified_release).unwrap();
+        verify_fixture_signatures(unmodified_catalog, unmodified_release).unwrap();
         #[cfg(feature = "fixture-tools")]
         {
             catalog_core::verify_fixture_signed_catalog(unmodified_catalog).unwrap();
@@ -3260,7 +3620,7 @@ mod tests {
         let mut catalog_cross_domain = catalog_value.clone();
         catalog_cross_domain["signature"] = json!(&release_signature);
         assert!(
-            verify_fixture_signatures_for_test(
+            verify_fixture_signatures(
                 &serde_jcs::to_vec(&catalog_cross_domain).unwrap(),
                 unmodified_release,
             )
@@ -3269,7 +3629,7 @@ mod tests {
         let mut release_cross_domain = release_value.clone();
         release_cross_domain["signature"]["signature"] = json!(&catalog_signature);
         assert!(
-            verify_fixture_signatures_for_test(
+            verify_fixture_signatures(
                 unmodified_catalog,
                 &serde_jcs::to_vec(&release_cross_domain).unwrap(),
             )
@@ -3280,7 +3640,7 @@ mod tests {
         altered[0] = if altered[0] == b'A' { b'B' } else { b'A' };
         release_bit_flip["signature"]["signature"] = json!(String::from_utf8(altered).unwrap());
         assert!(
-            verify_fixture_signatures_for_test(
+            verify_fixture_signatures(
                 unmodified_catalog,
                 &serde_jcs::to_vec(&release_bit_flip).unwrap(),
             )
@@ -3298,7 +3658,7 @@ mod tests {
         let result = write_signed_output(
             OutputPreflight::new(&output).unwrap(),
             signed,
-            SignatureVerificationPolicy::SyntheticTestFixture,
+            SignatureVerificationPolicy::Fixture,
         )
         .unwrap();
         assert_eq!(result.output(), output);
@@ -3310,6 +3670,118 @@ mod tests {
             OutputPreflight::new(&output).is_err(),
             "no-clobber output was reusable"
         );
+    }
+
+    #[test]
+    fn signed_output_faults_preserve_visibility_and_support_exact_public_recovery() {
+        for checkpoint in [
+            PublishCheckpoint::BeforeRename,
+            PublishCheckpoint::RenameVisibility,
+            PublishCheckpoint::FirstParentFsync,
+            PublishCheckpoint::EmptyContainerUnlink,
+            PublishCheckpoint::FinalParentFsync,
+            PublishCheckpoint::FinalReopen,
+        ] {
+            let fixture = CandidateFixture::new();
+            let bundle = verify_transferred_bundle(&fixture.final_bundle).unwrap();
+            let candidate = finalize_candidate_after_admission_for_test(
+                &bundle,
+                &fixture.source,
+                &fixture.qualification,
+            )
+            .unwrap();
+            let key = fixture_signing_key_for_test();
+            let signed = sign_candidate(&candidate, key.as_dalek(), "catalog-test-key-v1").unwrap();
+            drop(key);
+            let output = fixture
+                .root
+                .path
+                .join(format!("fault-{checkpoint:?}-signed-output"));
+            set_publish_fault(
+                checkpoint,
+                if checkpoint == PublishCheckpoint::RenameVisibility {
+                    PublishFault::Interrupt
+                } else {
+                    PublishFault::Once
+                },
+            );
+            let result = write_signed_output(
+                OutputPreflight::new(&output).unwrap(),
+                signed,
+                SignatureVerificationPolicy::Fixture,
+            );
+            if checkpoint == PublishCheckpoint::BeforeRename {
+                assert_eq!(result.unwrap_err(), SignError::OutputRejected);
+                assert!(!output.exists());
+                continue;
+            }
+            assert_eq!(result.unwrap_err(), SignError::OutputDurabilityUncertain);
+            let before = reopen_recovery_snapshot(&output);
+            recover_signed_output(&output, &candidate, SignatureVerificationPolicy::Fixture)
+                .unwrap();
+            assert_eq!(reopen_recovery_snapshot(&output), before);
+            recover_signed_output(&output, &candidate, SignatureVerificationPolicy::Fixture)
+                .unwrap();
+        }
+
+        let fixture = CandidateFixture::new();
+        let bundle = verify_transferred_bundle(&fixture.final_bundle).unwrap();
+        let candidate = finalize_candidate_after_admission_for_test(
+            &bundle,
+            &fixture.source,
+            &fixture.qualification,
+        )
+        .unwrap();
+        let key = fixture_signing_key_for_test();
+        let signed = sign_candidate(&candidate, key.as_dalek(), "catalog-test-key-v1").unwrap();
+        drop(key);
+        let output = fixture.root.path.join("persistent-cleanup-output");
+        set_publish_fault(
+            PublishCheckpoint::EmptyContainerUnlink,
+            PublishFault::Persistent,
+        );
+        assert_eq!(
+            write_signed_output(
+                OutputPreflight::new(&output).unwrap(),
+                signed,
+                SignatureVerificationPolicy::Fixture,
+            )
+            .unwrap_err(),
+            SignError::OutputDurabilityUncertain
+        );
+        let staging = fs::read_dir(&fixture.root.path)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".catalog-sign-stage-")
+            })
+            .unwrap();
+        fs::write(staging.join("unknown-evidence"), b"retain").unwrap();
+        assert!(
+            recover_signed_output(&output, &candidate, SignatureVerificationPolicy::Fixture)
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(staging.join("unknown-evidence")).unwrap(),
+            b"retain"
+        );
+        set_publish_fault(PublishCheckpoint::BeforeRename, PublishFault::Once);
+    }
+
+    fn reopen_recovery_snapshot(path: &Path) -> BTreeMap<String, Vec<u8>> {
+        fs::read_dir(path)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (
+                    entry.file_name().into_string().unwrap(),
+                    fs::read(entry.path()).unwrap(),
+                )
+            })
+            .collect()
     }
 
     #[test]
@@ -3709,6 +4181,13 @@ mod tests {
             "authentic admission did not reach key open"
         );
         assert!(!output.exists());
+
+        if let Some(export) = std::env::var_os("CATALOG_AUTHENTIC_JOURNEY_EXPORT") {
+            let export = PathBuf::from(export);
+            assert!(export.is_absolute());
+            copy_transfer_tree(&fixture.intent_bundle, &export.join("intent-input"));
+            copy_transfer_tree(&fixture.final_bundle, &export.join("final-input"));
+        }
     }
 
     #[test]
@@ -4987,6 +5466,29 @@ mod tests {
         }))
         .unwrap();
         write_read_only(&path.join(TRANSFER_MANIFEST_NAME), &manifest);
+    }
+
+    fn copy_transfer_tree(source: &Path, destination: &Path) {
+        fs::DirBuilder::new()
+            .mode(fs::symlink_metadata(source).unwrap().permissions().mode() & 0o7777)
+            .create(destination)
+            .unwrap();
+        for entry in fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let metadata = fs::symlink_metadata(entry.path()).unwrap();
+            let target = destination.join(entry.file_name());
+            if metadata.is_dir() {
+                copy_transfer_tree(&entry.path(), &target);
+            } else {
+                assert!(metadata.is_file() && !metadata.file_type().is_symlink());
+                fs::copy(entry.path(), &target).unwrap();
+                fs::set_permissions(
+                    target,
+                    fs::Permissions::from_mode(metadata.permissions().mode() & 0o7777),
+                )
+                .unwrap();
+            }
+        }
     }
 
     fn write_read_only(path: &Path, bytes: &[u8]) {

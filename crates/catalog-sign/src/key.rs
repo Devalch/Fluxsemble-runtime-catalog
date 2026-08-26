@@ -213,12 +213,27 @@ impl MetadataFacts {
 }
 
 #[cfg(feature = "fixture-tools")]
+const FIXTURE_RUNTIME_KEY_ID: &str = "runtime-catalog-ed25519-077d2679ff8dd7d9";
+#[cfg(feature = "fixture-tools")]
+const FIXTURE_PUBLIC: [u8; 32] = [
+    0x1b, 0xd3, 0x6a, 0xfe, 0xe9, 0x32, 0x3f, 0x1e, 0x38, 0x13, 0xf6, 0x8c, 0x4d, 0x5f, 0x2f, 0x2b,
+    0x1b, 0xae, 0x44, 0xc0, 0xef, 0x69, 0x17, 0x62, 0x8e, 0xd6, 0xaf, 0xe1, 0x6a, 0xae, 0x44, 0xa9,
+];
+
+#[cfg(feature = "fixture-tools")]
+pub(crate) fn read_fixture_signing_key(path: &Path) -> Result<Zeroizing<SigningKey>, SignError> {
+    read_signing_key_for_identity(
+        path,
+        ExpectedIdentity {
+            key_id: FIXTURE_RUNTIME_KEY_ID,
+            public_key: &FIXTURE_PUBLIC,
+        },
+        || {},
+    )
+}
+
+#[cfg(feature = "fixture-tools")]
 pub(crate) fn fixture_signing_key() -> Result<Zeroizing<SigningKey>, SignError> {
-    const FIXTURE_PUBLIC: [u8; 32] = [
-        0x1b, 0xd3, 0x6a, 0xfe, 0xe9, 0x32, 0x3f, 0x1e, 0x38, 0x13, 0xf6, 0x8c, 0x4d, 0x5f, 0x2f,
-        0x2b, 0x1b, 0xae, 0x44, 0xc0, 0xef, 0x69, 0x17, 0x62, 0x8e, 0xd6, 0xaf, 0xe1, 0x6a, 0xae,
-        0x44, 0xa9,
-    ];
     let pem = Zeroizing::new(
         include_bytes!("../tests/fixtures/nonproduction-ed25519-pkcs8.pem").to_vec(),
     );

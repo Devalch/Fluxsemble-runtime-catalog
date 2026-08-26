@@ -27,6 +27,11 @@ path = "src/lib.rs"
 name = "catalog-sign"
 path = "src/main.rs"
 
+[[bin]]
+name = "catalog-sign-fixture"
+path = "src/bin/catalog-sign-fixture.rs"
+required-features = ["fixture-tools"]
+
 [[example]]
 name = "sign-fixture"
 path = "examples/sign-fixture.rs"
