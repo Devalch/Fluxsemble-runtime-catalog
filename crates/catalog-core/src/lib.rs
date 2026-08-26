@@ -1,3 +1,25 @@
+use std::{error::Error, fmt};
+
+mod canonical;
+mod wire;
+
+pub use canonical::{canonical_catalog_payload, catalog_payload_sha256};
+pub use wire::*;
+
+/// Closed, non-echoing failures from the data-only catalog core.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoreError {
+    InvalidCatalog,
+}
+
+impl fmt::Display for CoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("invalid catalog")
+    }
+}
+
+impl Error for CoreError {}
+
 /// Shared catalog package names for bootstrap validation.
 pub const PACKAGES: &[&str] = &[
     "catalog-acquire",

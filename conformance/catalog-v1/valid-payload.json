@@ -1,0 +1,111 @@
+{
+  "schema_version": 1,
+  "sequence": "42",
+  "generated_at": "2026-08-01T00:00:00Z",
+  "expires_at": "2026-08-31T00:00:00Z",
+  "compatibility_ranges": [
+    "=0.1.0"
+  ],
+  "providers": [
+    {
+      "provider_id": "builtin:pi",
+      "allowed_origins": [
+        "https://nodejs.org",
+        "https://registry.npmjs.org"
+      ],
+      "releases": [
+        {
+          "version": "0.83.0",
+          "target": "linux_x86_64",
+          "compatibility_ranges": [
+            "=0.1.0"
+          ],
+          "release_metadata": {
+            "title": "Pi 0.83.0",
+            "notes": "Approved managed Pi release."
+          },
+          "components": [
+            {
+              "component_id": "component:node",
+              "version": "22.19.0",
+              "artifacts": [
+                {
+                  "artifact_id": "artifact:node-linux-x86_64",
+                  "url": "https://nodejs.org/dist/v22.19.0/node-v22.19.0-linux-x64.tar.xz",
+                  "size_bytes": "31457280",
+                  "sha256": "c0649af18e6a24f6fe5535a3e86b341dd49a8e71117c8b68bde973ef834f16f2",
+                  "inventory": [
+                    {
+                      "path": "bin/node",
+                      "size_bytes": "1024",
+                      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "component_id": "component:pi",
+              "version": "0.83.0",
+              "artifacts": [
+                {
+                  "artifact_id": "artifact:pi-coding-agent",
+                  "url": "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/pi-coding-agent-0.83.0.tgz",
+                  "size_bytes": "1048576",
+                  "sha256": "7097fe4b38762dda7ec78001e7b90430c849fbaf717325bfe8109744e32255e6",
+                  "inventory": [
+                    {
+                      "path": "dist/cli.js",
+                      "size_bytes": "2048",
+                      "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "provider_extension": {
+            "kind": "pi",
+            "metadata": {
+              "approved_package": {
+                "name": "@earendil-works/pi-coding-agent",
+                "version": "0.83.0"
+              },
+              "expected_entrypoint": "dist/cli.js",
+              "component_id": "component:pi",
+              "package_artifact_id": "artifact:pi-coding-agent",
+              "registry_integrity": "sha512-uYhF+FsZxogoSX/AxBcUdiY+ZklubwaXyAoEGA2eQwsHcyEAhUYIKh/WLXe/a8+k8eTCmxb+ZN2Zo9mzQtzbWw==",
+              "root_package_manifest": {
+                "url": "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/package-0.83.0.json",
+                "size_bytes": "4096",
+                "sha256": "e02deae1cec07035807436c1864c88342e2f7d49050d03b858a3719f0c7aedbf"
+              },
+              "shipped_shrinkwrap": {
+                "lockfile_version": 3,
+                "root_package": {
+                  "name": "@earendil-works/pi-coding-agent",
+                  "version": "0.83.0"
+                },
+                "artifact": {
+                  "url": "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/npm-shrinkwrap-0.83.0.json",
+                  "size_bytes": "65536",
+                  "sha256": "9a17a6b9ba0a57b37773644f7945b1bf0bc10aa8923b87233fee6f75af1e1772"
+                },
+                "locked_packages": [
+                  {
+                    "locator": "node_modules/chalk",
+                    "name": "chalk",
+                    "version": "5.6.2",
+                    "resolved_url": "https://registry.npmjs.org/chalk/-/chalk-5.6.2.tgz",
+                    "registry_integrity": "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+                    "archive_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
