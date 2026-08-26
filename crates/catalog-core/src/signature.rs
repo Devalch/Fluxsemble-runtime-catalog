@@ -160,13 +160,26 @@ pub fn verify_signed_release_bundle_manifest(
 pub fn verify_fixture_signed_catalog(
     bytes: &[u8],
 ) -> Result<VerifiedCatalogV1, CatalogSignatureError> {
-    verify_signed_catalog_with_identity(
-        bytes,
-        VerificationIdentity {
-            key_id: FIXTURE_KEY_ID,
-            public_key: FIXTURE_PUBLIC_KEY,
-        },
-    )
+    verify_signed_catalog_with_identity(bytes, fixture_identity())
+}
+
+/// Fixture release verification exists only in separately gated fixture-tool builds.
+#[cfg(feature = "fixture-tools")]
+pub fn verify_fixture_signed_release_bundle_manifest(
+    bytes: &[u8],
+) -> Result<VerifiedReleaseBundleManifestV1, CatalogSignatureError> {
+    let manifest =
+        SignedReleaseBundleManifestV1::from_json(bytes).map_err(|_| invalid_release_bundle())?;
+    verify_release_manifest_with_identity(&manifest, fixture_identity())?;
+    Ok(VerifiedReleaseBundleManifestV1 { manifest })
+}
+
+#[cfg(feature = "fixture-tools")]
+const fn fixture_identity() -> VerificationIdentity {
+    VerificationIdentity {
+        key_id: FIXTURE_KEY_ID,
+        public_key: FIXTURE_PUBLIC_KEY,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -202,9 +215,12 @@ fn verify_signed_catalog_with_identity(
         return Err(invalid_catalog());
     }
 
-    let payload =
-        CatalogPayloadV1::from_json(&bytes[spans.payload]).map_err(|_| invalid_catalog())?;
+    let payload = CatalogPayloadV1::from_json(&bytes[spans.payload.clone()])
+        .map_err(|_| invalid_catalog())?;
     let canonical_payload = canonical_catalog_payload(&payload).map_err(|_| invalid_catalog())?;
+    if canonical_payload.as_slice() != &bytes[spans.payload] {
+        return Err(invalid_catalog());
+    }
     verify_signature(&identity.public_key, &canonical_payload, &signature_text)
         .map_err(|_| invalid_catalog())?;
     let payload_sha256 = catalog_payload_sha256(&payload).map_err(|_| invalid_catalog())?;
@@ -430,12 +446,23 @@ fn scan_json_string(bytes: &[u8], index: usize) -> Result<usize, CatalogSignatur
     while let Some(byte) = bytes.get(cursor).copied() {
         match byte {
             b'\"' => return Ok(cursor + 1),
-            b'\\' => {
-                cursor = cursor.checked_add(2).ok_or_else(invalid_catalog)?;
-                if cursor > bytes.len() {
-                    return Err(invalid_catalog());
+            b'\\' => match bytes.get(cursor + 1).copied() {
+                Some(b'\"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't') => {
+                    cursor += 2;
                 }
-            }
+                Some(b'u') => {
+                    let hex_end = cursor.checked_add(6).ok_or_else(invalid_catalog)?;
+                    let digits = bytes
+                        .get(cursor + 2..hex_end)
+                        .filter(|digits| digits.len() == 4)
+                        .ok_or_else(invalid_catalog)?;
+                    if !digits.iter().all(u8::is_ascii_hexdigit) {
+                        return Err(invalid_catalog());
+                    }
+                    cursor = hex_end;
+                }
+                _ => return Err(invalid_catalog()),
+            },
             0x00..=0x1f => return Err(invalid_catalog()),
             _ => cursor += 1,
         }
@@ -624,6 +651,74 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn canonical_payload_spelling_is_part_of_envelope_admission() {
+        let canonical_envelope = envelope();
+        let value: Value = serde_json::from_slice(&canonical_envelope).unwrap();
+        let noncanonical_payload = serde_json::to_string_pretty(&value["payload"]).unwrap();
+        let altered = format!(
+            "{{\"envelope_version\":1,\"signature_algorithm\":\"ed25519\",\"key_id\":\"{TEST_ID}\",\"payload\":{noncanonical_payload},\"signature\":{}}}",
+            serde_json::to_string(value["signature"].as_str().unwrap()).unwrap()
+        );
+        assert!(verify_signed_catalog_with_identity(altered.as_bytes(), test_identity()).is_err());
+    }
+
+    #[test]
+    fn scanner_and_signature_decoder_reject_adversarial_spellings() {
+        let signed = envelope();
+        let signed_value: Value = serde_json::from_slice(&signed).unwrap();
+        let signature = signed_value["signature"].as_str().unwrap();
+
+        let padded = String::from_utf8(signed.clone())
+            .unwrap()
+            .replace(signature, &format!("{signature}="));
+        assert!(verify_signed_catalog_with_identity(padded.as_bytes(), test_identity()).is_err());
+
+        let mut noncanonical_signature = signature.as_bytes().to_vec();
+        let final_index = noncanonical_signature.len() - 1;
+        noncanonical_signature[final_index] = match noncanonical_signature[final_index] {
+            b'A' => b'B',
+            b'Q' => b'R',
+            b'g' => b'h',
+            b'w' => b'x',
+            _ => panic!("canonical 64-byte base64url has an unexpected final character"),
+        };
+        let noncanonical_signature = String::from_utf8(noncanonical_signature).unwrap();
+        let noncanonical = String::from_utf8(signed.clone())
+            .unwrap()
+            .replace(signature, &noncanonical_signature);
+        assert!(
+            verify_signed_catalog_with_identity(noncanonical.as_bytes(), test_identity()).is_err()
+        );
+
+        let mut flipped_signature = signature.as_bytes().to_vec();
+        flipped_signature[0] = if flipped_signature[0] == b'A' {
+            b'B'
+        } else {
+            b'A'
+        };
+        let flipped = String::from_utf8(signed)
+            .unwrap()
+            .replace(signature, &String::from_utf8(flipped_signature).unwrap());
+        assert!(verify_signed_catalog_with_identity(flipped.as_bytes(), test_identity()).is_err());
+
+        for malformed in [
+            br#"{"pay\qload":0}"#.as_slice(),
+            br#"{"pay\u12x4load":0}"#.as_slice(),
+            br#"{"payload":"unterminated\"}"#.as_slice(),
+        ] {
+            assert!(scan_signed_envelope(malformed).is_err());
+        }
+
+        let nested = format!(
+            "{{\"envelope_version\":1,\"signature_algorithm\":\"ed25519\",\"key_id\":\"{TEST_ID}\",\"payload\":{}0{},\"signature\":\"{}\"}}",
+            "[".repeat(MAX_JSON_NESTING_DEPTH + 1),
+            "]".repeat(MAX_JSON_NESTING_DEPTH + 1),
+            "A".repeat(ED25519_SIGNATURE_TEXT_BYTES),
+        );
+        assert!(scan_signed_envelope(nested.as_bytes()).is_err());
     }
 
     #[test]

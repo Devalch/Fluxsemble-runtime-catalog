@@ -40,9 +40,30 @@ const MAX_ENTRIES: usize = 32_768;
 const MAX_ARGUMENTS: usize = 7;
 const MAX_ARGUMENT_BYTES: usize = 16 * 1024;
 const INTENT_SEMANTICS_DOMAIN: &[u8] = b"fluxsemble:runtime-catalog-intent-semantics:v1\0";
+const APPROVED_PACKAGE_INPUT_DOMAIN: &[u8] =
+    b"fluxsemble:runtime-catalog-approved-package-input-manifest:v1\0";
+// Derived with Task 5's PackageInputManifestV1::canonical_bytes from the authenticated public
+// 140-package Pi fixture: 78,346 canonical bytes, raw SHA-256 d511e45be4fc28ec20c62c2450b61ab61e61fbbd12024a1e95698ab0b702a02d.
+const APPROVED_PACKAGE_INPUT_SHA256: &str =
+    "04ff8560de163983621e86598c8eb6b80fabb32cfced020602c14ed45818f9ef";
 const ROOT_NAME: &str = "@earendil-works/pi-coding-agent";
 const ROOT_VERSION: &str = "0.83.0";
+const ROOT_ARTIFACT_URL: &str =
+    "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/pi-coding-agent-0.83.0.tgz";
+const ROOT_ARTIFACT_SIZE: u64 = 4_992_066;
+const ROOT_ARTIFACT_SHA256: &str =
+    "7097fe4b38762dda7ec78001e7b90430c849fbaf717325bfe8109744e32255e6";
+const ROOT_REGISTRY_INTEGRITY: &str = "sha512-uYhF+FsZxogoSX/AxBcUdiY+ZklubwaXyAoEGA2eQwsHcyEAhUYIKh/WLXe/a8+k8eTCmxb+ZN2Zo9mzQtzbWw==";
+const ROOT_MANIFEST_SIZE: u64 = 3_560;
+const ROOT_MANIFEST_SHA256: &str =
+    "e02deae1cec07035807436c1864c88342e2f7d49050d03b858a3719f0c7aedbf";
+const SHRINKWRAP_SIZE: u64 = 61_540;
+const SHRINKWRAP_SHA256: &str = "9a17a6b9ba0a57b37773644f7945b1bf0bc10aa8923b87233fee6f75af1e1772";
 const NODE_VERSION: &str = "22.19.0";
+const NODE_ARTIFACT_URL: &str = "https://nodejs.org/dist/v22.19.0/node-v22.19.0-linux-x64.tar.xz";
+const NODE_ARTIFACT_SIZE: u64 = 30_479_988;
+const NODE_ARTIFACT_SHA256: &str =
+    "c0649af18e6a24f6fe5535a3e86b341dd49a8e71117c8b68bde973ef834f16f2";
 const LOCKED_COUNT: usize = 139;
 const PRE_PRUNE_COUNT: u16 = 131;
 const APPLICABLE_COUNT: u16 = 130;
@@ -455,9 +476,50 @@ pub fn verify_transferred_bundle(path: &Path) -> Result<VerifiedTransferredBundl
     Ok(verified)
 }
 
+#[derive(Clone, Copy)]
+enum ReleaseAdmissionPolicy {
+    Production,
+    #[cfg(test)]
+    SyntheticTestFixture,
+}
+
+#[cfg(test)]
+fn assemble_release_intent_for_test(
+    bundle: &VerifiedTransferredBundle,
+    intent: &InitialPiReleaseIntentV1,
+) -> Result<UnsignedReleaseCandidateV1, SignError> {
+    assemble_release_intent_with_policy(
+        bundle,
+        intent,
+        ReleaseAdmissionPolicy::SyntheticTestFixture,
+    )
+}
+
+#[cfg(test)]
+fn finalize_candidate_for_test(
+    bundle: &VerifiedTransferredBundle,
+    source: &CatalogSourceV1,
+    qualification: &CompatibilityQualificationV1,
+) -> Result<UnsignedReleaseCandidateV1, SignError> {
+    finalize_candidate_with_policy(
+        bundle,
+        source,
+        qualification,
+        ReleaseAdmissionPolicy::SyntheticTestFixture,
+    )
+}
+
 pub fn assemble_release_intent(
     bundle: &VerifiedTransferredBundle,
     intent: &InitialPiReleaseIntentV1,
+) -> Result<UnsignedReleaseCandidateV1, SignError> {
+    assemble_release_intent_with_policy(bundle, intent, ReleaseAdmissionPolicy::Production)
+}
+
+fn assemble_release_intent_with_policy(
+    bundle: &VerifiedTransferredBundle,
+    intent: &InitialPiReleaseIntentV1,
+    policy: ReleaseAdmissionPolicy,
 ) -> Result<UnsignedReleaseCandidateV1, SignError> {
     bundle.reverify_all()?;
     if bundle.inventory.source_kind() != InputSourceKind::ReleaseIntent
@@ -480,13 +542,27 @@ pub fn assemble_release_intent(
     if bundle.inventory.compatibility_input_sha256().as_str() != semantic {
         return Err(candidate_rejected());
     }
-    assemble_common(bundle, intent, semantic, None)
+    assemble_common(bundle, intent, semantic, None, policy)
 }
 
 pub fn finalize_candidate(
     bundle: &VerifiedTransferredBundle,
     source: &CatalogSourceV1,
     qualification: &CompatibilityQualificationV1,
+) -> Result<UnsignedReleaseCandidateV1, SignError> {
+    finalize_candidate_with_policy(
+        bundle,
+        source,
+        qualification,
+        ReleaseAdmissionPolicy::Production,
+    )
+}
+
+fn finalize_candidate_with_policy(
+    bundle: &VerifiedTransferredBundle,
+    source: &CatalogSourceV1,
+    qualification: &CompatibilityQualificationV1,
+    policy: ReleaseAdmissionPolicy,
 ) -> Result<UnsignedReleaseCandidateV1, SignError> {
     bundle.reverify_all()?;
     if bundle.inventory.source_kind() != InputSourceKind::CatalogSource {
@@ -545,6 +621,7 @@ pub fn finalize_candidate(
         source.intent(),
         semantic.clone(),
         Some(final_bindings),
+        policy,
     )?;
     candidate.support_assets.push(CandidateAsset {
         name: format!("qualification-{qualification_sha256}.json"),
@@ -571,10 +648,12 @@ fn assemble_common(
     intent: &InitialPiReleaseIntentV1,
     runtime_semantic_sha256: String,
     final_bindings: Option<FinalBindings>,
+    policy: ReleaseAdmissionPolicy,
 ) -> Result<UnsignedReleaseCandidateV1, SignError> {
     require_first_tuple(intent)?;
     let package_inputs_bytes = bundle.record_bytes("package_inputs")?;
     let package_inputs = parse_package_inputs(&package_inputs_bytes)?;
+    require_release_admission(intent, &package_inputs_bytes, policy)?;
     let payload = catalog_payload_for_intent(intent)?;
     let canonical_payload =
         canonical_catalog_payload(&payload).map_err(|_| candidate_rejected())?;
@@ -627,8 +706,12 @@ pub fn sign_release(request: SignReleaseRequest<'_>) -> Result<SignedReleaseBund
         production_key_identity().key_id(),
     )?;
     drop(signing_key);
-    verify_signed_bytes(&signed_bytes, true)?;
-    write_signed_output(output, signed_bytes, true)
+    verify_signed_bytes(&signed_bytes, SignatureVerificationPolicy::Production)?;
+    write_signed_output(
+        output,
+        signed_bytes,
+        SignatureVerificationPolicy::Production,
+    )
 }
 
 struct SignedBytes {
@@ -765,7 +848,17 @@ fn inventory_for_files(files: &BTreeMap<String, Vec<u8>>) -> Result<BundleInvent
     .map_err(|_| candidate_rejected())
 }
 
-fn verify_signed_bytes(bytes: &SignedBytes, production: bool) -> Result<(), SignError> {
+#[derive(Clone, Copy)]
+enum SignatureVerificationPolicy {
+    Production,
+    #[cfg(test)]
+    SyntheticTestFixture,
+}
+
+fn verify_signed_bytes(
+    bytes: &SignedBytes,
+    policy: SignatureVerificationPolicy,
+) -> Result<(), SignError> {
     verify_signed_release_inventory(&bytes.inventory, &bytes.manifest)
         .map_err(|_| verification_failed())?;
     let catalog = bytes
@@ -776,9 +869,15 @@ fn verify_signed_bytes(bytes: &SignedBytes, production: bool) -> Result<(), Sign
         .files
         .get(RELEASE_MANIFEST_NAME)
         .ok_or_else(verification_failed)?;
-    if production {
-        verify_signed_catalog(catalog).map_err(|_| verification_failed())?;
-        verify_signed_release_bundle_manifest(manifest).map_err(|_| verification_failed())?;
+    match policy {
+        SignatureVerificationPolicy::Production => {
+            verify_signed_catalog(catalog).map_err(|_| verification_failed())?;
+            verify_signed_release_bundle_manifest(manifest).map_err(|_| verification_failed())?;
+        }
+        #[cfg(test)]
+        SignatureVerificationPolicy::SyntheticTestFixture => {
+            verify_fixture_signatures_for_test(catalog, manifest)?;
+        }
     }
     for entry in bytes.inventory.entries() {
         let file = bytes
@@ -792,23 +891,117 @@ fn verify_signed_bytes(bytes: &SignedBytes, production: bool) -> Result<(), Sign
     Ok(())
 }
 
+#[cfg(test)]
+fn verify_fixture_signatures_for_test(
+    catalog_bytes: &[u8],
+    manifest_bytes: &[u8],
+) -> Result<(), SignError> {
+    use ed25519_dalek::{Signature, VerifyingKey};
+
+    const FIXTURE_PUBLIC_KEY: [u8; 32] = [
+        0x1b, 0xd3, 0x6a, 0xfe, 0xe9, 0x32, 0x3f, 0x1e, 0x38, 0x13, 0xf6, 0x8c, 0x4d, 0x5f, 0x2f,
+        0x2b, 0x1b, 0xae, 0x44, 0xc0, 0xef, 0x69, 0x17, 0x62, 0x8e, 0xd6, 0xaf, 0xe1, 0x6a, 0xae,
+        0x44, 0xa9,
+    ];
+    const FIXTURE_KEY_ID: &str = "catalog-test-key-v1";
+
+    let verifying_key =
+        VerifyingKey::from_bytes(&FIXTURE_PUBLIC_KEY).map_err(|_| verification_failed())?;
+    let envelope: Value =
+        serde_json::from_slice(catalog_bytes).map_err(|_| verification_failed())?;
+    if envelope.as_object().is_none_or(|object| object.len() != 5)
+        || envelope["envelope_version"] != 1
+        || envelope["signature_algorithm"] != "ed25519"
+        || envelope["key_id"] != FIXTURE_KEY_ID
+    {
+        return Err(verification_failed());
+    }
+    let payload = CatalogPayloadV1::from_json(
+        &serde_json::to_vec(&envelope["payload"]).map_err(|_| verification_failed())?,
+    )
+    .map_err(|_| verification_failed())?;
+    let canonical_payload =
+        canonical_catalog_payload(&payload).map_err(|_| verification_failed())?;
+    let catalog_signature = envelope["signature"]
+        .as_str()
+        .and_then(decode_fixture_signature_for_test)
+        .ok_or_else(verification_failed)?;
+    verifying_key
+        .verify_strict(
+            &canonical_payload,
+            &Signature::from_bytes(&catalog_signature),
+        )
+        .map_err(|_| verification_failed())?;
+
+    let manifest = SignedReleaseBundleManifestV1::from_json(manifest_bytes)
+        .map_err(|_| verification_failed())?;
+    if manifest.signature().key_id().as_str() != FIXTURE_KEY_ID {
+        return Err(verification_failed());
+    }
+    let release_signature =
+        decode_fixture_signature_for_test(manifest.signature().signature().as_str())
+            .ok_or_else(verification_failed)?;
+    verifying_key
+        .verify_strict(
+            &release_bundle_signing_bytes(&manifest).map_err(|_| verification_failed())?,
+            &Signature::from_bytes(&release_signature),
+        )
+        .map_err(|_| verification_failed())
+}
+
+#[cfg(test)]
+fn decode_fixture_signature_for_test(value: &str) -> Option<[u8; 64]> {
+    if value.len() != 86 || value.contains('=') {
+        return None;
+    }
+    let decode = |byte| match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'-' => Some(62),
+        b'_' => Some(63),
+        _ => None,
+    };
+    let mut output = [0_u8; 64];
+    let mut output_index = 0;
+    for chunk in value.as_bytes().chunks(4) {
+        let a = decode(chunk[0])?;
+        let b = decode(chunk[1])?;
+        output[output_index] = (a << 2) | (b >> 4);
+        output_index += 1;
+        if chunk.len() >= 3 {
+            let c = decode(chunk[2])?;
+            output[output_index] = (b << 4) | (c >> 2);
+            output_index += 1;
+            if chunk.len() == 4 {
+                let d = decode(chunk[3])?;
+                output[output_index] = (c << 6) | d;
+                output_index += 1;
+            } else if c & 0x03 != 0 {
+                return None;
+            }
+        }
+    }
+    (output_index == output.len() && encode_base64url_no_pad(&output) == value).then_some(output)
+}
+
 fn write_signed_output(
     preflight: OutputPreflight,
     bytes: SignedBytes,
-    production: bool,
+    verification_policy: SignatureVerificationPolicy,
 ) -> Result<SignedReleaseBundleV1, SignError> {
     let mut output = StagedOutput::create(preflight)?;
     for (name, contents) in &bytes.files {
         output.write_file(name, contents)?;
     }
     output.verify_files(&bytes.files)?;
-    verify_signed_bytes(&bytes, production)?;
+    verify_signed_bytes(&bytes, verification_policy)?;
     output.publish()?;
     let reopened = reopen_signed_output(&output.final_path, &bytes.files)?;
     if reopened != bytes.files {
         return Err(verification_failed());
     }
-    verify_signed_bytes(&bytes, production)?;
+    verify_signed_bytes(&bytes, verification_policy)?;
     Ok(SignedReleaseBundleV1 {
         output: output.final_path,
         inventory: bytes.inventory,
@@ -875,6 +1068,202 @@ fn require_first_tuple(intent: &InitialPiReleaseIntentV1) -> Result<(), SignErro
         || intent.release().node_version().as_str() != NODE_VERSION
         || intent.tag().as_str() != format!("catalog-v1-sequence-{}", intent.sequence())
         || intent.generated_at() >= intent.expires_at()
+    {
+        return Err(candidate_rejected());
+    }
+    Ok(())
+}
+
+fn require_release_admission(
+    intent: &InitialPiReleaseIntentV1,
+    package_inputs_bytes: &[u8],
+    policy: ReleaseAdmissionPolicy,
+) -> Result<(), SignError> {
+    match policy {
+        ReleaseAdmissionPolicy::Production => {
+            require_approved_production_tuple(intent)?;
+            if approved_package_input_digest(package_inputs_bytes) != APPROVED_PACKAGE_INPUT_SHA256
+            {
+                return Err(candidate_rejected());
+            }
+            Ok(())
+        }
+        #[cfg(test)]
+        ReleaseAdmissionPolicy::SyntheticTestFixture => Ok(()),
+    }
+}
+
+fn approved_package_input_digest(canonical_package_inputs: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(APPROVED_PACKAGE_INPUT_DOMAIN);
+    hasher.update(canonical_package_inputs);
+    format!("{:x}", hasher.finalize())
+}
+
+fn require_approved_production_tuple(intent: &InitialPiReleaseIntentV1) -> Result<(), SignError> {
+    let value = serde_json::to_value(intent).map_err(|_| candidate_rejected())?;
+    let tag = intent.tag().as_str();
+    let root_manifest_name = format!("pi-package-{ROOT_MANIFEST_SHA256}.json");
+    let shrinkwrap_name = format!("pi-shrinkwrap-{SHRINKWRAP_SHA256}.json");
+    let release_prefix =
+        format!("https://github.com/Devalch/Fluxsemble-runtime-catalog/releases/download/{tag}/");
+    let root_manifest_url = format!("{release_prefix}{root_manifest_name}");
+    let shrinkwrap_url = format!("{release_prefix}{shrinkwrap_name}");
+
+    let exact_strings = [
+        ("/fluxsemble_requirement", "=0.1.0"),
+        ("/release/provider", "builtin:pi"),
+        ("/release/release/version", ROOT_VERSION),
+        ("/release/release/target", "linux_x86_64"),
+        (
+            "/release/release/components/0/component_id",
+            "component:node",
+        ),
+        ("/release/release/components/0/version", NODE_VERSION),
+        (
+            "/release/release/components/0/artifacts/0/artifact_id",
+            "artifact:node-linux-x86_64",
+        ),
+        (
+            "/release/release/components/0/artifacts/0/url",
+            NODE_ARTIFACT_URL,
+        ),
+        (
+            "/release/release/components/0/artifacts/0/size_bytes",
+            "30479988",
+        ),
+        (
+            "/release/release/components/0/artifacts/0/sha256",
+            NODE_ARTIFACT_SHA256,
+        ),
+        ("/release/release/components/1/component_id", "component:pi"),
+        ("/release/release/components/1/version", ROOT_VERSION),
+        (
+            "/release/release/components/1/artifacts/0/artifact_id",
+            "artifact:pi-coding-agent",
+        ),
+        (
+            "/release/release/components/1/artifacts/0/url",
+            ROOT_ARTIFACT_URL,
+        ),
+        (
+            "/release/release/components/1/artifacts/0/size_bytes",
+            "4992066",
+        ),
+        (
+            "/release/release/components/1/artifacts/0/sha256",
+            ROOT_ARTIFACT_SHA256,
+        ),
+        ("/release/release/provider_extension/kind", "pi"),
+        (
+            "/release/release/provider_extension/metadata/approved_package/name",
+            ROOT_NAME,
+        ),
+        (
+            "/release/release/provider_extension/metadata/approved_package/version",
+            ROOT_VERSION,
+        ),
+        (
+            "/release/release/provider_extension/metadata/expected_entrypoint",
+            "dist/cli.js",
+        ),
+        (
+            "/release/release/provider_extension/metadata/component_id",
+            "component:pi",
+        ),
+        (
+            "/release/release/provider_extension/metadata/package_artifact_id",
+            "artifact:pi-coding-agent",
+        ),
+        (
+            "/release/release/provider_extension/metadata/registry_integrity",
+            ROOT_REGISTRY_INTEGRITY,
+        ),
+        (
+            "/release/release/provider_extension/metadata/root_package_manifest/url",
+            root_manifest_url.as_str(),
+        ),
+        (
+            "/release/release/provider_extension/metadata/root_package_manifest/size_bytes",
+            "3560",
+        ),
+        (
+            "/release/release/provider_extension/metadata/root_package_manifest/sha256",
+            ROOT_MANIFEST_SHA256,
+        ),
+        (
+            "/release/release/provider_extension/metadata/shipped_shrinkwrap/root_package/name",
+            ROOT_NAME,
+        ),
+        (
+            "/release/release/provider_extension/metadata/shipped_shrinkwrap/root_package/version",
+            ROOT_VERSION,
+        ),
+        (
+            "/release/release/provider_extension/metadata/shipped_shrinkwrap/artifact/url",
+            shrinkwrap_url.as_str(),
+        ),
+        (
+            "/release/release/provider_extension/metadata/shipped_shrinkwrap/artifact/size_bytes",
+            "61540",
+        ),
+        (
+            "/release/release/provider_extension/metadata/shipped_shrinkwrap/artifact/sha256",
+            SHRINKWRAP_SHA256,
+        ),
+    ];
+    if exact_strings.iter().any(|(pointer, expected)| {
+        value.pointer(pointer).and_then(Value::as_str) != Some(*expected)
+    }) || value.pointer("/release/allowed_origins")
+        != Some(&json!([
+            "https://github.com",
+            "https://nodejs.org",
+            "https://registry.npmjs.org"
+        ]))
+        || value.pointer("/release/release/compatibility_ranges") != Some(&json!(["=0.1.0"]))
+        || value
+            .pointer("/release/release/components")
+            .and_then(Value::as_array)
+            .is_none_or(|components| components.len() != 2)
+        || value
+            .pointer("/release/release/components/0/artifacts")
+            .and_then(Value::as_array)
+            .is_none_or(|artifacts| artifacts.len() != 1)
+        || value
+            .pointer("/release/release/components/1/artifacts")
+            .and_then(Value::as_array)
+            .is_none_or(|artifacts| artifacts.len() != 1)
+        || value
+            .pointer(
+                "/release/release/provider_extension/metadata/shipped_shrinkwrap/lockfile_version",
+            )
+            .and_then(Value::as_u64)
+            != Some(3)
+        || value
+            .pointer(
+                "/release/release/provider_extension/metadata/shipped_shrinkwrap/locked_packages",
+            )
+            .and_then(Value::as_array)
+            .is_none_or(|packages| packages.len() != LOCKED_COUNT)
+    {
+        return Err(candidate_rejected());
+    }
+    if intent.release().catalog_release().components()[0].artifacts()[0]
+        .size_bytes()
+        .get()
+        != NODE_ARTIFACT_SIZE
+        || intent.release().catalog_release().components()[1].artifacts()[0]
+            .size_bytes()
+            .get()
+            != ROOT_ARTIFACT_SIZE
+        || match intent.release().catalog_release().provider_extension() {
+            ProviderExtensionV1::Pi(metadata) => {
+                metadata.root_package_manifest().size_bytes().get() != ROOT_MANIFEST_SIZE
+                    || metadata.shipped_shrinkwrap().artifact().size_bytes().get()
+                        != SHRINKWRAP_SIZE
+            }
+            ProviderExtensionV1::None => true,
+        }
     {
         return Err(candidate_rejected());
     }
@@ -1982,27 +2371,115 @@ fn exact_flags(args: &[String], flags: &[&str]) -> Result<Vec<String>, SignError
     Ok(values)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CandidateOutputCheckpoint {
+    Link,
+    ParentFsync,
+    FinalReopen,
+}
+
 fn write_candidate(path: &Path, candidate: &UnsignedReleaseCandidateV1) -> Result<(), SignError> {
-    if !is_absolute_bounded_path(path) {
+    write_candidate_atomically(path, &candidate.canonical_payload, |_| Ok(()))
+}
+
+fn write_candidate_atomically(
+    path: &Path,
+    bytes: &[u8],
+    mut checkpoint: impl FnMut(CandidateOutputCheckpoint) -> Result<(), SignError>,
+) -> Result<(), SignError> {
+    if bytes.is_empty() || bytes.len() as u64 > MAX_MANIFEST_BYTES {
         return Err(output_rejected());
     }
-    let parent = path.parent().ok_or_else(output_rejected)?;
-    let metadata = fs::metadata(parent).map_err(|_| output_rejected())?;
-    if !secure_directory(&metadata) {
+    let preflight = OutputPreflight::new(path)?;
+    let dot = CString::new(".").expect("fixed temporary-file path");
+    // SAFETY: the retained parent descriptor, fixed path, flags, and mode are valid. O_TMPFILE
+    // creates an unnamed inode, so every failure before link leaves no visible partial output.
+    let descriptor = unsafe {
+        libc::openat(
+            preflight.parent.as_raw_fd(),
+            dot.as_ptr(),
+            libc::O_TMPFILE | libc::O_RDWR | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if descriptor < 0 {
         return Err(output_rejected());
     }
-    let mut options = fs::OpenOptions::new();
-    options
-        .write(true)
-        .create_new(true)
-        .mode(0o400)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut file = options.open(path).map_err(|_| output_rejected())?;
-    file.write_all(&candidate.canonical_payload)
-        .map_err(|_| output_rejected())?;
-    file.sync_all().map_err(|_| output_rejected())?;
+    // SAFETY: openat returned one newly owned descriptor.
+    let mut temporary = unsafe { fs::File::from_raw_fd(descriptor) };
+    let initial = temporary.metadata().map_err(|_| output_rejected())?;
+    if !secure_candidate_file(&initial, 0o600, 0) || initial.len() != 0 {
+        return Err(output_rejected());
+    }
+    let identity = FileIdentity::from_metadata(&initial);
+    temporary.write_all(bytes).map_err(|_| output_rejected())?;
+    temporary.flush().map_err(|_| output_rejected())?;
+    temporary.sync_all().map_err(|_| output_rejected())?;
+    // SAFETY: the descriptor remains valid and 0400 is the exact settled mode.
+    if unsafe { libc::fchmod(temporary.as_raw_fd(), 0o400) } != 0 {
+        return Err(output_rejected());
+    }
+    temporary.sync_all().map_err(|_| output_rejected())?;
+    let settled = temporary.metadata().map_err(|_| output_rejected())?;
+    if !secure_candidate_file(&settled, 0o400, 0)
+        || settled.len() != bytes.len() as u64
+        || FileIdentity::from_metadata(&settled) != identity
+        || hash_file(&temporary, bytes.len() as u64).map_err(|_| output_rejected())?
+            != sha256(bytes)
+    {
+        return Err(output_rejected());
+    }
+    checkpoint(CandidateOutputCheckpoint::Link)?;
+    if !secure_directory(&preflight.parent.metadata().map_err(|_| output_rejected())?)
+        || name_exists_at(&preflight.parent, &preflight.final_name)?
+    {
+        return Err(output_rejected());
+    }
+    // SAFETY: AT_EMPTY_PATH links the exact retained unnamed inode. linkat has no replacement
+    // behavior, so a concurrently created destination fails closed without clobbering it.
+    if unsafe {
+        libc::linkat(
+            temporary.as_raw_fd(),
+            c"".as_ptr(),
+            preflight.parent.as_raw_fd(),
+            preflight.final_name.as_ptr(),
+            libc::AT_EMPTY_PATH,
+        )
+    } != 0
+    {
+        return Err(output_rejected());
+    }
+
+    // From this point the complete, settled file is committed. A parent-fsync error reports
+    // durability indeterminate and deliberately does not remove or replace the committed name.
+    checkpoint(CandidateOutputCheckpoint::ParentFsync)?;
+    preflight.parent.sync_all().map_err(|_| output_rejected())?;
+    checkpoint(CandidateOutputCheckpoint::FinalReopen)?;
+    let reopened = open_regular_at(
+        &preflight.parent,
+        preflight
+            .final_name
+            .to_str()
+            .map_err(|_| output_rejected())?,
+    )
+    .map_err(|_| output_rejected())?;
+    let reopened_metadata = reopened.metadata().map_err(|_| output_rejected())?;
+    if !secure_candidate_file(&reopened_metadata, 0o400, 1)
+        || reopened_metadata.len() != bytes.len() as u64
+        || FileIdentity::from_metadata(&reopened_metadata) != identity
+        || hash_file(&reopened, bytes.len() as u64).map_err(|_| output_rejected())? != sha256(bytes)
+    {
+        return Err(output_rejected());
+    }
     Ok(())
+}
+
+fn secure_candidate_file(metadata: &fs::Metadata, mode: u32, links: u64) -> bool {
+    metadata.is_file()
+        && !metadata.file_type().is_symlink()
+        && metadata.uid() == current_euid()
+        && metadata.nlink() == links
+        && metadata.permissions().mode() & 0o7777 == mode
 }
 
 #[cfg(feature = "fixture-tools")]
@@ -2064,15 +2541,136 @@ mod tests {
     const SRI: &str = "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
 
     #[test]
+    fn approved_package_input_digest_derivation_is_domain_separated_and_fixed() {
+        assert_eq!(
+            APPROVED_PACKAGE_INPUT_DOMAIN,
+            b"fluxsemble:runtime-catalog-approved-package-input-manifest:v1\0"
+        );
+        assert_eq!(
+            APPROVED_PACKAGE_INPUT_SHA256,
+            "04ff8560de163983621e86598c8eb6b80fabb32cfced020602c14ed45818f9ef"
+        );
+        assert_ne!(
+            approved_package_input_digest(b"{}"),
+            APPROVED_PACKAGE_INPUT_SHA256
+        );
+    }
+
+    #[test]
+    fn approved_production_tuple_pins_each_public_immutable_fact() {
+        let approved = approved_tuple_shape_for_test();
+        require_approved_production_tuple(&approved).unwrap();
+        let baseline: Value =
+            serde_json::from_slice(&serde_jcs::to_vec(&approved).unwrap()).unwrap();
+        for (pointer, replacement) in [
+            ("/release/provider", json!("builtin:other")),
+            ("/release/release/target", json!("linux_arm64")),
+            (
+                "/release/release/components/0/artifacts/0/url",
+                json!("https://nodejs.org/dist/v22.19.0/substituted.tar.xz"),
+            ),
+            (
+                "/release/release/components/0/artifacts/0/size_bytes",
+                json!("30479989"),
+            ),
+            (
+                "/release/release/components/0/artifacts/0/sha256",
+                json!("11".repeat(32)),
+            ),
+            (
+                "/release/release/components/1/artifacts/0/url",
+                json!("https://registry.npmjs.org/substituted.tgz"),
+            ),
+            (
+                "/release/release/components/1/artifacts/0/size_bytes",
+                json!("4992067"),
+            ),
+            (
+                "/release/release/components/1/artifacts/0/sha256",
+                json!("12".repeat(32)),
+            ),
+            (
+                "/release/release/provider_extension/metadata/registry_integrity",
+                json!(SRI),
+            ),
+            (
+                "/release/release/provider_extension/metadata/root_package_manifest/url",
+                json!("https://github.com/substituted.json"),
+            ),
+            (
+                "/release/release/provider_extension/metadata/root_package_manifest/size_bytes",
+                json!("3561"),
+            ),
+            (
+                "/release/release/provider_extension/metadata/root_package_manifest/sha256",
+                json!("13".repeat(32)),
+            ),
+            (
+                "/release/release/provider_extension/metadata/shipped_shrinkwrap/artifact/url",
+                json!("https://github.com/substituted-shrinkwrap.json"),
+            ),
+            (
+                "/release/release/provider_extension/metadata/shipped_shrinkwrap/artifact/size_bytes",
+                json!("61541"),
+            ),
+            (
+                "/release/release/provider_extension/metadata/shipped_shrinkwrap/artifact/sha256",
+                json!("14".repeat(32)),
+            ),
+        ] {
+            let mut mutation = baseline.clone();
+            *mutation.pointer_mut(pointer).unwrap() = replacement;
+            if let Ok(intent) =
+                InitialPiReleaseIntentV1::from_json(&serde_jcs::to_vec(&mutation).unwrap())
+            {
+                assert!(
+                    require_approved_production_tuple(&intent).is_err(),
+                    "production policy accepted mutation at {pointer}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn public_production_entry_points_reject_synthetic_tuples_before_key_open() {
+        let fixture = CandidateFixture::new();
+        let intent_bundle = verify_transferred_bundle(&fixture.intent_bundle).unwrap();
+        let final_bundle = verify_transferred_bundle(&fixture.final_bundle).unwrap();
+        reset_key_open_count();
+        assert_eq!(
+            assemble_release_intent(&intent_bundle, &fixture.intent),
+            Err(SignError::CandidateRejected)
+        );
+        assert_eq!(
+            finalize_candidate(&final_bundle, &fixture.source, &fixture.qualification),
+            Err(SignError::CandidateRejected)
+        );
+        let output = fixture.root.path.join("production-rejected-output");
+        assert!(matches!(
+            sign_release(SignReleaseRequest {
+                bundle: &final_bundle,
+                source: &fixture.source,
+                qualification: &fixture.qualification,
+                key_path: &fixture.fixture_key,
+                output: &output,
+            }),
+            Err(SignError::CandidateRejected)
+        ));
+        assert_eq!(key_open_count(), 0);
+        assert!(!output.exists());
+    }
+
+    #[test]
     fn intent_and_final_candidates_bind_the_same_runtime_semantics_and_only_final_can_sign() {
         let fixture = CandidateFixture::new();
         let intent_bundle = verify_transferred_bundle(&fixture.intent_bundle).unwrap();
-        let intent = assemble_release_intent(&intent_bundle, &fixture.intent).unwrap();
+        let intent = assemble_release_intent_for_test(&intent_bundle, &fixture.intent).unwrap();
         assert!(!intent.is_production_signable());
 
         let final_bundle = verify_transferred_bundle(&fixture.final_bundle).unwrap();
         let final_candidate =
-            finalize_candidate(&final_bundle, &fixture.source, &fixture.qualification).unwrap();
+            finalize_candidate_for_test(&final_bundle, &fixture.source, &fixture.qualification)
+                .unwrap();
         assert!(final_candidate.is_production_signable());
         assert_eq!(
             final_candidate.runtime_semantic_sha256(),
@@ -2104,11 +2702,58 @@ mod tests {
         let fixture = CandidateFixture::new();
         let bundle = verify_transferred_bundle(&fixture.final_bundle).unwrap();
         let candidate =
-            finalize_candidate(&bundle, &fixture.source, &fixture.qualification).unwrap();
+            finalize_candidate_for_test(&bundle, &fixture.source, &fixture.qualification).unwrap();
         let key = fixture_signing_key_for_test();
         let signed = sign_candidate(&candidate, key.as_dalek(), "catalog-test-key-v1").unwrap();
         drop(key);
-        verify_signed_bytes(&signed, false).unwrap();
+        verify_signed_bytes(&signed, SignatureVerificationPolicy::SyntheticTestFixture).unwrap();
+        let unmodified_catalog = signed.files.get(CATALOG_NAME).unwrap();
+        let unmodified_release = signed.files.get(RELEASE_MANIFEST_NAME).unwrap();
+        verify_fixture_signatures_for_test(unmodified_catalog, unmodified_release).unwrap();
+        #[cfg(feature = "fixture-tools")]
+        {
+            catalog_core::verify_fixture_signed_catalog(unmodified_catalog).unwrap();
+            catalog_core::verify_fixture_signed_release_bundle_manifest(unmodified_release)
+                .unwrap();
+        }
+
+        let catalog_value: Value = serde_json::from_slice(unmodified_catalog).unwrap();
+        let release_value: Value = serde_json::from_slice(unmodified_release).unwrap();
+        let catalog_signature = catalog_value["signature"].as_str().unwrap().to_owned();
+        let release_signature = release_value["signature"]["signature"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let mut catalog_cross_domain = catalog_value.clone();
+        catalog_cross_domain["signature"] = json!(&release_signature);
+        assert!(
+            verify_fixture_signatures_for_test(
+                &serde_jcs::to_vec(&catalog_cross_domain).unwrap(),
+                unmodified_release,
+            )
+            .is_err()
+        );
+        let mut release_cross_domain = release_value.clone();
+        release_cross_domain["signature"]["signature"] = json!(&catalog_signature);
+        assert!(
+            verify_fixture_signatures_for_test(
+                unmodified_catalog,
+                &serde_jcs::to_vec(&release_cross_domain).unwrap(),
+            )
+            .is_err()
+        );
+        let mut release_bit_flip = release_value;
+        let mut altered = release_signature.as_bytes().to_vec();
+        altered[0] = if altered[0] == b'A' { b'B' } else { b'A' };
+        release_bit_flip["signature"]["signature"] = json!(String::from_utf8(altered).unwrap());
+        assert!(
+            verify_fixture_signatures_for_test(
+                unmodified_catalog,
+                &serde_jcs::to_vec(&release_bit_flip).unwrap(),
+            )
+            .is_err()
+        );
+
         assert_eq!(
             signed.inventory.entries().len(),
             signed.manifest.assets().len() + 3
@@ -2117,8 +2762,12 @@ mod tests {
         assert_eq!(signed.manifest.tag().as_str(), "catalog-v1-sequence-1");
 
         let output = fixture.root.path.join("signed-output");
-        let result =
-            write_signed_output(OutputPreflight::new(&output).unwrap(), signed, false).unwrap();
+        let result = write_signed_output(
+            OutputPreflight::new(&output).unwrap(),
+            signed,
+            SignatureVerificationPolicy::SyntheticTestFixture,
+        )
+        .unwrap();
         assert_eq!(result.output(), output);
         assert_eq!(mode(&output), 0o700);
         for entry in fs::read_dir(&output).unwrap() {
@@ -2128,6 +2777,64 @@ mod tests {
             OutputPreflight::new(&output).is_err(),
             "no-clobber output was reusable"
         );
+    }
+
+    #[test]
+    fn candidate_file_publication_is_atomic_no_clobber_and_reopened_exactly() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = CandidateFixture::new();
+        let bundle = verify_transferred_bundle(&fixture.final_bundle).unwrap();
+        let candidate =
+            finalize_candidate_for_test(&bundle, &fixture.source, &fixture.qualification).unwrap();
+
+        let output = fixture.root.path.join("candidate.json");
+        write_candidate(&output, &candidate).unwrap();
+        assert_eq!(mode(&output), 0o400);
+        assert_eq!(fs::read(&output).unwrap(), candidate.canonical_payload());
+
+        fs::set_permissions(&output, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&output, b"existing-sentinel").unwrap();
+        fs::set_permissions(&output, fs::Permissions::from_mode(0o400)).unwrap();
+        assert_eq!(
+            write_candidate(&output, &candidate),
+            Err(SignError::OutputRejected)
+        );
+        assert_eq!(fs::read(&output).unwrap(), b"existing-sentinel");
+
+        let failed = fixture.root.path.join("failed-before-link.json");
+        assert_eq!(
+            write_candidate_atomically(&failed, candidate.canonical_payload(), |stage| {
+                (stage != CandidateOutputCheckpoint::Link)
+                    .then_some(())
+                    .ok_or_else(output_rejected)
+            }),
+            Err(SignError::OutputRejected)
+        );
+        assert!(!failed.exists(), "an unnamed failed write became visible");
+
+        let indeterminate = fixture.root.path.join("durability-indeterminate.json");
+        assert_eq!(
+            write_candidate_atomically(&indeterminate, candidate.canonical_payload(), |stage| {
+                (stage != CandidateOutputCheckpoint::ParentFsync)
+                    .then_some(())
+                    .ok_or_else(output_rejected)
+            },),
+            Err(SignError::OutputRejected)
+        );
+        assert_eq!(mode(&indeterminate), 0o400);
+        assert_eq!(
+            fs::read(&indeterminate).unwrap(),
+            candidate.canonical_payload()
+        );
+
+        let linked_parent = fixture.root.path.join("linked-parent");
+        symlink(&fixture.root.path, &linked_parent).unwrap();
+        assert_eq!(
+            write_candidate(&linked_parent.join("outside.json"), &candidate),
+            Err(SignError::OutputRejected)
+        );
+        assert!(!fixture.root.path.join("outside.json").exists());
     }
 
     #[test]
@@ -2271,7 +2978,7 @@ mod tests {
         let fixture = CandidateFixture::new();
         let bundle = verify_transferred_bundle(&fixture.final_bundle).unwrap();
         let candidate =
-            finalize_candidate(&bundle, &fixture.source, &fixture.qualification).unwrap();
+            finalize_candidate_for_test(&bundle, &fixture.source, &fixture.qualification).unwrap();
         let key = fixture_signing_key_for_test();
         let signed = sign_candidate(&candidate, key.as_dalek(), "catalog-test-key-v1").unwrap();
         let original: Value =
@@ -2459,6 +3166,37 @@ mod tests {
     }
 
     type FixtureObjects = BTreeMap<String, (String, Vec<u8>)>;
+
+    fn approved_tuple_shape_for_test() -> InitialPiReleaseIntentV1 {
+        let (mut intent, _, _) = intent_fixture();
+        let tag = intent["tag"].as_str().unwrap().to_owned();
+        let release = &mut intent["release"]["release"];
+        release["components"][0]["artifacts"][0]["url"] = json!(NODE_ARTIFACT_URL);
+        release["components"][0]["artifacts"][0]["size_bytes"] =
+            json!(NODE_ARTIFACT_SIZE.to_string());
+        release["components"][0]["artifacts"][0]["sha256"] = json!(NODE_ARTIFACT_SHA256);
+        release["components"][1]["artifacts"][0]["url"] = json!(ROOT_ARTIFACT_URL);
+        release["components"][1]["artifacts"][0]["size_bytes"] =
+            json!(ROOT_ARTIFACT_SIZE.to_string());
+        release["components"][1]["artifacts"][0]["sha256"] = json!(ROOT_ARTIFACT_SHA256);
+        let metadata = &mut release["provider_extension"]["metadata"];
+        metadata["registry_integrity"] = json!(ROOT_REGISTRY_INTEGRITY);
+        metadata["root_package_manifest"] = json!({
+            "url": format!(
+                "https://github.com/Devalch/Fluxsemble-runtime-catalog/releases/download/{tag}/pi-package-{ROOT_MANIFEST_SHA256}.json"
+            ),
+            "size_bytes": ROOT_MANIFEST_SIZE.to_string(),
+            "sha256": ROOT_MANIFEST_SHA256,
+        });
+        metadata["shipped_shrinkwrap"]["artifact"] = json!({
+            "url": format!(
+                "https://github.com/Devalch/Fluxsemble-runtime-catalog/releases/download/{tag}/pi-shrinkwrap-{SHRINKWRAP_SHA256}.json"
+            ),
+            "size_bytes": SHRINKWRAP_SIZE.to_string(),
+            "sha256": SHRINKWRAP_SHA256,
+        });
+        InitialPiReleaseIntentV1::from_json(&serde_jcs::to_vec(&intent).unwrap()).unwrap()
+    }
 
     fn intent_fixture() -> (Value, Vec<u8>, FixtureObjects) {
         let mut payload: Value = serde_json::from_slice(include_bytes!(

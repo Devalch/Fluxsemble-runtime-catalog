@@ -302,15 +302,17 @@ fn decode_standard_base64(encoded: &[u8]) -> Result<Zeroizing<Vec<u8>>, SignErro
             }
         }
     }
-    if encode_standard_base64(&output).as_bytes() != encoded {
+    let canonical = encode_standard_base64(&output);
+    if canonical.as_bytes() != encoded {
         return Err(rejected());
     }
     Ok(output)
 }
 
-fn encode_standard_base64(bytes: &[u8]) -> String {
+/// Canonical re-encoding remains zeroizing because its input can be private-key DER.
+fn encode_standard_base64(bytes: &[u8]) -> Zeroizing<String> {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    let mut output = Zeroizing::new(String::with_capacity(bytes.len().div_ceil(3) * 4));
     for chunk in bytes.chunks(3) {
         output.push(char::from(ALPHABET[usize::from(chunk[0] >> 2)]));
         output.push(char::from(
@@ -419,6 +421,14 @@ mod tests {
             "committed fixture must be accepted"
         );
 
+        let generic_ec = pem_with_der(&mutated_der(8, 0x2a));
+        let wrong_oid = pem_with_der(&mutated_der(10, 0x71));
+        let mut multiple = Zeroizing::new(Vec::with_capacity(FIXTURE.len() * 2));
+        multiple.extend_from_slice(FIXTURE);
+        multiple.extend_from_slice(FIXTURE);
+        let mut trailing = Zeroizing::new(Vec::with_capacity(FIXTURE.len() + 8));
+        trailing.extend_from_slice(FIXTURE);
+        trailing.extend_from_slice(b"trailing");
         let replacements: &[(&str, &[u8])] = &[
             (
                 "encrypted.pem",
@@ -432,17 +442,11 @@ mod tests {
                 "sec1.pem",
                 b"-----BEGIN EC PRIVATE KEY-----\nAAAA\n-----END EC PRIVATE KEY-----\n",
             ),
-            ("generic-ec.pem", &pem_with_der(&mutated_der(8, 0x2a))),
-            ("wrong-oid.pem", &pem_with_der(&mutated_der(10, 0x71))),
+            ("generic-ec.pem", &generic_ec),
+            ("wrong-oid.pem", &wrong_oid),
             ("truncated.pem", &FIXTURE[..FIXTURE.len() - 8]),
-            (
-                "multiple.pem",
-                &[FIXTURE, FIXTURE].concat(),
-            ),
-            (
-                "trailing.pem",
-                &[FIXTURE, b"trailing"].concat(),
-            ),
+            ("multiple.pem", &multiple),
+            ("trailing.pem", &trailing),
             (
                 "malformed-base64.pem",
                 b"-----BEGIN PRIVATE KEY-----\n!!!!\n-----END PRIVATE KEY-----\n",
@@ -543,18 +547,24 @@ mod tests {
         assert_eq!(facts.require_secure(), Err(SignError::SigningKeyRejected));
     }
 
-    fn mutated_der(index: usize, value: u8) -> Vec<u8> {
-        let mut der = decode_one_private_key_pem(FIXTURE).unwrap().to_vec();
+    fn mutated_der(index: usize, value: u8) -> Zeroizing<Vec<u8>> {
+        let mut der = decode_one_private_key_pem(FIXTURE).unwrap();
         der[index] = value;
         der
     }
 
-    fn pem_with_der(der: &[u8]) -> Vec<u8> {
-        format!(
-            "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
-            encode_standard_base64(der)
-        )
-        .into_bytes()
+    fn pem_with_der(der: &[u8]) -> Zeroizing<Vec<u8>> {
+        let encoded = encode_standard_base64(der);
+        let mut pem = Zeroizing::new(Vec::with_capacity(
+            PEM_BEGIN.len() + encoded.len() + PEM_END.len() + 3,
+        ));
+        pem.extend_from_slice(PEM_BEGIN);
+        pem.push(b'\n');
+        pem.extend_from_slice(encoded.as_bytes());
+        pem.push(b'\n');
+        pem.extend_from_slice(PEM_END);
+        pem.push(b'\n');
+        pem
     }
 
     struct TempDirectory {

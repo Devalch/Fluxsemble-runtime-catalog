@@ -127,10 +127,20 @@ PY
 
 python3 - <<'PY'
 from pathlib import Path
+import re
 import sys
 
 sign_manifest = Path("crates/catalog-sign/Cargo.toml").read_text(encoding="utf-8")
-for forbidden in ["catalog-acquire", "catalog-publish", "reqwest", "tokio"]:
+for forbidden in [
+    "catalog-acquire",
+    "catalog-publish",
+    "reqwest",
+    "tokio",
+    "hyper",
+    "ureq",
+    "curl",
+    "openssh",
+]:
     if forbidden in sign_manifest:
         print(f"forbidden signer dependency/capability: {forbidden}", file=sys.stderr)
         sys.exit(1)
@@ -143,6 +153,74 @@ for forbidden in ["catalog-test-key-v1", "nonproduction-ed25519-pkcs8.pem"]:
         sys.exit(1)
 if "fixture-tools" in main_source:
     print("fixture CLI feature in production signer", file=sys.stderr)
+    sys.exit(1)
+
+capability_patterns = [
+    re.compile(pattern)
+    for pattern in [
+        r"\bstd::net\b",
+        r"\btokio::net\b",
+        r"\b(?:TcpStream|TcpListener|UdpSocket)\b",
+        r"\bstd::process::Command\b",
+        r"\bCommand::new\s*\(",
+        r"\blibc::(?:socket|connect|bind|listen|accept|fork|exec[a-z]*|posix_spawn|system|popen)\b",
+    ]
+]
+
+def signer_boundary_errors(sources):
+    errors = []
+    for name, source in sources.items():
+        for pattern in capability_patterns:
+            if pattern.search(source):
+                errors.append(f"network/process-launch capability in {name}: {pattern.pattern}")
+    key_source = sources["crates/catalog-sign/src/key.rs"]
+    required_zeroizing = [
+        "let mut pem = Zeroizing::new(Vec::with_capacity(",
+        "let mut encoded = Zeroizing::new(Vec::with_capacity(128))",
+        "fn decode_standard_base64(encoded: &[u8]) -> Result<Zeroizing<Vec<u8>>, SignError>",
+        "fn encode_standard_base64(bytes: &[u8]) -> Zeroizing<String>",
+        "let mut seed = Zeroizing::new([0_u8; 32])",
+    ]
+    for required in required_zeroizing:
+        if required not in key_source:
+            errors.append(f"missing private-derived zeroizing boundary: {required}")
+    forbidden_private_sinks = [
+        re.compile(r"fn encode_standard_base64\(bytes: &\[u8\]\) -> String"),
+        re.compile(r"let\s+(?:mut\s+)?(?:pem|der|seed|encoded)\s*=\s*(?:Vec|String)::"),
+        re.compile(r"let\s+(?:mut\s+)?der\s*=.*\.to_vec\(\)"),
+    ]
+    for pattern in forbidden_private_sinks:
+        if pattern.search(key_source):
+            errors.append(f"non-zeroizing private-derived sink: {pattern.pattern}")
+    return errors
+
+sign_sources = {
+    str(path): path.read_text(encoding="utf-8")
+    for path in sorted(Path("crates/catalog-sign/src").glob("*.rs"))
+}
+errors = signer_boundary_errors(sign_sources)
+if errors:
+    print(errors[0], file=sys.stderr)
+    sys.exit(1)
+
+# Mutation-style assertions prove both new structural boundaries fail closed.
+key_name = "crates/catalog-sign/src/key.rs"
+zeroizing_mutation = dict(sign_sources)
+zeroizing_mutation[key_name] = zeroizing_mutation[key_name].replace(
+    "fn encode_standard_base64(bytes: &[u8]) -> Zeroizing<String>",
+    "fn encode_standard_base64(bytes: &[u8]) -> String",
+    1,
+)
+if not signer_boundary_errors(zeroizing_mutation):
+    print("zeroizing boundary scanner accepted an ordinary String mutation", file=sys.stderr)
+    sys.exit(1)
+
+capability_mutation = dict(sign_sources)
+capability_mutation["crates/catalog-sign/src/lib.rs"] += (
+    "\nfn forbidden_mutation() { let _ = std::process::Command::new(\"true\"); }\n"
+)
+if not signer_boundary_errors(capability_mutation):
+    print("signer capability scanner accepted a process-launch mutation", file=sys.stderr)
     sys.exit(1)
 
 core_source = Path("crates/catalog-core/src/signature.rs").read_text(encoding="utf-8")

@@ -16,7 +16,33 @@ fn key_reader_is_private_and_production_cli_has_no_fixture_authority() {
     let main_source = include_str!("../src/main.rs");
     assert!(key_source.contains("fn read_signing_key("));
     assert!(!key_source.contains("pub fn read_signing_key("));
+    assert!(key_source.contains("fn encode_standard_base64(bytes: &[u8]) -> Zeroizing<String>"));
+    assert!(!key_source.contains("fn encode_standard_base64(bytes: &[u8]) -> String"));
     assert!(main_source.contains("production_key_identity"));
     assert!(!main_source.contains("catalog-test-key-v1"));
     assert!(!main_source.contains("fixture-tools"));
+
+    let signer_sources = [
+        key_source.as_str(),
+        include_str!("../src/lib.rs"),
+        include_str!("../src/main.rs"),
+        include_str!("../src/signing.rs"),
+    ]
+    .concat();
+    for forbidden in [
+        "std::net",
+        "TcpStream",
+        "UdpSocket",
+        "std::process::Command",
+        "Command::new(",
+        "libc::socket",
+        "libc::connect",
+        "libc::fork",
+        "libc::exec",
+    ] {
+        assert!(
+            !signer_sources.contains(forbidden),
+            "signer gained forbidden network/process capability: {forbidden}"
+        );
+    }
 }
