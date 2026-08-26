@@ -95,6 +95,58 @@ class AuthenticatedInputTests(unittest.TestCase):
         write_public_file(self.root_path / "nested/input.json", data)
         self.assertEqual(self.read("nested/input.json", data), data)
 
+    def test_directory_policy_rejects_synthetic_foreign_root_and_nested_owner(self) -> None:
+        nested = self.root_path / "nested-owner"
+        nested.mkdir(mode=0o700)
+        for label, metadata in (
+            ("root", self.root_path.stat()),
+            ("nested", nested.stat()),
+        ):
+            self.assertTrue(
+                GENERATOR._public_directory_policy_matches(metadata, os.geteuid()),
+                f"current owner did not satisfy the {label} directory policy",
+            )
+            self.assertFalse(
+                GENERATOR._public_directory_policy_matches(
+                    metadata, os.geteuid() + 1
+                ),
+                f"a deterministic synthetic foreign owner satisfied the {label} directory policy",
+            )
+
+    def test_authenticated_root_accepts_exact_safe_modes_and_rejects_unsafe_modes(self) -> None:
+        candidate = Path(self.temporary.name) / "mode-root"
+        candidate.mkdir(mode=0o700)
+        try:
+            for mode in (0o700, 0o755):
+                candidate.chmod(mode)
+                opened = GENERATOR.AuthenticatedInputRoot.open(candidate)
+                opened.close()
+            for mode in (0o777, 0o1700, 0o2755):
+                candidate.chmod(mode)
+                with self.assertRaises(ValueError, msg=f"accepted root mode {mode:o}"):
+                    GENERATOR.AuthenticatedInputRoot.open(candidate)
+        finally:
+            candidate.chmod(0o700)
+
+    def test_intermediate_directory_accepts_exact_safe_modes_and_rejects_unsafe_modes(
+        self,
+    ) -> None:
+        data = b"authenticated evidence"
+        nested = self.root_path / "mode-nested"
+        write_public_file(nested / "input.json", data)
+        try:
+            for mode in (0o700, 0o755):
+                nested.chmod(mode)
+                self.assertEqual(self.read("mode-nested/input.json", data), data)
+            for mode in (0o777, 0o1700, 0o2755):
+                nested.chmod(mode)
+                with self.assertRaises(
+                    ValueError, msg=f"accepted intermediate mode {mode:o}"
+                ):
+                    self.read("mode-nested/input.json", data)
+        finally:
+            nested.chmod(0o700)
+
     def test_final_and_intermediate_symlinks_are_rejected(self) -> None:
         data = b"authenticated evidence"
         write_public_file(self.root_path / "outside.json", data)

@@ -3672,6 +3672,102 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_corpus_reader_enforces_root_and_component_directory_policy() {
+        let temporary = TempDirectory::new();
+        let root = temporary.path.join("corpus-root");
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let nested = root.join("nested");
+        fs::DirBuilder::new().mode(0o700).create(&nested).unwrap();
+
+        for (label, metadata) in [
+            ("root", root.metadata().unwrap()),
+            ("nested", nested.metadata().unwrap()),
+        ] {
+            assert!(
+                secure_public_corpus_directory_for_owner(&metadata, current_euid()),
+                "current owner did not satisfy the {label} directory policy"
+            );
+            assert!(
+                !secure_public_corpus_directory_for_owner(
+                    &metadata,
+                    current_euid().wrapping_add(1)
+                ),
+                "a deterministic synthetic foreign owner satisfied the {label} directory policy"
+            );
+        }
+
+        for mode in [0o700, 0o755] {
+            fs::set_permissions(&root, fs::Permissions::from_mode(mode)).unwrap();
+            assert!(
+                AuthenticatedCorpus::open(&root).is_ok(),
+                "rejected safe root mode {mode:o}"
+            );
+        }
+        for mode in [0o777, 0o1700, 0o2755] {
+            fs::set_permissions(&root, fs::Permissions::from_mode(mode)).unwrap();
+            assert!(
+                AuthenticatedCorpus::open(&root).is_err(),
+                "accepted unsafe root mode {mode:o}"
+            );
+        }
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let corpus = AuthenticatedCorpus::open(&root).unwrap();
+        let bytes = b"authenticated nested object";
+        let digest = sha256(bytes);
+        let object = nested.join("object.bin");
+        fs::write(&object, bytes).unwrap();
+        fs::set_permissions(&object, fs::Permissions::from_mode(0o644)).unwrap();
+
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(
+            corpus
+                .read_object("nested/object.bin", bytes.len() as u64, &digest)
+                .is_err(),
+            "an unsafe retained root remained usable"
+        );
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+
+        for mode in [0o700, 0o755] {
+            fs::set_permissions(&nested, fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(
+                corpus
+                    .read_object("nested/object.bin", bytes.len() as u64, &digest)
+                    .unwrap(),
+                bytes,
+                "rejected safe intermediate mode {mode:o}"
+            );
+        }
+        for mode in [0o777, 0o1700, 0o2755] {
+            fs::set_permissions(&nested, fs::Permissions::from_mode(mode)).unwrap();
+            assert!(
+                corpus
+                    .read_object("nested/object.bin", bytes.len() as u64, &digest)
+                    .is_err(),
+                "accepted unsafe intermediate mode {mode:o}"
+            );
+        }
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let result = corpus.read_object_with_checkpoints(
+            "nested/object.bin",
+            bytes.len() as u64,
+            &digest,
+            || {},
+            || {},
+            || {},
+            || {
+                fs::set_permissions(&nested, fs::Permissions::from_mode(0o777)).unwrap();
+            },
+        );
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            result.is_err(),
+            "a full-path rebind accepted an intermediate directory made unsafe"
+        );
+    }
+
+    #[test]
     fn authenticated_corpus_reader_enforces_complete_file_and_capability_policy() {
         use std::os::unix::fs::symlink;
 
@@ -4499,6 +4595,14 @@ mod tests {
             Ok(bytes)
         }
 
+        fn validated_root(&self) -> Result<fs::File, SignError> {
+            let metadata = self.root.metadata().map_err(|_| bundle_rejected())?;
+            if !secure_public_corpus_directory(&metadata) {
+                return Err(bundle_rejected());
+            }
+            self.root.try_clone().map_err(|_| bundle_rejected())
+        }
+
         fn open_relative_with_parent(
             &self,
             relative: &str,
@@ -4509,18 +4613,24 @@ mod tests {
             let (parent_name, final_name) = relative
                 .rsplit_once('/')
                 .map_or((None, relative), |(parent, name)| (Some(parent), name));
-            let parent = if let Some(parent_name) = parent_name {
-                let parent_name = CString::new(parent_name).map_err(|_| bundle_rejected())?;
-                openat2(
-                    self.root.as_raw_fd(),
-                    &parent_name,
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-                    // RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH.
-                    0x02 | 0x04 | 0x08,
-                )?
-            } else {
-                self.root.try_clone().map_err(|_| bundle_rejected())?
-            };
+            let mut parent = self.validated_root()?;
+            if let Some(parent_name) = parent_name {
+                for component in parent_name.split('/') {
+                    let component = CString::new(component).map_err(|_| bundle_rejected())?;
+                    let child = openat2(
+                        parent.as_raw_fd(),
+                        &component,
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                        // RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH.
+                        0x02 | 0x04 | 0x08,
+                    )?;
+                    let metadata = child.metadata().map_err(|_| bundle_rejected())?;
+                    if !secure_public_corpus_directory(&metadata) {
+                        return Err(bundle_rejected());
+                    }
+                    parent = child;
+                }
+            }
             let final_name = CString::new(final_name).map_err(|_| bundle_rejected())?;
             let file = openat2(
                 parent.as_raw_fd(),
@@ -4537,17 +4647,8 @@ mod tests {
         }
 
         fn open_relative(&self, relative: &str) -> Result<fs::File, SignError> {
-            if !safe_relative(relative) {
-                return Err(bundle_rejected());
-            }
-            let relative = CString::new(relative).map_err(|_| bundle_rejected())?;
-            openat2(
-                self.root.as_raw_fd(),
-                &relative,
-                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK,
-                // RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH.
-                0x02 | 0x04 | 0x08,
-            )
+            let OpenedCorpusObject { file, .. } = self.open_relative_with_parent(relative)?;
+            Ok(file)
         }
     }
 

@@ -240,10 +240,44 @@ retained_tar_call = 'tarfile.open(fileobj=expanded, mode="r:") as opened:'
 # self-mutations below remove that expression and require the scanner to reject
 # the result, rather than searching for a broad token that may remain elsewhere.
 python_reader_policies = [
-    ("current effective owner", "metadata.st_uid == expected_owner", 1),
     (
-        "production current effective owner",
+        "file expected-owner comparison",
+        "and stat.S_ISREG(metadata.st_mode)\n        and metadata.st_uid == expected_owner",
+        1,
+    ),
+    (
+        "file production current effective owner",
         "metadata, expected_size, maximum_size, os.geteuid()",
+        1,
+    ),
+    (
+        "directory expected-owner comparison",
+        "stat.S_ISDIR(metadata.st_mode)\n        and metadata.st_uid == expected_owner",
+        1,
+    ),
+    (
+        "directory exact safe mode set",
+        "SAFE_PUBLIC_DIRECTORY_MODES = frozenset((0o700, 0o755))",
+        1,
+    ),
+    (
+        "directory production current effective owner",
+        "_public_directory_policy_matches(metadata, os.geteuid())",
+        1,
+    ),
+    (
+        "authenticated-root directory policy invocation",
+        "_require_public_directory(os.fstat(descriptor), str(path))",
+        1,
+    ),
+    (
+        "per-relative-component directory policy invocation",
+        "_require_public_directory(\n                    os.fstat(parent), f\"{self._label}/{component}\"\n                )",
+        1,
+    ),
+    (
+        "absolute-root component-wise retained traversal",
+        "next_descriptor = os.open(component, _DIRECTORY_FLAGS, dir_fd=descriptor)",
         1,
     ),
     ("single link", "and metadata.st_nlink == 1", 1),
@@ -397,11 +431,61 @@ python_reader_policies = [
 
 rust_reader_policies = [
     (
-        "production current effective owner",
+        "file production current effective owner",
         "secure_public_corpus_file_for_owner(metadata, current_euid())",
         1,
     ),
-    ("current effective owner", "&& metadata.uid() == expected_owner", 2),
+    (
+        "directory production current effective owner",
+        "secure_public_corpus_directory_for_owner(metadata, current_euid())",
+        1,
+    ),
+    (
+        "file expected-owner comparison",
+        "metadata.is_file()\n            && !metadata.file_type().is_symlink()\n            && metadata.uid() == expected_owner",
+        1,
+    ),
+    (
+        "directory expected-owner comparison",
+        "metadata.is_dir()\n            && !metadata.file_type().is_symlink()\n            && metadata.uid() == expected_owner",
+        1,
+    ),
+    ("directory exact safe modes", "0o700 | 0o755", 1),
+    (
+        "root admission directory-policy invocation",
+        "let metadata = root.metadata().map_err(|_| bundle_rejected())?;\n            if !secure_public_corpus_directory(&metadata)",
+        1,
+    ),
+    (
+        "retained-root directory-policy revalidation",
+        "let metadata = self.root.metadata().map_err(|_| bundle_rejected())?;\n            if !secure_public_corpus_directory(&metadata)",
+        1,
+    ),
+    (
+        "retained root revalidation before traversal",
+        "let mut parent = self.validated_root()?;",
+        1,
+    ),
+    (
+        "component-wise retained-directory open",
+        "let child = openat2(\n                        parent.as_raw_fd(),\n                        &component,\n                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,",
+        1,
+    ),
+    (
+        "retained-directory close-on-exec flags",
+        "libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,",
+        1,
+    ),
+    (
+        "component directory no-magic-link/no-symlink/beneath resolution",
+        "libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,\n                        // RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH.\n                        0x02 | 0x04 | 0x08,",
+        1,
+    ),
+    (
+        "per-component directory-policy invocation",
+        "let metadata = child.metadata().map_err(|_| bundle_rejected())?;\n                    if !secure_public_corpus_directory(&metadata)",
+        1,
+    ),
     ("single link", "&& metadata.nlink() == 1", 1),
     (
         "exact safe mode",
@@ -437,12 +521,12 @@ rust_reader_policies = [
     (
         "nonblocking no-follow object opens",
         "libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK,",
-        3,
+        2,
     ),
     (
-        "beneath no-symlink resolution",
+        "beneath no-symlink resolution for components and objects",
         "0x02 | 0x04 | 0x08,",
-        4,
+        3,
     ),
     ("bounded read and one-byte excess", ".take(expected_size + 1)", 1),
     (
@@ -451,8 +535,13 @@ rust_reader_policies = [
         2,
     ),
     (
-        "full-relative-path reopen",
-        "let full_path = self.open_relative(relative)?;",
+        "initial and full-relative-path validated traversal",
+        "self.open_relative_with_parent(relative)?;",
+        2,
+    ),
+    (
+        "full-relative-path object open uses validated traversal",
+        "let OpenedCorpusObject { file, .. } = self.open_relative_with_parent(relative)?;",
         1,
     ),
 ]

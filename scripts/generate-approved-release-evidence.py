@@ -130,12 +130,19 @@ def _metadata_snapshot(metadata: os.stat_result) -> tuple[int, ...]:
     )
 
 
+def _public_directory_policy_matches(
+    metadata: os.stat_result,
+    expected_owner: int,
+) -> bool:
+    return (
+        stat.S_ISDIR(metadata.st_mode)
+        and metadata.st_uid == expected_owner
+        and stat.S_IMODE(metadata.st_mode) in SAFE_PUBLIC_DIRECTORY_MODES
+    )
+
+
 def _require_public_directory(metadata: os.stat_result, label: str) -> None:
-    if (
-        not stat.S_ISDIR(metadata.st_mode)
-        or metadata.st_uid != os.geteuid()
-        or stat.S_IMODE(metadata.st_mode) not in SAFE_PUBLIC_DIRECTORY_MODES
-    ):
+    if not _public_directory_policy_matches(metadata, os.geteuid()):
         raise ValueError(f"authenticated input directory policy mismatch: {label}")
 
 
