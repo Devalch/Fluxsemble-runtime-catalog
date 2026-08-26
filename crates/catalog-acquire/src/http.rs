@@ -2,13 +2,18 @@
 
 use std::{
     collections::{BTreeSet, HashSet},
-    fmt, fs, io,
+    ffi::{CStr, CString},
+    fmt, fs,
+    io::{self, Read, Seek, SeekFrom},
     num::NonZeroU64,
-    os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt},
-    path::{Path, PathBuf},
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+    },
+    path::Path,
     sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
     time::Duration,
 };
@@ -17,9 +22,9 @@ use base64::Engine as _;
 use reqwest::{Client, StatusCode, Url, header, redirect::Policy};
 use sha2::{Digest, Sha256, Sha512};
 use tokio::{
-    fs::{File, OpenOptions},
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::AsyncWriteExt,
     sync::Notify,
+    task::spawn_blocking,
     time::{Instant, sleep_until},
 };
 
@@ -30,7 +35,9 @@ const MAX_URL_BYTES: usize = 16 * 1024;
 const STREAM_BUFFER_BYTES: usize = 64 * 1024;
 const GITHUB_HOST: &str = "github.com";
 const GITHUB_ASSET_HOST: &str = "release-assets.githubusercontent.com";
-static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(test)]
+use std::path::PathBuf;
 
 /// A query-free HTTPS URL admitted by `catalog-core`.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -253,28 +260,39 @@ impl fmt::Display for AcquireError {
 
 impl std::error::Error for AcquireError {}
 
-/// A fully rehashed digest-addressed cache winner.
-#[derive(Debug)]
+/// Non-cloneable authority over one fully rehashed digest-addressed cache winner.
 pub struct FetchedObject {
-    path: PathBuf,
-    bytes: Vec<u8>,
+    file: fs::File,
+    size: u64,
     sha256: Sha256Hex,
 }
 
+impl fmt::Debug for FetchedObject {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FetchedObject")
+            .field("size", &self.size)
+            .field("sha256", &self.sha256)
+            .finish_non_exhaustive()
+    }
+}
+
 impl FetchedObject {
+    /// Borrows the verified descriptor without reopening a pathname.
     #[must_use]
-    pub fn path(&self) -> &Path {
-        &self.path
+    pub fn file(&self) -> &fs::File {
+        &self.file
+    }
+
+    /// Transfers the verified descriptor for bounded streaming by the next phase.
+    #[must_use]
+    pub fn into_file(self) -> fs::File {
+        self.file
     }
 
     #[must_use]
-    pub fn bytes(&self) -> &[u8] {
-        &self.bytes
-    }
-
-    #[must_use]
-    pub fn size(&self) -> u64 {
-        self.bytes.len() as u64
+    pub const fn size(&self) -> u64 {
+        self.size
     }
 
     #[must_use]
@@ -297,6 +315,8 @@ struct FetcherInner {
     mode: TransportMode,
     #[cfg(test)]
     hook: Option<TestHook>,
+    #[cfg(test)]
+    blocking_hook: Option<BlockingTestHook>,
 }
 
 #[derive(Clone, Copy)]
@@ -328,6 +348,8 @@ impl CredentialFreeFetcher {
                 mode: TransportMode::Production,
                 #[cfg(test)]
                 hook: None,
+                #[cfg(test)]
+                blocking_hook: None,
             }),
         })
     }
@@ -363,6 +385,7 @@ impl CredentialFreeFetcher {
                 timeout,
                 mode: TransportMode::Loopback(address),
                 hook: None,
+                blocking_hook: None,
             }),
         })
     }
@@ -377,6 +400,22 @@ impl CredentialFreeFetcher {
                 timeout: self.inner.timeout,
                 mode: self.inner.mode,
                 hook: Some(hook),
+                blocking_hook: self.inner.blocking_hook.clone(),
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_blocking_test_hook(&self, hook: BlockingTestHook) -> Self {
+        Self {
+            inner: Arc::new(FetcherInner {
+                client: self.inner.client.clone(),
+                cache: self.inner.cache.clone(),
+                profile: self.inner.profile,
+                timeout: self.inner.timeout,
+                mode: self.inner.mode,
+                hook: self.inner.hook.clone(),
+                blocking_hook: Some(hook),
             }),
         }
     }
@@ -419,23 +458,18 @@ impl FetcherInner {
     ) -> Result<FetchedObject, AcquireError> {
         validate_request(&request, self.profile, self.mode)?;
         check_ready(cancellation, deadline)?;
-        self.cache.revalidate()?;
-        let object_path = self.cache.object_path(&request.sha256);
-        if path_exists(&object_path)? {
-            let bytes = reopen_and_verify(
-                &self.cache,
-                &object_path,
+        if let Some(verified) = self
+            .cache
+            .open_verified(
                 &request,
                 cancellation,
                 deadline,
                 AcquireError::CacheInvalid,
+                self.blocking_hook(BlockingTestHookPoint::CacheReopen),
             )
-            .await?;
-            return Ok(FetchedObject {
-                path: object_path,
-                bytes,
-                sha256: request.sha256,
-            });
+            .await?
+        {
+            return Ok(fetched_object(verified, request.sha256));
         }
 
         let mut current =
@@ -471,7 +505,7 @@ impl FetcherInner {
                 return Err(AcquireError::UnexpectedStatus);
             }
             return self
-                .receive_and_publish(response, request, object_path, cancellation, deadline)
+                .receive_and_publish(response, request, cancellation, deadline)
                 .await;
         }
     }
@@ -480,13 +514,22 @@ impl FetcherInner {
         &self,
         mut response: reqwest::Response,
         request: FetchRequest,
-        object_path: PathBuf,
         cancellation: &AcquisitionCancellation,
         deadline: Instant,
     ) -> Result<FetchedObject, AcquireError> {
         validate_content_length(response.headers(), &request)?;
-        let (mut temporary, mut output) =
-            self.cache.create_temporary(cancellation, deadline).await?;
+        #[cfg(test)]
+        self.pause_at(TestHookPoint::BeforeTemporaryCreate, cancellation, deadline)
+            .await?;
+        let temporary = self
+            .cache
+            .create_temporary(
+                cancellation,
+                deadline,
+                self.blocking_hook(BlockingTestHookPoint::TemporaryCreate),
+            )
+            .await?;
+        let mut output = tokio::fs::File::from_std(temporary);
         #[cfg(test)]
         self.pause_at(TestHookPoint::TemporaryCreated, cancellation, deadline)
             .await?;
@@ -518,6 +561,9 @@ impl FetcherInner {
                 .map_err(|_| AcquireError::TemporaryFile)?;
             sha256.update(&chunk);
             sha512.update(&chunk);
+            #[cfg(test)]
+            self.pause_at(TestHookPoint::BodyChunkWritten, cancellation, deadline)
+                .await?;
         }
         if request
             .expected_size
@@ -533,82 +579,65 @@ impl FetcherInner {
         await_phase(cancellation, deadline, output.flush())
             .await?
             .map_err(|_| AcquireError::TemporaryFile)?;
-        await_phase(cancellation, deadline, output.sync_all())
-            .await?
-            .map_err(|_| AcquireError::TemporaryFile)?;
-        await_phase(
-            cancellation,
-            deadline,
-            output.set_permissions(fs::Permissions::from_mode(0o400)),
-        )
-        .await?
-        .map_err(|_| AcquireError::TemporaryFile)?;
-        drop(output);
+        let temporary = await_phase(cancellation, deadline, output.into_std()).await?;
+        let temporary = self
+            .cache
+            .settle_temporary(
+                temporary,
+                &request,
+                cancellation,
+                deadline,
+                self.blocking_hook(BlockingTestHookPoint::TemporarySettlement),
+            )
+            .await?;
 
-        let temporary_path = temporary.path().to_owned();
-        let _ = reopen_and_verify(
-            &self.cache,
-            &temporary_path,
-            &request,
-            cancellation,
-            deadline,
-            AcquireError::TemporaryFile,
-        )
-        .await?;
         #[cfg(test)]
         self.pause_at(TestHookPoint::BeforePublication, cancellation, deadline)
             .await?;
-        check_ready(cancellation, deadline)?;
-        self.cache.revalidate()?;
-        validate_file_path(&temporary_path, 0o400, AcquireError::TemporaryFile)?;
+        let verified = self
+            .cache
+            .publish(
+                temporary,
+                &request,
+                cancellation,
+                deadline,
+                self.publication_blocking_hook(),
+            )
+            .await?;
+        Ok(fetched_object(verified, request.sha256))
+    }
 
-        match fs::hard_link(&temporary_path, &object_path) {
-            Ok(()) => {
-                let mut published = PublishedGuard::new(object_path.clone());
-                let linked =
-                    fs::metadata(&temporary_path).map_err(|_| AcquireError::TemporaryFile)?;
-                if !secure_file(&linked, 0o400, 2) {
-                    return Err(AcquireError::TemporaryFile);
-                }
-                temporary.remove()?;
-                check_ready(cancellation, deadline)?;
-                sync_directory(&self.cache.path).map_err(|_| AcquireError::Publication)?;
-                let bytes = reopen_and_verify(
-                    &self.cache,
-                    &object_path,
-                    &request,
-                    cancellation,
-                    deadline,
-                    AcquireError::Publication,
+    fn blocking_hook(&self, point: BlockingTestHookPoint) -> Option<BlockingTestHook> {
+        #[cfg(test)]
+        let hook = self
+            .blocking_hook
+            .as_ref()
+            .filter(|hook| hook.point() == point)
+            .cloned();
+        #[cfg(not(test))]
+        let hook = {
+            let _ = point;
+            None
+        };
+        hook
+    }
+
+    fn publication_blocking_hook(&self) -> Option<BlockingTestHook> {
+        #[cfg(test)]
+        let hook = self
+            .blocking_hook
+            .as_ref()
+            .filter(|hook| {
+                matches!(
+                    hook.point(),
+                    BlockingTestHookPoint::Publication
+                        | BlockingTestHookPoint::PublicationAfterLink
                 )
-                .await?;
-                check_ready(cancellation, deadline)?;
-                published.disarm();
-                Ok(FetchedObject {
-                    path: object_path,
-                    bytes,
-                    sha256: request.sha256,
-                })
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                temporary.remove()?;
-                let bytes = reopen_and_verify(
-                    &self.cache,
-                    &object_path,
-                    &request,
-                    cancellation,
-                    deadline,
-                    AcquireError::CacheInvalid,
-                )
-                .await?;
-                Ok(FetchedObject {
-                    path: object_path,
-                    bytes,
-                    sha256: request.sha256,
-                })
-            }
-            Err(_) => Err(AcquireError::Publication),
-        }
+            })
+            .cloned();
+        #[cfg(not(test))]
+        let hook = None;
+        hook
     }
 
     #[cfg(test)]
@@ -627,44 +656,274 @@ impl FetcherInner {
     }
 }
 
-async fn reopen_and_verify(
-    cache: &CacheRoot,
-    path: &Path,
-    request: &FetchRequest,
+struct SettledBlocking<T> {
+    value: T,
+    interruption: Option<AcquireError>,
+}
+
+async fn run_blocking_settled<T, F>(
     cancellation: &AcquisitionCancellation,
     deadline: Instant,
-    category: AcquireError,
-) -> Result<Vec<u8>, AcquireError> {
+    operation: F,
+) -> Result<SettledBlocking<T>, AcquireError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
     check_ready(cancellation, deadline)?;
-    cache.revalidate().map_err(|_| category)?;
-    let mut options = OpenOptions::new();
-    options
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    let mut file = await_phase(cancellation, deadline, options.open(path))
-        .await?
-        .map_err(|_| category)?;
-    let before = await_phase(cancellation, deadline, file.metadata())
-        .await?
-        .map_err(|_| category)?;
-    if !secure_file(&before, 0o400, 1)
-        || before.len() > request.maximum_size.get()
+    let mut task = spawn_blocking(operation);
+    let mut interruption = None;
+    let value = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => {
+            interruption = Some(AcquireError::Cancelled);
+            task.await.map_err(|_| AcquireError::Transport)?
+        }
+        () = sleep_until(deadline) => {
+            interruption = Some(AcquireError::Timeout);
+            task.await.map_err(|_| AcquireError::Transport)?
+        }
+        result = &mut task => result.map_err(|_| AcquireError::Transport)?,
+    };
+    if interruption.is_none() {
+        interruption = current_interruption(cancellation, deadline);
+    }
+    Ok(SettledBlocking {
+        value,
+        interruption,
+    })
+}
+
+fn current_interruption(
+    cancellation: &AcquisitionCancellation,
+    deadline: Instant,
+) -> Option<AcquireError> {
+    if cancellation.is_cancelled() {
+        Some(AcquireError::Cancelled)
+    } else if Instant::now() >= deadline {
+        Some(AcquireError::Timeout)
+    } else {
+        None
+    }
+}
+
+fn check_blocking_ready(
+    cancellation: &AcquisitionCancellation,
+    deadline: Instant,
+) -> Result<(), AcquireError> {
+    current_interruption(cancellation, deadline).map_or(Ok(()), Err)
+}
+
+fn fetched_object(verified: VerifiedOpen, sha256: Sha256Hex) -> FetchedObject {
+    FetchedObject {
+        file: verified.file,
+        size: verified.size,
+        sha256,
+    }
+}
+
+struct VerifiedOpen {
+    file: fs::File,
+    size: u64,
+}
+
+struct PublishOutcome {
+    verified: VerifiedOpen,
+}
+
+struct PublishBlockingRequest<'a> {
+    name: &'a CStr,
+    request: &'a FetchRequest,
+    cancellation: &'a AcquisitionCancellation,
+    deadline: Instant,
+    control: &'a PublicationControl,
+    hook: Option<&'a BlockingTestHook>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+    size: u64,
+    mode: u32,
+    links: u64,
+    uid: u32,
+}
+
+const PUBLICATION_UNDECIDED: u8 = 0;
+const PUBLICATION_COMMIT: u8 = 1;
+const PUBLICATION_ABORT: u8 = 2;
+
+#[derive(Clone)]
+struct PublicationControl {
+    inner: Arc<PublicationControlInner>,
+}
+
+struct PublicationControlInner {
+    tentative: AtomicBool,
+    tentative_notify: Notify,
+    decision: AtomicU8,
+    decision_lock: Mutex<()>,
+    decision_notify: Condvar,
+}
+
+impl PublicationControl {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(PublicationControlInner {
+                tentative: AtomicBool::new(false),
+                tentative_notify: Notify::new(),
+                decision: AtomicU8::new(PUBLICATION_UNDECIDED),
+                decision_lock: Mutex::new(()),
+                decision_notify: Condvar::new(),
+            }),
+        }
+    }
+
+    fn mark_tentative(&self) {
+        self.inner.tentative.store(true, Ordering::Release);
+        self.inner.tentative_notify.notify_waiters();
+    }
+
+    async fn tentative(&self) {
+        loop {
+            let notified = self.inner.tentative_notify.notified();
+            if self.inner.tentative.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn decide(&self, decision: u8) {
+        let _ = self.inner.decision.compare_exchange(
+            PUBLICATION_UNDECIDED,
+            decision,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        self.inner.decision_notify.notify_all();
+    }
+
+    fn is_aborted(&self) -> bool {
+        self.inner.decision.load(Ordering::Acquire) == PUBLICATION_ABORT
+    }
+
+    fn wait_for_decision(&self) -> bool {
+        let mut lock = self.inner.decision_lock.lock().expect("publication lock");
+        loop {
+            match self.inner.decision.load(Ordering::Acquire) {
+                PUBLICATION_COMMIT => return true,
+                PUBLICATION_ABORT => return false,
+                _ => {
+                    lock = self
+                        .inner
+                        .decision_notify
+                        .wait(lock)
+                        .expect("publication wait");
+                }
+            }
+        }
+    }
+}
+
+struct PublicationDecisionGuard {
+    control: PublicationControl,
+    active: bool,
+}
+
+impl PublicationDecisionGuard {
+    fn new(control: PublicationControl) -> Self {
+        Self {
+            control,
+            active: true,
+        }
+    }
+
+    fn abort(&mut self) {
+        self.control.decide(PUBLICATION_ABORT);
+        self.active = false;
+    }
+
+    fn commit(&mut self) {
+        self.control.decide(PUBLICATION_COMMIT);
+        self.active = false;
+    }
+
+    fn disarm_without_decision(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for PublicationDecisionGuard {
+    fn drop(&mut self) {
+        if self.active {
+            self.control.decide(PUBLICATION_ABORT);
+        }
+    }
+}
+
+impl FileIdentity {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            size: metadata.len(),
+            mode: metadata.mode(),
+            links: metadata.nlink(),
+            uid: metadata.uid(),
+        }
+    }
+
+    fn is_regular_owner_file(self, mode: u32, links: u64) -> bool {
+        self.mode & libc::S_IFMT == libc::S_IFREG
+            && self.uid == current_euid()
+            && self.mode & 0o777 == mode
+            && self.links == links
+    }
+}
+
+struct VerifyOpenRequest<'a> {
+    cache: &'a CacheRoot,
+    object_name: Option<&'a CStr>,
+    request: &'a FetchRequest,
+    cancellation: &'a AcquisitionCancellation,
+    deadline: Instant,
+    category: AcquireError,
+    expected_links: u64,
+}
+
+fn verify_open_file(
+    mut file: fs::File,
+    verification: VerifyOpenRequest<'_>,
+) -> Result<(VerifiedOpen, FileIdentity), AcquireError> {
+    let VerifyOpenRequest {
+        cache,
+        object_name,
+        request,
+        cancellation,
+        deadline,
+        category,
+        expected_links,
+    } = verification;
+    check_blocking_ready(cancellation, deadline)?;
+    let before = FileIdentity::from_metadata(&file.metadata().map_err(|_| category)?);
+    if !before.is_regular_owner_file(0o400, expected_links)
+        || before.size > request.maximum_size.get()
         || request
             .expected_size
-            .is_some_and(|expected| before.len() != expected)
+            .is_some_and(|expected| before.size != expected)
     {
         return Err(category);
     }
-    let capacity = usize::try_from(before.len()).map_err(|_| category)?;
-    let mut bytes = Vec::with_capacity(capacity);
+    file.seek(SeekFrom::Start(0)).map_err(|_| category)?;
     let mut sha256 = Sha256::new();
     let mut sha512 = Sha512::new();
-    let mut buffer = vec![0_u8; STREAM_BUFFER_BYTES];
+    let mut buffer = [0_u8; STREAM_BUFFER_BYTES];
     let mut size = 0_u64;
     loop {
-        let read = await_phase(cancellation, deadline, file.read(&mut buffer))
-            .await?
-            .map_err(|_| category)?;
+        check_blocking_ready(cancellation, deadline)?;
+        let read = file.read(&mut buffer).map_err(|_| category)?;
         if read == 0 {
             break;
         }
@@ -678,31 +937,32 @@ async fn reopen_and_verify(
         }
         sha256.update(&buffer[..read]);
         sha512.update(&buffer[..read]);
-        bytes.extend_from_slice(&buffer[..read]);
     }
-    if size != before.len()
+    if size != before.size
         || request
             .expected_size
             .is_some_and(|expected| size != expected)
+        || !digests_match(
+            request,
+            sha256.finalize().as_slice(),
+            sha512.finalize().as_slice(),
+        )
     {
         return Err(category);
     }
-    if !digests_match(
-        request,
-        sha256.finalize().as_slice(),
-        sha512.finalize().as_slice(),
-    ) {
+    let after = FileIdentity::from_metadata(&file.metadata().map_err(|_| category)?);
+    if before != after || !after.is_regular_owner_file(0o400, expected_links) {
         return Err(category);
     }
-    let after = await_phase(cancellation, deadline, file.metadata())
-        .await?
-        .map_err(|_| category)?;
-    if !same_file(&before, &after) || !secure_file(&after, 0o400, 1) {
-        return Err(category);
+    if let Some(name) = object_name {
+        let named = cache.statat(name).map_err(|_| category)?.ok_or(category)?;
+        if named != after {
+            return Err(category);
+        }
     }
-    validate_open_path(path, &after, category)?;
-    cache.revalidate().map_err(|_| category)?;
-    Ok(bytes)
+    file.seek(SeekFrom::Start(0)).map_err(|_| category)?;
+    check_blocking_ready(cancellation, deadline)?;
+    Ok((VerifiedOpen { file, size }, after))
 }
 
 async fn await_phase<T, F>(
@@ -1024,19 +1284,16 @@ fn is_canonical_test_sri(value: &str) -> bool {
 
 #[derive(Clone)]
 struct CacheRoot {
+    directory: Arc<fs::File>,
+    #[cfg(test)]
     path: PathBuf,
-    device: u64,
-    inode: u64,
 }
 
 impl CacheRoot {
     fn open(path: &Path) -> Result<Self, AcquireError> {
         match fs::symlink_metadata(path) {
-            Ok(metadata) => {
-                if !secure_directory(&metadata) {
-                    return Err(AcquireError::InvalidPolicy);
-                }
-            }
+            Ok(metadata) if secure_directory(&metadata) => {}
+            Ok(_) => return Err(AcquireError::InvalidPolicy),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 fs::DirBuilder::new()
                     .recursive(false)
@@ -1046,69 +1303,435 @@ impl CacheRoot {
             }
             Err(_) => return Err(AcquireError::InvalidPolicy),
         }
-        let canonical = fs::canonicalize(path).map_err(|_| AcquireError::InvalidPolicy)?;
-        let metadata = fs::symlink_metadata(&canonical).map_err(|_| AcquireError::InvalidPolicy)?;
+        let mut options = fs::OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let directory = options
+            .open(path)
+            .map_err(|_| AcquireError::InvalidPolicy)?;
+        let metadata = directory
+            .metadata()
+            .map_err(|_| AcquireError::InvalidPolicy)?;
         if !secure_directory(&metadata) {
             return Err(AcquireError::InvalidPolicy);
         }
         Ok(Self {
-            path: canonical,
-            device: metadata.dev(),
-            inode: metadata.ino(),
+            directory: Arc::new(directory),
+            #[cfg(test)]
+            path: path.to_owned(),
         })
     }
 
-    fn revalidate(&self) -> Result<(), AcquireError> {
-        let metadata = fs::symlink_metadata(&self.path).map_err(|_| AcquireError::CacheInvalid)?;
-        if !secure_directory(&metadata)
-            || metadata.dev() != self.device
-            || metadata.ino() != self.inode
-        {
-            return Err(AcquireError::CacheInvalid);
+    async fn open_verified(
+        &self,
+        request: &FetchRequest,
+        cancellation: &AcquisitionCancellation,
+        deadline: Instant,
+        category: AcquireError,
+        hook: Option<BlockingTestHook>,
+    ) -> Result<Option<VerifiedOpen>, AcquireError> {
+        let cache = self.clone();
+        let request = request.clone();
+        let cancellation_owned = cancellation.clone();
+        let name = object_name(&request.sha256)?;
+        let settled = run_blocking_settled(cancellation, deadline, move || {
+            if let Some(hook) = hook {
+                hook.block();
+            }
+            check_blocking_ready(&cancellation_owned, deadline)?;
+            let Some(file) = cache
+                .open_named(&name, libc::O_RDONLY)
+                .map_err(|_| category)?
+            else {
+                return Ok(None);
+            };
+            verify_open_file(
+                file,
+                VerifyOpenRequest {
+                    cache: &cache,
+                    object_name: Some(&name),
+                    request: &request,
+                    cancellation: &cancellation_owned,
+                    deadline,
+                    category,
+                    expected_links: 1,
+                },
+            )
+            .map(|(verified, _)| Some(verified))
+        })
+        .await?;
+        if let Some(interruption) = settled.interruption {
+            return Err(interruption);
         }
-        Ok(())
-    }
-
-    fn object_path(&self, digest: &Sha256Hex) -> PathBuf {
-        self.path.join(digest.as_str())
+        settled.value
     }
 
     async fn create_temporary(
         &self,
         cancellation: &AcquisitionCancellation,
         deadline: Instant,
-    ) -> Result<(TemporaryGuard, File), AcquireError> {
-        self.revalidate()?;
-        for _ in 0..64 {
-            check_ready(cancellation, deadline)?;
-            let nonce = NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed);
-            let path = self
-                .path
-                .join(format!(".fetch-{}-{nonce}.tmp", std::process::id()));
-            let mut options = OpenOptions::new();
-            options
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-            match await_phase(cancellation, deadline, options.open(&path)).await? {
-                Ok(file) => {
-                    let metadata = file
-                        .metadata()
-                        .await
-                        .map_err(|_| AcquireError::TemporaryFile)?;
-                    if !secure_file(&metadata, 0o600, 1) {
-                        let _ = fs::remove_file(&path);
-                        return Err(AcquireError::TemporaryFile);
-                    }
-                    return Ok((TemporaryGuard::new(path), file));
+        hook: Option<BlockingTestHook>,
+    ) -> Result<fs::File, AcquireError> {
+        let cache = self.clone();
+        let cancellation_owned = cancellation.clone();
+        let settled = run_blocking_settled(cancellation, deadline, move || {
+            if let Some(hook) = hook {
+                hook.block();
+            }
+            check_blocking_ready(&cancellation_owned, deadline)?;
+            let dot = c_string(".")?;
+            let file = cache
+                .open_named_required(&dot, libc::O_TMPFILE | libc::O_RDWR, 0o600)
+                .map_err(|_| AcquireError::TemporaryFile)?;
+            let identity = FileIdentity::from_metadata(
+                &file.metadata().map_err(|_| AcquireError::TemporaryFile)?,
+            );
+            if !identity.is_regular_owner_file(0o600, 0) {
+                return Err(AcquireError::TemporaryFile);
+            }
+            check_blocking_ready(&cancellation_owned, deadline)?;
+            Ok(file)
+        })
+        .await?;
+        if let Some(interruption) = settled.interruption {
+            return Err(interruption);
+        }
+        settled.value
+    }
+
+    async fn settle_temporary(
+        &self,
+        file: fs::File,
+        request: &FetchRequest,
+        cancellation: &AcquisitionCancellation,
+        deadline: Instant,
+        hook: Option<BlockingTestHook>,
+    ) -> Result<fs::File, AcquireError> {
+        let cache = self.clone();
+        let request = request.clone();
+        let cancellation_owned = cancellation.clone();
+        let settled = run_blocking_settled(cancellation, deadline, move || {
+            if let Some(hook) = hook {
+                hook.block();
+            }
+            check_blocking_ready(&cancellation_owned, deadline)?;
+            file.sync_all().map_err(|_| AcquireError::TemporaryFile)?;
+            file.set_permissions(fs::Permissions::from_mode(0o400))
+                .map_err(|_| AcquireError::TemporaryFile)?;
+            verify_open_file(
+                file,
+                VerifyOpenRequest {
+                    cache: &cache,
+                    object_name: None,
+                    request: &request,
+                    cancellation: &cancellation_owned,
+                    deadline,
+                    category: AcquireError::TemporaryFile,
+                    expected_links: 0,
+                },
+            )
+            .map(|(verified, _)| verified.file)
+        })
+        .await?;
+        if let Some(interruption) = settled.interruption {
+            return Err(interruption);
+        }
+        settled.value
+    }
+
+    async fn publish(
+        &self,
+        temporary: fs::File,
+        request: &FetchRequest,
+        cancellation: &AcquisitionCancellation,
+        deadline: Instant,
+        hook: Option<BlockingTestHook>,
+    ) -> Result<VerifiedOpen, AcquireError> {
+        check_ready(cancellation, deadline)?;
+        let cache = self.clone();
+        let request_owned = request.clone();
+        let cancellation_owned = cancellation.clone();
+        let name = object_name(&request.sha256)?;
+        let control = PublicationControl::new();
+        let mut guard = PublicationDecisionGuard::new(control.clone());
+        let operation_control = control.clone();
+        let mut task = spawn_blocking(move || {
+            if hook
+                .as_ref()
+                .is_some_and(|hook| hook.point() == BlockingTestHookPoint::Publication)
+            {
+                hook.as_ref().expect("publication hook").block();
+            }
+            if operation_control.is_aborted() {
+                return Err(AcquireError::Cancelled);
+            }
+            check_blocking_ready(&cancellation_owned, deadline)?;
+            cache.publish_blocking(
+                temporary,
+                PublishBlockingRequest {
+                    name: &name,
+                    request: &request_owned,
+                    cancellation: &cancellation_owned,
+                    deadline,
+                    control: &operation_control,
+                    hook: hook.as_ref(),
+                },
+            )
+        });
+
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => {
+                guard.abort();
+                let _ = task.await.map_err(|_| AcquireError::Publication)?;
+                Err(AcquireError::Cancelled)
+            }
+            () = sleep_until(deadline) => {
+                guard.abort();
+                let _ = task.await.map_err(|_| AcquireError::Publication)?;
+                Err(AcquireError::Timeout)
+            }
+            () = control.tentative() => {
+                if let Some(interruption) = current_interruption(cancellation, deadline) {
+                    guard.abort();
+                    let _ = task.await.map_err(|_| AcquireError::Publication)?;
+                    return Err(interruption);
                 }
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(_) => return Err(AcquireError::TemporaryFile),
+                guard.commit();
+                task.await
+                    .map_err(|_| AcquireError::Publication)?
+                    .map(|outcome| outcome.verified)
+            }
+            result = &mut task => {
+                guard.disarm_without_decision();
+                let outcome = result.map_err(|_| AcquireError::Publication)??;
+                if let Some(interruption) = current_interruption(cancellation, deadline) {
+                    return Err(interruption);
+                }
+                Ok(outcome.verified)
             }
         }
-        Err(AcquireError::TemporaryFile)
     }
+
+    fn publish_blocking(
+        &self,
+        temporary: fs::File,
+        publication: PublishBlockingRequest<'_>,
+    ) -> Result<PublishOutcome, AcquireError> {
+        let PublishBlockingRequest {
+            name,
+            request,
+            cancellation,
+            deadline,
+            control,
+            hook,
+        } = publication;
+        let before = FileIdentity::from_metadata(
+            &temporary
+                .metadata()
+                .map_err(|_| AcquireError::TemporaryFile)?,
+        );
+        if !before.is_regular_owner_file(0o400, 0) {
+            return Err(AcquireError::TemporaryFile);
+        }
+        match self.link_unnamed(&temporary, name) {
+            Ok(()) => {
+                let linked = FileIdentity::from_metadata(
+                    &temporary
+                        .metadata()
+                        .map_err(|_| AcquireError::TemporaryFile)?,
+                );
+                if !linked.is_regular_owner_file(0o400, 1) {
+                    let _ = self.unlink_if_matches(name, linked);
+                    return Err(AcquireError::TemporaryFile);
+                }
+                if hook
+                    .is_some_and(|hook| hook.point() == BlockingTestHookPoint::PublicationAfterLink)
+                {
+                    hook.expect("after-link hook").block();
+                    if let Err(error) = check_blocking_ready(cancellation, deadline) {
+                        let _ = self.unlink_if_matches(name, linked);
+                        let _ = self.sync_directory();
+                        return Err(error);
+                    }
+                }
+                let result = (|| {
+                    self.sync_directory()?;
+                    check_blocking_ready(cancellation, deadline)?;
+                    let file = self
+                        .open_named(name, libc::O_RDONLY)
+                        .map_err(|_| AcquireError::Publication)?
+                        .ok_or(AcquireError::Publication)?;
+                    let (verified, identity) = verify_open_file(
+                        file,
+                        VerifyOpenRequest {
+                            cache: self,
+                            object_name: Some(name),
+                            request,
+                            cancellation,
+                            deadline,
+                            category: AcquireError::Publication,
+                            expected_links: 1,
+                        },
+                    )?;
+                    if identity != linked {
+                        return Err(AcquireError::Publication);
+                    }
+                    self.sync_directory()?;
+                    check_blocking_ready(cancellation, deadline)?;
+                    control.mark_tentative();
+                    if !control.wait_for_decision() {
+                        return Err(AcquireError::Cancelled);
+                    }
+                    Ok(PublishOutcome { verified })
+                })();
+                if result.is_err() {
+                    let _ = self.unlink_if_matches(name, linked);
+                    let _ = self.sync_directory();
+                }
+                result
+            }
+            Err(error) if error.raw_os_error() == Some(libc::EEXIST) => {
+                let file = self
+                    .open_named(name, libc::O_RDONLY)
+                    .map_err(|_| AcquireError::CacheInvalid)?
+                    .ok_or(AcquireError::CacheInvalid)?;
+                let (verified, _) = verify_open_file(
+                    file,
+                    VerifyOpenRequest {
+                        cache: self,
+                        object_name: Some(name),
+                        request,
+                        cancellation,
+                        deadline,
+                        category: AcquireError::CacheInvalid,
+                        expected_links: 1,
+                    },
+                )?;
+                Ok(PublishOutcome { verified })
+            }
+            Err(_) => Err(AcquireError::Publication),
+        }
+    }
+
+    fn open_named(&self, name: &CStr, flags: i32) -> io::Result<Option<fs::File>> {
+        match self.open_named_required(name, flags, 0) {
+            Ok(file) => Ok(Some(file)),
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn open_named_required(&self, name: &CStr, flags: i32, mode: u32) -> io::Result<fs::File> {
+        // SAFETY: the retained descriptor is an opened directory, `name` is NUL-terminated,
+        // and a successful returned descriptor is immediately given unique `File` ownership.
+        let descriptor = unsafe {
+            libc::openat(
+                self.directory.as_raw_fd(),
+                name.as_ptr(),
+                flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                mode as libc::mode_t,
+            )
+        };
+        if descriptor < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            // SAFETY: `openat` returned a fresh owned descriptor.
+            Ok(unsafe { fs::File::from_raw_fd(descriptor) })
+        }
+    }
+
+    fn link_unnamed(&self, file: &fs::File, name: &CStr) -> io::Result<()> {
+        // SAFETY: both descriptors are live, both pointers are NUL-terminated, and
+        // `AT_EMPTY_PATH` names the O_TMPFILE inode held by `file`.
+        let result = unsafe {
+            libc::linkat(
+                file.as_raw_fd(),
+                c"".as_ptr(),
+                self.directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::AT_EMPTY_PATH,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    fn statat(&self, name: &CStr) -> io::Result<Option<FileIdentity>> {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `stat` points to writable storage, the directory descriptor is live,
+        // and `name` is NUL-terminated. No symlink is followed.
+        let result = unsafe {
+            libc::fstatat(
+                self.directory.as_raw_fd(),
+                name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if result == 0 {
+            // SAFETY: successful `fstatat` initialized the structure.
+            let stat = unsafe { stat.assume_init() };
+            if stat.st_size < 0 {
+                return Err(io::Error::from_raw_os_error(libc::EIO));
+            }
+            Ok(Some(FileIdentity {
+                device: stat.st_dev,
+                inode: stat.st_ino,
+                size: stat.st_size as u64,
+                mode: stat.st_mode,
+                links: stat.st_nlink,
+                uid: stat.st_uid,
+            }))
+        } else {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ENOENT) {
+                Ok(None)
+            } else {
+                Err(error)
+            }
+        }
+    }
+
+    fn unlink_if_matches(&self, name: &CStr, identity: FileIdentity) -> io::Result<()> {
+        if self.statat(name)? != Some(identity) {
+            return Err(io::Error::from_raw_os_error(libc::ESTALE));
+        }
+        // SAFETY: the retained directory descriptor and NUL-terminated relative name are valid.
+        let result = unsafe { libc::unlinkat(self.directory.as_raw_fd(), name.as_ptr(), 0) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    fn sync_directory(&self) -> Result<(), AcquireError> {
+        // SAFETY: the retained descriptor is live for the duration of the call.
+        let result = unsafe { libc::fsync(self.directory.as_raw_fd()) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(AcquireError::Publication)
+        }
+    }
+
+    #[cfg(test)]
+    fn object_path(&self, digest: &Sha256Hex) -> PathBuf {
+        self.path.join(digest.as_str())
+    }
+}
+
+fn object_name(digest: &Sha256Hex) -> Result<CString, AcquireError> {
+    c_string(digest.as_str()).map_err(|_| AcquireError::InvalidPolicy)
+}
+
+fn c_string(value: &str) -> Result<CString, AcquireError> {
+    CString::new(value).map_err(|_| AcquireError::InvalidPolicy)
 }
 
 fn current_euid() -> u32 {
@@ -1122,117 +1745,83 @@ fn secure_directory(metadata: &fs::Metadata) -> bool {
         && metadata.mode() & 0o777 == 0o700
 }
 
-fn secure_file(metadata: &fs::Metadata, mode: u32, links: u64) -> bool {
-    metadata.file_type().is_file()
-        && metadata.uid() == current_euid()
-        && metadata.mode() & 0o777 == mode
-        && metadata.nlink() == links
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockingTestHookPoint {
+    CacheReopen,
+    TemporaryCreate,
+    TemporarySettlement,
+    Publication,
+    PublicationAfterLink,
 }
 
-fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    left.dev() == right.dev()
-        && left.ino() == right.ino()
-        && left.len() == right.len()
-        && left.mode() == right.mode()
-        && left.nlink() == right.nlink()
+#[derive(Clone)]
+pub(crate) struct BlockingTestHook {
+    inner: Arc<BlockingTestHookInner>,
 }
 
-fn validate_file_path(path: &Path, mode: u32, category: AcquireError) -> Result<(), AcquireError> {
-    let metadata = fs::symlink_metadata(path).map_err(|_| category)?;
-    secure_file(&metadata, mode, 1)
-        .then_some(())
-        .ok_or(category)
+struct BlockingTestHookInner {
+    point: BlockingTestHookPoint,
+    reached: AtomicBool,
+    reached_notify: Notify,
+    released: Mutex<bool>,
+    release_notify: Condvar,
 }
 
-fn validate_open_path(
-    path: &Path,
-    opened: &fs::Metadata,
-    category: AcquireError,
-) -> Result<(), AcquireError> {
-    let path_metadata = fs::symlink_metadata(path).map_err(|_| category)?;
-    if !secure_file(&path_metadata, 0o400, 1)
-        || path_metadata.dev() != opened.dev()
-        || path_metadata.ino() != opened.ino()
-    {
-        return Err(category);
-    }
-    Ok(())
-}
-
-fn path_exists(path: &Path) -> Result<bool, AcquireError> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => Ok(true),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(_) => Err(AcquireError::CacheInvalid),
-    }
-}
-
-fn sync_directory(path: &Path) -> io::Result<()> {
-    fs::File::open(path)?.sync_all()
-}
-
-struct TemporaryGuard {
-    path: Option<PathBuf>,
-}
-
-impl TemporaryGuard {
-    fn new(path: PathBuf) -> Self {
-        Self { path: Some(path) }
-    }
-
-    fn path(&self) -> &Path {
-        self.path.as_deref().expect("temporary path remains armed")
-    }
-
-    fn remove(&mut self) -> Result<(), AcquireError> {
-        if let Some(path) = self.path.take()
-            && let Err(error) = fs::remove_file(&path)
-        {
-            self.path = Some(path);
-            return Err(if error.kind() == io::ErrorKind::NotFound {
-                AcquireError::TemporaryFile
-            } else {
-                AcquireError::Publication
-            });
-        }
-        Ok(())
-    }
-}
-
-impl Drop for TemporaryGuard {
-    fn drop(&mut self) {
-        if let Some(path) = self.path.take() {
-            let _ = fs::remove_file(path);
+impl BlockingTestHook {
+    #[cfg(test)]
+    pub(crate) fn new(point: BlockingTestHookPoint) -> Self {
+        Self {
+            inner: Arc::new(BlockingTestHookInner {
+                point,
+                reached: AtomicBool::new(false),
+                reached_notify: Notify::new(),
+                released: Mutex::new(false),
+                release_notify: Condvar::new(),
+            }),
         }
     }
-}
 
-struct PublishedGuard {
-    path: Option<PathBuf>,
-}
-
-impl PublishedGuard {
-    fn new(path: PathBuf) -> Self {
-        Self { path: Some(path) }
+    fn point(&self) -> BlockingTestHookPoint {
+        self.inner.point
     }
 
-    fn disarm(&mut self) {
-        self.path = None;
-    }
-}
-
-impl Drop for PublishedGuard {
-    fn drop(&mut self) {
-        if let Some(path) = self.path.take() {
-            let _ = fs::remove_file(path);
+    fn block(&self) {
+        self.inner.reached.store(true, Ordering::Release);
+        self.inner.reached_notify.notify_waiters();
+        let mut released = self.inner.released.lock().expect("blocking hook lock");
+        while !*released {
+            released = self
+                .inner
+                .release_notify
+                .wait(released)
+                .expect("blocking hook wait");
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_until_reached(&self) {
+        loop {
+            let notified = self.inner.reached_notify.notified();
+            if self.inner.reached.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release(&self) {
+        *self.inner.released.lock().expect("blocking hook lock") = true;
+        self.inner.release_notify.notify_all();
     }
 }
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TestHookPoint {
+    BeforeTemporaryCreate,
     TemporaryCreated,
+    BodyChunkWritten,
     BeforePublication,
 }
 

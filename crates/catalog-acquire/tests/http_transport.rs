@@ -3,16 +3,17 @@ mod http;
 
 use std::{
     fs,
+    io::{Read, Seek, SeekFrom},
     num::NonZeroU64,
-    os::unix::fs::{DirBuilderExt, PermissionsExt},
+    os::unix::fs::{DirBuilderExt, PermissionsExt, symlink},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use http::{
-    AcquireError, AcquisitionCancellation, CredentialFreeFetcher, FetchRequest, RedirectProfile,
-    TestHook, TestHookPoint,
+    AcquireError, AcquisitionCancellation, BlockingTestHook, BlockingTestHookPoint,
+    CredentialFreeFetcher, FetchRequest, FetchedObject, RedirectProfile, TestHook, TestHookPoint,
 };
 use sha2::{Digest, Sha256, Sha512};
 use tokio::{
@@ -40,12 +41,12 @@ async fn fetch_is_exact_bounded_and_credential_free() {
         .await
         .unwrap();
 
-    assert_eq!(fetched.bytes(), ARTIFACT);
     assert_eq!(fetched.size(), 8);
     assert_eq!(
-        fs::metadata(fetched.path()).unwrap().permissions().mode() & 0o777,
+        fetched.file().metadata().unwrap().permissions().mode() & 0o777,
         0o400
     );
+    assert_eq!(fetched_bytes(fetched), ARTIFACT);
     let requests = server.wait_for_requests(2).await;
     for request in requests {
         for forbidden in ["authorization", "cookie", "proxy-authorization", "referer"] {
@@ -127,7 +128,7 @@ async fn github_profile_allows_only_a_bounded_final_release_asset_query() {
         )
         .await
         .unwrap();
-    assert_eq!(fetched.bytes(), body);
+    assert_eq!(fetched_bytes(fetched), body);
 
     let production_initial =
         "https://github.com/owner/repository/releases/latest/download/asset.bin";
@@ -293,13 +294,16 @@ async fn cancellation_before_headers_during_body_and_before_publication_leaves_n
 
     let during_body = LoopbackServer::start(vec![ResponsePlan::chunk_then_hold(b"arti")]).await;
     let root = TestRoot::new();
-    let fetcher = test_fetcher(root.path(), &during_body, RedirectProfile::Default);
+    let hook = TestHook::new(TestHookPoint::BodyChunkWritten);
+    let fetcher = test_fetcher(root.path(), &during_body, RedirectProfile::Default)
+        .with_test_hook(hook.clone());
     let cancellation = AcquisitionCancellation::new();
     let trigger = cancellation.clone();
-    let root_path = root.path().to_path_buf();
+    let release = hook.clone();
     tokio::spawn(async move {
-        wait_for_temporary(&root_path).await;
+        release.wait_until_reached().await;
         trigger.cancel();
+        release.release();
     });
     assert_eq!(
         fetcher
@@ -373,6 +377,34 @@ async fn dropped_future_and_timeout_remove_temporary_objects() {
     wait_for_no_temporary(root.path()).await;
     assert_no_partial(root.path());
 
+    let server = LoopbackServer::start(vec![ResponsePlan::exact(ARTIFACT)]).await;
+    let root = TestRoot::new();
+    let hook = BlockingTestHook::new(BlockingTestHookPoint::PublicationAfterLink);
+    let fetcher = test_fetcher(root.path(), &server, RedirectProfile::Default)
+        .with_blocking_test_hook(hook.clone());
+    let fetch = tokio::spawn({
+        let request = request(
+            &server.url("/drop-during-publication"),
+            &[server.origin()],
+            ARTIFACT,
+            None,
+            8,
+        );
+        async move {
+            fetcher
+                .fetch_exact(request, &AcquisitionCancellation::new())
+                .await
+        }
+    });
+    hook.wait_until_reached().await;
+    assert_eq!(cache_objects(root.path()).len(), 1);
+    fetch.abort();
+    let _ = fetch.await;
+    hook.release();
+    wait_for_empty(root.path()).await;
+    sleep(Duration::from_millis(50)).await;
+    assert_no_partial(root.path());
+
     let server = LoopbackServer::start(vec![ResponsePlan::exact(ARTIFACT).hold_headers()]).await;
     let root = TestRoot::new();
     let fetcher = CredentialFreeFetcher::for_loopback_test(
@@ -425,39 +457,61 @@ async fn cache_collision_link_attack_and_concurrent_exact_fetch_fail_or_settle_s
     );
     assert!(collision_server.requests().is_empty());
 
+    let hardlink_server = LoopbackServer::start(vec![ResponsePlan::exact(ARTIFACT)]).await;
+    let hardlink_root = TestRoot::new();
+    let hardlink_fetcher = test_fetcher(
+        hardlink_root.path(),
+        &hardlink_server,
+        RedirectProfile::Default,
+    );
+    let hardlink_request = request(
+        &hardlink_server.url("/must-not-fetch-linked-cache"),
+        &[hardlink_server.origin()],
+        ARTIFACT,
+        None,
+        8,
+    );
+    let hardlink_cache = hardlink_fetcher.cache_path_for_test(&hardlink_request);
+    let external_link = hardlink_root.external_path("cache-hardlink");
+    fs::write(&hardlink_cache, ARTIFACT).unwrap();
+    fs::set_permissions(&hardlink_cache, fs::Permissions::from_mode(0o400)).unwrap();
+    fs::hard_link(&hardlink_cache, &external_link).unwrap();
+    assert_eq!(
+        hardlink_fetcher
+            .fetch_exact(hardlink_request, &AcquisitionCancellation::new())
+            .await
+            .unwrap_err(),
+        AcquireError::CacheInvalid
+    );
+    assert!(hardlink_server.requests().is_empty());
+    fs::remove_file(external_link).unwrap();
+
     let linked_server = LoopbackServer::start(vec![ResponsePlan::exact(ARTIFACT)]).await;
     let root = TestRoot::new();
     let hook = TestHook::new(TestHookPoint::BeforePublication);
     let fetcher = test_fetcher(root.path(), &linked_server, RedirectProfile::Default)
         .with_test_hook(hook.clone());
     let req = request(
-        &linked_server.url("/linked"),
+        &linked_server.url("/unnamed-temporary"),
         &[linked_server.origin()],
         ARTIFACT,
         None,
         8,
     );
-    let cache_path = fetcher.cache_path_for_test(&req);
-    let external_link = root.external_path("linked-temp");
-    let attacker_root = root.path().to_path_buf();
-    let attacker = hook.clone();
-    let attack = tokio::spawn(async move {
-        attacker.wait_until_reached().await;
-        let temporary = temporary_paths(&attacker_root).pop().unwrap();
-        fs::hard_link(temporary, &external_link).unwrap();
-        attacker.release();
-        external_link
+    let observer_root = root.path().to_path_buf();
+    let observer = hook.clone();
+    let observation = tokio::spawn(async move {
+        observer.wait_until_reached().await;
+        assert!(temporary_paths(&observer_root).is_empty());
+        observer.release();
     });
-    assert_eq!(
-        fetcher
-            .fetch_exact(req, &AcquisitionCancellation::new())
-            .await
-            .unwrap_err(),
-        AcquireError::TemporaryFile
-    );
-    assert!(!cache_path.exists());
-    fs::remove_file(attack.await.unwrap()).unwrap();
-    assert_no_partial(root.path());
+    let fetched = fetcher
+        .fetch_exact(req, &AcquisitionCancellation::new())
+        .await
+        .unwrap();
+    observation.await.unwrap();
+    assert_eq!(fetched_bytes(fetched), ARTIFACT);
+    assert_eq!(cache_objects(root.path()).len(), 1);
 
     let first = LoopbackServer::start(vec![ResponsePlan::exact(ARTIFACT)]).await;
     let second = LoopbackServer::start(vec![ResponsePlan::exact(ARTIFACT)]).await;
@@ -475,10 +529,220 @@ async fn cache_collision_link_attack_and_concurrent_exact_fetch_fail_or_settle_s
         &cancellation_b,
     );
     let (a, b) = tokio::join!(a, b);
-    assert_eq!(a.unwrap().bytes(), ARTIFACT);
-    assert_eq!(b.unwrap().bytes(), ARTIFACT);
+    assert_eq!(fetched_bytes(a.unwrap()), ARTIFACT);
+    assert_eq!(fetched_bytes(b.unwrap()), ARTIFACT);
     assert_eq!(cache_objects(root.path()).len(), 1);
     assert!(temporary_paths(root.path()).is_empty());
+}
+
+#[tokio::test]
+async fn large_artifact_returns_descriptor_authority_without_retaining_artifact_bytes() {
+    let body = vec![0x5a; 8 * 1024 * 1024];
+    let server = LoopbackServer::start(vec![ResponsePlan::exact(&body)]).await;
+    let root = TestRoot::new();
+    let fetcher = CredentialFreeFetcher::for_loopback_test(
+        root.path(),
+        RedirectProfile::Default,
+        server.addr(),
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    let fetched = fetcher
+        .fetch_exact(
+            request(
+                &server.url("/large"),
+                &[server.origin()],
+                &body,
+                None,
+                body.len() as u64,
+            ),
+            &AcquisitionCancellation::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(fetched.size(), body.len() as u64);
+    let mut file = fetched.into_file();
+    let mut sample = [0_u8; 1];
+    file.read_exact(&mut sample).unwrap();
+    assert_eq!(sample, [0x5a]);
+    file.seek(SeekFrom::End(-1)).unwrap();
+    file.read_exact(&mut sample).unwrap();
+    assert_eq!(sample, [0x5a]);
+
+    let source = include_str!("../src/http.rs");
+    let fetched_source = source
+        .split("pub struct FetchedObject")
+        .nth(1)
+        .unwrap()
+        .split("pub struct CredentialFreeFetcher")
+        .next()
+        .unwrap();
+    assert!(!fetched_source.contains("Vec<u8>"));
+    assert!(!fetched_source.contains("pub fn bytes"));
+    assert!(fetched_source.contains("file: fs::File"));
+}
+
+#[tokio::test]
+async fn blocking_filesystem_cancellation_settles_without_starving_runtime_or_late_publication() {
+    let server = LoopbackServer::start(vec![ResponsePlan::exact(ARTIFACT)]).await;
+    let root = TestRoot::new();
+    let hook = BlockingTestHook::new(BlockingTestHookPoint::PublicationAfterLink);
+    let fetcher = test_fetcher(root.path(), &server, RedirectProfile::Default)
+        .with_blocking_test_hook(hook.clone());
+    let cancellation = AcquisitionCancellation::new();
+    let fetch = tokio::spawn({
+        let cancellation = cancellation.clone();
+        let request = request(
+            &server.url("/blocked"),
+            &[server.origin()],
+            ARTIFACT,
+            None,
+            8,
+        );
+        async move { fetcher.fetch_exact(request, &cancellation).await }
+    });
+
+    hook.wait_until_reached().await;
+    cancellation.cancel();
+    timeout(Duration::from_millis(100), sleep(Duration::from_millis(20)))
+        .await
+        .unwrap();
+    assert!(
+        !fetch.is_finished(),
+        "filesystem mutation must settle before return"
+    );
+    assert_eq!(cache_objects(root.path()).len(), 1);
+    hook.release();
+    assert_eq!(fetch.await.unwrap().unwrap_err(), AcquireError::Cancelled);
+    sleep(Duration::from_millis(50)).await;
+    assert_no_partial(root.path());
+}
+
+#[tokio::test]
+async fn blocking_filesystem_timeout_settles_before_return_and_stops_mutation() {
+    let server = LoopbackServer::start(vec![ResponsePlan::exact(ARTIFACT)]).await;
+    let root = TestRoot::new();
+    let hook = BlockingTestHook::new(BlockingTestHookPoint::PublicationAfterLink);
+    let fetcher = CredentialFreeFetcher::for_loopback_test(
+        root.path(),
+        RedirectProfile::Default,
+        server.addr(),
+        Duration::from_millis(75),
+    )
+    .unwrap()
+    .with_blocking_test_hook(hook.clone());
+    let fetch = tokio::spawn({
+        let request = request(
+            &server.url("/blocked-timeout"),
+            &[server.origin()],
+            ARTIFACT,
+            None,
+            8,
+        );
+        async move {
+            fetcher
+                .fetch_exact(request, &AcquisitionCancellation::new())
+                .await
+        }
+    });
+
+    hook.wait_until_reached().await;
+    timeout(
+        Duration::from_millis(150),
+        sleep(Duration::from_millis(100)),
+    )
+    .await
+    .unwrap();
+    assert!(
+        !fetch.is_finished(),
+        "timed-out mutation must still settle before return"
+    );
+    assert_eq!(cache_objects(root.path()).len(), 1);
+    hook.release();
+    assert_eq!(fetch.await.unwrap().unwrap_err(), AcquireError::Timeout);
+    sleep(Duration::from_millis(50)).await;
+    assert_no_partial(root.path());
+}
+
+#[tokio::test]
+async fn cache_root_directory_replacement_before_temp_creation_cannot_redirect_authority() {
+    let server = LoopbackServer::start(vec![ResponsePlan::exact(ARTIFACT)]).await;
+    let root = TestRoot::new();
+    let hook = TestHook::new(TestHookPoint::BeforeTemporaryCreate);
+    let fetcher =
+        test_fetcher(root.path(), &server, RedirectProfile::Default).with_test_hook(hook.clone());
+    let fetch = tokio::spawn({
+        let request = request(
+            &server.url("/replace-root"),
+            &[server.origin()],
+            ARTIFACT,
+            None,
+            8,
+        );
+        async move {
+            fetcher
+                .fetch_exact(request, &AcquisitionCancellation::new())
+                .await
+        }
+    });
+
+    hook.wait_until_reached().await;
+    let original = root.external_path("original-before-temp");
+    fs::rename(root.path(), &original).unwrap();
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(root.path())
+        .unwrap();
+    hook.release();
+    let fetched = fetch.await.unwrap().unwrap();
+    assert_eq!(fetched_bytes(fetched), ARTIFACT);
+    assert_no_partial(root.path());
+    assert_eq!(cache_objects(&original).len(), 1);
+    fs::remove_dir_all(original).unwrap();
+}
+
+#[tokio::test]
+async fn cache_root_symlink_replacement_before_publication_cannot_redirect_authority() {
+    let server = LoopbackServer::start(vec![ResponsePlan::exact(ARTIFACT)]).await;
+    let root = TestRoot::new();
+    let hook = TestHook::new(TestHookPoint::BeforePublication);
+    let fetcher =
+        test_fetcher(root.path(), &server, RedirectProfile::Default).with_test_hook(hook.clone());
+    let fetch = tokio::spawn({
+        let request = request(
+            &server.url("/replace-before-publish"),
+            &[server.origin()],
+            ARTIFACT,
+            None,
+            8,
+        );
+        async move {
+            fetcher
+                .fetch_exact(request, &AcquisitionCancellation::new())
+                .await
+        }
+    });
+
+    hook.wait_until_reached().await;
+    let original = root.external_path("original-before-publish");
+    let attacker = root.external_path("attacker-root");
+    fs::rename(root.path(), &original).unwrap();
+    fs::DirBuilder::new().mode(0o700).create(&attacker).unwrap();
+    symlink(&attacker, root.path()).unwrap();
+    hook.release();
+    let fetched = fetch.await.unwrap().unwrap();
+    assert_eq!(fetched_bytes(fetched), ARTIFACT);
+    assert_no_partial(&attacker);
+    assert_eq!(cache_objects(&original).len(), 1);
+
+    fs::remove_file(root.path()).unwrap();
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(root.path())
+        .unwrap();
+    fs::remove_dir_all(original).unwrap();
+    fs::remove_dir_all(attacker).unwrap();
 }
 
 #[test]
@@ -558,6 +822,13 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+fn fetched_bytes(fetched: FetchedObject) -> Vec<u8> {
+    let mut file = fetched.into_file();
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).unwrap();
+    bytes
+}
+
 fn assert_no_partial(root: &Path) {
     assert!(
         fs::read_dir(root).unwrap().next().is_none(),
@@ -592,9 +863,9 @@ fn temporary_paths(root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-async fn wait_for_temporary(root: &Path) {
+async fn wait_for_no_temporary(root: &Path) {
     timeout(Duration::from_secs(2), async {
-        while temporary_paths(root).is_empty() {
+        while !temporary_paths(root).is_empty() {
             sleep(Duration::from_millis(5)).await;
         }
     })
@@ -602,9 +873,9 @@ async fn wait_for_temporary(root: &Path) {
     .unwrap();
 }
 
-async fn wait_for_no_temporary(root: &Path) {
+async fn wait_for_empty(root: &Path) {
     timeout(Duration::from_secs(2), async {
-        while !temporary_paths(root).is_empty() {
+        while fs::read_dir(root).unwrap().next().is_some() {
             sleep(Duration::from_millis(5)).await;
         }
     })
