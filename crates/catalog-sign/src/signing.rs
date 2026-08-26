@@ -480,6 +480,38 @@ pub fn verify_transferred_bundle(path: &Path) -> Result<VerifiedTransferredBundl
     Ok(verified)
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FinalizationStage {
+    Started,
+    TransferredRecordsBound,
+    VerifyQualificationEntered,
+    VerifyQualificationRejected,
+    QualificationVerified,
+    SourceDigestRejected,
+    CompatibilityDigestRejected,
+    QualificationDigestRejected,
+    ApprovalTimeRejected,
+    FinalBindingsVerified,
+}
+
+#[cfg(test)]
+thread_local! {
+    static LAST_FINALIZATION_STAGE: std::cell::Cell<Option<FinalizationStage>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+fn mark_finalization_stage(stage: FinalizationStage) {
+    LAST_FINALIZATION_STAGE.set(Some(stage));
+}
+
+#[cfg(test)]
+fn last_finalization_stage_for_test() -> Option<FinalizationStage> {
+    LAST_FINALIZATION_STAGE.get()
+}
+
 #[derive(Clone, Copy)]
 enum ReleaseAdmissionPolicy {
     Production,
@@ -503,6 +535,7 @@ fn finalize_candidate_after_admission_for_test(
     source: &CatalogSourceV1,
     qualification: &CompatibilityQualificationV1,
 ) -> Result<UnsignedReleaseCandidateV1, SignError> {
+    mark_finalization_stage(FinalizationStage::Started);
     finalize_candidate_with_policy(
         bundle,
         source,
@@ -584,19 +617,44 @@ fn finalize_candidate_with_policy(
     {
         return Err(candidate_rejected());
     }
-    verify_qualification(source, qualification).map_err(|_| candidate_rejected())?;
+    #[cfg(test)]
+    mark_finalization_stage(FinalizationStage::TransferredRecordsBound);
+    #[cfg(test)]
+    mark_finalization_stage(FinalizationStage::VerifyQualificationEntered);
+    if verify_qualification(source, qualification).is_err() {
+        #[cfg(test)]
+        mark_finalization_stage(FinalizationStage::VerifyQualificationRejected);
+        return Err(candidate_rejected());
+    }
+    #[cfg(test)]
+    mark_finalization_stage(FinalizationStage::QualificationVerified);
     let source_digest = catalog_source_digest(source).map_err(|_| candidate_rejected())?;
     let compatibility = compatibility_input_digest(source.intent(), source.build())
         .map_err(|_| candidate_rejected())?;
     let qualification_digest =
         qualification_record_digest(qualification).map_err(|_| candidate_rejected())?;
-    if bundle.inventory.source_sha256().as_str() != encode_hex(&source_digest)
-        || bundle.inventory.compatibility_input_sha256().as_str() != encode_hex(&compatibility)
-        || source.qualification().sha256().as_str() != encode_hex(&qualification_digest)
-        || qualification.release_owner_approved_at() > source.intent().generated_at()
-    {
+    if bundle.inventory.source_sha256().as_str() != encode_hex(&source_digest) {
+        #[cfg(test)]
+        mark_finalization_stage(FinalizationStage::SourceDigestRejected);
         return Err(candidate_rejected());
     }
+    if bundle.inventory.compatibility_input_sha256().as_str() != encode_hex(&compatibility) {
+        #[cfg(test)]
+        mark_finalization_stage(FinalizationStage::CompatibilityDigestRejected);
+        return Err(candidate_rejected());
+    }
+    if source.qualification().sha256().as_str() != encode_hex(&qualification_digest) {
+        #[cfg(test)]
+        mark_finalization_stage(FinalizationStage::QualificationDigestRejected);
+        return Err(candidate_rejected());
+    }
+    if qualification.release_owner_approved_at() > source.intent().generated_at() {
+        #[cfg(test)]
+        mark_finalization_stage(FinalizationStage::ApprovalTimeRejected);
+        return Err(candidate_rejected());
+    }
+    #[cfg(test)]
+    mark_finalization_stage(FinalizationStage::FinalBindingsVerified);
     let source_commit = bundle
         .manifest
         .source_commit
@@ -2556,6 +2614,7 @@ mod tests {
     use crate::key::{fixture_signing_key_for_test, key_open_count, reset_key_open_count};
 
     const SRI: &str = "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
+    const MAX_AUTHENTIC_CORPUS_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
 
     #[test]
     fn committed_approved_evidence_derives_compiled_admission_digests() {
@@ -3276,8 +3335,158 @@ mod tests {
     }
 
     #[test]
-    fn post_admission_seam_exercises_source_build_profile_qualification_tag_time_url_and_tuple_policy()
-     {
+    fn self_consistent_transfer_mutations_reach_the_intended_downstream_binding_seams() {
+        let source_fixture = CandidateFixture::with_finalization_mutation(
+            |source| {
+                source["qualification"]["relative_path"] =
+                    json!("qualifications/mutated-source-path.json");
+            },
+            |_| {},
+            false,
+        );
+        let source_bundle = verify_transferred_bundle(&source_fixture.final_bundle).unwrap();
+        assert_transferred_finalization_arguments_match(&source_bundle, &source_fixture);
+        verify_qualification(&source_fixture.source, &source_fixture.qualification).unwrap();
+        let source_digest = encode_hex(&catalog_source_digest(&source_fixture.source).unwrap());
+        assert_ne!(
+            source_bundle.inventory().source_sha256().as_str(),
+            source_digest
+        );
+        assert_eq!(
+            source_bundle
+                .inventory()
+                .compatibility_input_sha256()
+                .as_str(),
+            encode_hex(
+                &compatibility_input_digest(
+                    source_fixture.source.intent(),
+                    source_fixture.source.build(),
+                )
+                .unwrap(),
+            )
+        );
+        assert_eq!(
+            finalize_candidate_after_admission_for_test(
+                &source_bundle,
+                &source_fixture.source,
+                &source_fixture.qualification,
+            ),
+            Err(SignError::CandidateRejected)
+        );
+        assert_eq!(
+            last_finalization_stage_for_test(),
+            Some(FinalizationStage::SourceDigestRejected),
+            "source mutation did not pass qualification and reach the stale source-digest seam"
+        );
+
+        for (name, pointer, replacement) in [
+            ("build", "/build/application_sha256", json!("91".repeat(32))),
+            (
+                "profile",
+                "/build/compatibility_profile_sha256",
+                json!("92".repeat(32)),
+            ),
+        ] {
+            let fixture = CandidateFixture::with_finalization_mutation(
+                |source| *source.pointer_mut(pointer).unwrap() = replacement,
+                |_| {},
+                true,
+            );
+            let bundle = verify_transferred_bundle(&fixture.final_bundle).unwrap();
+            assert_transferred_finalization_arguments_match(&bundle, &fixture);
+            assert_eq!(
+                bundle.inventory().source_sha256().as_str(),
+                encode_hex(&catalog_source_digest(&fixture.source).unwrap()),
+                "{name} mutation did not receive its matching transferred source digest"
+            );
+            assert_ne!(
+                fixture.qualification.fluxsemble(),
+                fixture.source.build(),
+                "{name} mutation unexpectedly updated the qualification build binding"
+            );
+            assert!(verify_qualification(&fixture.source, &fixture.qualification).is_err());
+            assert_eq!(
+                finalize_candidate_after_admission_for_test(
+                    &bundle,
+                    &fixture.source,
+                    &fixture.qualification,
+                ),
+                Err(SignError::CandidateRejected)
+            );
+            assert_eq!(
+                last_finalization_stage_for_test(),
+                Some(FinalizationStage::VerifyQualificationRejected),
+                "{name} mutation did not reach verify_qualification"
+            );
+        }
+
+        let qualification_fixture = CandidateFixture::with_finalization_mutation(
+            |_| {},
+            |qualification| {
+                qualification["reviewer"] = json!("mutated-fixture-reviewer");
+            },
+            true,
+        );
+        let qualification_bundle =
+            verify_transferred_bundle(&qualification_fixture.final_bundle).unwrap();
+        assert_transferred_finalization_arguments_match(
+            &qualification_bundle,
+            &qualification_fixture,
+        );
+        assert_eq!(
+            qualification_bundle.inventory().source_sha256().as_str(),
+            encode_hex(&catalog_source_digest(&qualification_fixture.source).unwrap())
+        );
+        assert_eq!(
+            qualification_fixture.qualification.fluxsemble(),
+            qualification_fixture.source.build()
+        );
+        assert_eq!(
+            qualification_fixture
+                .qualification
+                .compatibility_input_sha256()
+                .as_str(),
+            encode_hex(
+                &compatibility_input_digest(
+                    qualification_fixture.source.intent(),
+                    qualification_fixture.source.build(),
+                )
+                .unwrap(),
+            )
+        );
+        assert_ne!(
+            qualification_fixture
+                .source
+                .qualification()
+                .sha256()
+                .as_str(),
+            encode_hex(&qualification_record_digest(&qualification_fixture.qualification).unwrap(),),
+            "qualification mutation unexpectedly updated the source qualification digest"
+        );
+        assert!(
+            verify_qualification(
+                &qualification_fixture.source,
+                &qualification_fixture.qualification,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            finalize_candidate_after_admission_for_test(
+                &qualification_bundle,
+                &qualification_fixture.source,
+                &qualification_fixture.qualification,
+            ),
+            Err(SignError::CandidateRejected)
+        );
+        assert_eq!(
+            last_finalization_stage_for_test(),
+            Some(FinalizationStage::VerifyQualificationRejected),
+            "qualification mutation did not reach its unchanged source-digest binding"
+        );
+    }
+
+    #[test]
+    fn post_admission_seam_keeps_tag_time_url_and_tuple_policy_coverage() {
         let fixture = CandidateFixture::new();
         let bundle = verify_transferred_bundle(&fixture.final_bundle).unwrap();
         finalize_candidate_after_admission_for_test(
@@ -3290,19 +3499,6 @@ mod tests {
             serde_json::from_slice(&serde_jcs::to_vec(&fixture.source).unwrap()).unwrap();
         let mut mutations = Vec::new();
 
-        let mut source = base.clone();
-        source["intent"]["release"]["release"]["release_metadata"]["notes"] =
-            json!("mutated source record");
-        mutations.push(("source", source));
-        let mut application = base.clone();
-        application["build"]["application_sha256"] = json!("91".repeat(32));
-        mutations.push(("build", application));
-        let mut profile = base.clone();
-        profile["build"]["compatibility_profile_sha256"] = json!("92".repeat(32));
-        mutations.push(("profile", profile));
-        let mut qualification = base.clone();
-        qualification["qualification"]["sha256"] = json!("93".repeat(32));
-        mutations.push(("qualification", qualification));
         let mut tag = base.clone();
         tag["intent"]["sequence"] = json!("2");
         tag["intent"]["tag"] = json!("catalog-v1-sequence-2");
@@ -3476,6 +3672,105 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_corpus_reader_rejects_links_fifo_oversize_and_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDirectory::new();
+        let linked_root = root.path.with_extension("linked-root");
+        symlink(&root.path, &linked_root).unwrap();
+        assert!(AuthenticatedCorpus::open(&linked_root).is_err());
+        fs::remove_file(&linked_root).unwrap();
+        let corpus = AuthenticatedCorpus::open(&root.path).unwrap();
+        let bytes = b"authenticated public object";
+        let digest = sha256(bytes);
+
+        let regular = root.path.join("regular.bin");
+        fs::write(&regular, bytes).unwrap();
+        fs::set_permissions(&regular, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            corpus
+                .read_object("regular.bin", bytes.len() as u64, &digest)
+                .unwrap(),
+            bytes
+        );
+
+        symlink("regular.bin", root.path.join("linked.bin")).unwrap();
+        assert!(
+            corpus
+                .read_object("linked.bin", bytes.len() as u64, &digest)
+                .is_err()
+        );
+        let real_directory = root.path.join("real-directory");
+        fs::DirBuilder::new()
+            .mode(0o755)
+            .create(&real_directory)
+            .unwrap();
+        fs::write(real_directory.join("nested.bin"), bytes).unwrap();
+        fs::set_permissions(
+            real_directory.join("nested.bin"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        symlink("real-directory", root.path.join("linked-directory")).unwrap();
+        assert!(
+            corpus
+                .read_object("linked-directory/nested.bin", bytes.len() as u64, &digest,)
+                .is_err()
+        );
+
+        fs::hard_link(&regular, root.path.join("hard-linked.bin")).unwrap();
+        assert!(
+            corpus
+                .read_object("regular.bin", bytes.len() as u64, &digest)
+                .is_err()
+        );
+        fs::remove_file(root.path.join("hard-linked.bin")).unwrap();
+        fs::set_permissions(&regular, fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(
+            corpus
+                .read_object("regular.bin", bytes.len() as u64, &digest)
+                .is_err()
+        );
+        fs::set_permissions(&regular, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let fifo_name = CString::new(root.path.join("object.fifo").as_os_str().as_bytes()).unwrap();
+        // SAFETY: the path is a valid NUL-terminated string and the mode is bounded.
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+        assert!(corpus.read_object("object.fifo", 1, &sha256(b"x")).is_err());
+
+        let oversized = root.path.join("oversized.bin");
+        let oversized_file = fs::File::create(&oversized).unwrap();
+        oversized_file
+            .set_len(MAX_AUTHENTIC_CORPUS_OBJECT_BYTES + 1)
+            .unwrap();
+        drop(oversized_file);
+        fs::set_permissions(&oversized, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            corpus
+                .read_object(
+                    "oversized.bin",
+                    MAX_AUTHENTIC_CORPUS_OBJECT_BYTES + 1,
+                    &sha256(b""),
+                )
+                .is_err()
+        );
+
+        let replace = root.path.join("replace.bin");
+        let displaced = root.path.join("displaced.bin");
+        fs::write(&replace, bytes).unwrap();
+        fs::set_permissions(&replace, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            corpus
+                .read_object_with_checkpoint("replace.bin", bytes.len() as u64, &digest, || {
+                    fs::rename(&replace, &displaced).unwrap();
+                    fs::write(&replace, bytes).unwrap();
+                    fs::set_permissions(&replace, fs::Permissions::from_mode(0o644)).unwrap();
+                },)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn object_substitution_is_rejected_before_key_open() {
         let fixture = CandidateFixture::new();
         let bundle = verify_transferred_bundle(&fixture.final_bundle).unwrap();
@@ -3625,9 +3920,31 @@ mod tests {
         }
 
         fn with_intent_mutation(mutate: impl FnOnce(&mut Value)) -> Self {
+            Self::with_finalization_mutations(mutate, |_| {}, |_| {}, true)
+        }
+
+        fn with_finalization_mutation(
+            mutate_source: impl FnOnce(&mut Value),
+            mutate_qualification: impl FnOnce(&mut Value),
+            bind_inventory_to_mutated_source: bool,
+        ) -> Self {
+            Self::with_finalization_mutations(
+                |_| {},
+                mutate_source,
+                mutate_qualification,
+                bind_inventory_to_mutated_source,
+            )
+        }
+
+        fn with_finalization_mutations(
+            mutate_intent: impl FnOnce(&mut Value),
+            mutate_source: impl FnOnce(&mut Value),
+            mutate_qualification: impl FnOnce(&mut Value),
+            bind_inventory_to_mutated_source: bool,
+        ) -> Self {
             let root = TempDirectory::new();
             let (mut intent_value, package_inputs, objects) = intent_fixture();
-            mutate(&mut intent_value);
+            mutate_intent(&mut intent_value);
             let intent =
                 InitialPiReleaseIntentV1::from_json(&serde_jcs::to_vec(&intent_value).unwrap())
                     .unwrap();
@@ -3660,7 +3977,7 @@ mod tests {
                 FluxsembleBuildBindingV1::from_json(&serde_jcs::to_vec(&build_value).unwrap())
                     .unwrap();
             let compatibility = encode_hex(&compatibility_input_digest(&intent, &build).unwrap());
-            let qualification_value = json!({
+            let mut qualification_value = json!({
                 "schema_version": 1,
                 "compatibility_input_sha256": compatibility,
                 "fluxsemble": build_value,
@@ -3683,13 +4000,13 @@ mod tests {
                 "release_owner_approved_at": "2026-08-25T00:00:00Z",
                 "residual_risks": ["Fixture-only qualification."],
             });
-            let qualification = CompatibilityQualificationV1::from_json(
+            let baseline_qualification = CompatibilityQualificationV1::from_json(
                 &serde_jcs::to_vec(&qualification_value).unwrap(),
             )
             .unwrap();
             let qualification_digest =
-                encode_hex(&qualification_record_digest(&qualification).unwrap());
-            let source_value = json!({
+                encode_hex(&qualification_record_digest(&baseline_qualification).unwrap());
+            let mut source_value = json!({
                 "intent": intent_value,
                 "build": build,
                 "qualification": {
@@ -3697,14 +4014,26 @@ mod tests {
                     "sha256": qualification_digest,
                 },
             });
+            let baseline_source =
+                CatalogSourceV1::from_json(&serde_jcs::to_vec(&source_value).unwrap()).unwrap();
+            mutate_source(&mut source_value);
+            mutate_qualification(&mut qualification_value);
             let source =
                 CatalogSourceV1::from_json(&serde_jcs::to_vec(&source_value).unwrap()).unwrap();
-            verify_qualification(&source, &qualification).unwrap();
+            let qualification = CompatibilityQualificationV1::from_json(
+                &serde_jcs::to_vec(&qualification_value).unwrap(),
+            )
+            .unwrap();
+            let inventory_source_digest = if bind_inventory_to_mutated_source {
+                catalog_source_digest(&source).unwrap()
+            } else {
+                catalog_source_digest(&baseline_source).unwrap()
+            };
             let final_bundle = root.path.join("final-bundle");
             write_transfer(
                 &final_bundle,
                 InputSourceKind::CatalogSource,
-                encode_hex(&catalog_source_digest(&source).unwrap()),
+                encode_hex(&inventory_source_digest),
                 compatibility,
                 Some(("55".repeat(20), "66".repeat(32))),
                 vec![
@@ -3733,11 +4062,13 @@ mod tests {
             }
         }
 
-        fn from_approved_corpus(corpus: &Path) -> Self {
+        fn from_approved_corpus(corpus_path: &Path) -> Self {
             assert!(
-                corpus.is_absolute(),
+                corpus_path.is_absolute(),
                 "authenticated corpus path must be absolute"
             );
+            let corpus = AuthenticatedCorpus::open(corpus_path)
+                .expect("authenticated corpus root must satisfy the retained capability policy");
             let root = TempDirectory::new();
             let intent_bytes =
                 include_bytes!("../tests/fixtures/approved-release/initial-release-intent-v1.json");
@@ -3759,24 +4090,26 @@ mod tests {
                 node.sha256().as_str().to_owned(),
                 (
                     node.url().as_str().to_owned(),
-                    read_approved_corpus_object(
-                        corpus,
-                        "toolchain/node/node-v22.19.0-linux-x64.tar.xz",
-                        node.size_bytes().get(),
-                        node.sha256().as_str(),
-                    ),
+                    corpus
+                        .read_object(
+                            "toolchain/node/node-v22.19.0-linux-x64.tar.xz",
+                            node.size_bytes().get(),
+                            node.sha256().as_str(),
+                        )
+                        .expect("authenticated Node archive must remain descriptor-bound"),
                 ),
             );
             objects.insert(
                 pi.sha256().as_str().to_owned(),
                 (
                     pi.url().as_str().to_owned(),
-                    read_approved_corpus_object(
-                        corpus,
-                        &format!("packages/archives/{}.tgz", pi.sha256().as_str()),
-                        pi.size_bytes().get(),
-                        pi.sha256().as_str(),
-                    ),
+                    corpus
+                        .read_object(
+                            &format!("packages/archives/{}.tgz", pi.sha256().as_str()),
+                            pi.size_bytes().get(),
+                            pi.sha256().as_str(),
+                        )
+                        .expect("authenticated Pi archive must remain descriptor-bound"),
                 ),
             );
             for record in &package_manifest.locked_packages {
@@ -3784,12 +4117,13 @@ mod tests {
                     record.archive_sha256.clone(),
                     (
                         record.resolved_url.clone(),
-                        read_approved_corpus_object(
-                            corpus,
-                            &format!("packages/archives/{}.tgz", record.archive_sha256),
-                            record.archive_size,
-                            &record.archive_sha256,
-                        ),
+                        corpus
+                            .read_object(
+                                &format!("packages/archives/{}.tgz", record.archive_sha256),
+                                record.archive_size,
+                                &record.archive_sha256,
+                            )
+                            .expect("authenticated package archive must remain descriptor-bound"),
                     ),
                 );
             }
@@ -3807,12 +4141,15 @@ mod tests {
                     descriptor.sha256().as_str().to_owned(),
                     (
                         descriptor.url().as_str().to_owned(),
-                        read_approved_corpus_object(
-                            corpus,
-                            relative,
-                            descriptor.size_bytes().get(),
-                            descriptor.sha256().as_str(),
-                        ),
+                        corpus
+                            .read_object(
+                                relative,
+                                descriptor.size_bytes().get(),
+                                descriptor.sha256().as_str(),
+                            )
+                            .expect(
+                                "authenticated package declaration must remain descriptor-bound",
+                            ),
                     ),
                 );
             }
@@ -3917,24 +4254,151 @@ mod tests {
         }
     }
 
-    fn read_approved_corpus_object(
-        corpus: &Path,
-        relative: &str,
-        expected_size: u64,
-        expected_sha256: &str,
-    ) -> Vec<u8> {
-        let bytes = fs::read(corpus.join(relative)).unwrap();
-        assert_eq!(
-            bytes.len() as u64,
-            expected_size,
-            "size mismatch for {relative}"
-        );
-        assert_eq!(
-            sha256(&bytes),
-            expected_sha256,
-            "digest mismatch for {relative}"
-        );
-        bytes
+    fn assert_transferred_finalization_arguments_match(
+        bundle: &VerifiedTransferredBundle,
+        fixture: &CandidateFixture,
+    ) {
+        let transferred_source =
+            CatalogSourceV1::from_json(&bundle.record_bytes("catalog_source").unwrap()).unwrap();
+        let transferred_qualification =
+            CompatibilityQualificationV1::from_json(&bundle.record_bytes("qualification").unwrap())
+                .unwrap();
+        assert_eq!(transferred_source, fixture.source);
+        assert_eq!(transferred_qualification, fixture.qualification);
+    }
+
+    struct AuthenticatedCorpus {
+        root: fs::File,
+    }
+
+    impl AuthenticatedCorpus {
+        fn open(path: &Path) -> Result<Self, SignError> {
+            if !is_absolute_bounded_path(path) {
+                return Err(bundle_rejected());
+            }
+            let root = open_absolute_directory(path)?;
+            let metadata = root.metadata().map_err(|_| bundle_rejected())?;
+            if !secure_public_corpus_directory(&metadata) {
+                return Err(bundle_rejected());
+            }
+            Ok(Self { root })
+        }
+
+        fn read_object(
+            &self,
+            relative: &str,
+            expected_size: u64,
+            expected_sha256: &str,
+        ) -> Result<Vec<u8>, SignError> {
+            self.read_object_with_checkpoint(relative, expected_size, expected_sha256, || {})
+        }
+
+        fn read_object_with_checkpoint(
+            &self,
+            relative: &str,
+            expected_size: u64,
+            expected_sha256: &str,
+            checkpoint: impl FnOnce(),
+        ) -> Result<Vec<u8>, SignError> {
+            if !safe_relative(relative)
+                || expected_size == 0
+                || expected_size > MAX_AUTHENTIC_CORPUS_OBJECT_BYTES
+                || !valid_sha256(expected_sha256)
+            {
+                return Err(bundle_rejected());
+            }
+            let mut file = self.open_relative(relative)?;
+            let before = file.metadata().map_err(|_| bundle_rejected())?;
+            if !secure_public_corpus_file(&before) || before.len() != expected_size {
+                return Err(bundle_rejected());
+            }
+            let before = PublicCorpusMetadata::from_metadata(&before);
+            let mut bytes = Vec::with_capacity(expected_size as usize);
+            (&mut file)
+                .take(expected_size + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| bundle_rejected())?;
+            let after = file.metadata().map_err(|_| bundle_rejected())?;
+            if bytes.len() as u64 != expected_size
+                || PublicCorpusMetadata::from_metadata(&after) != before
+                || sha256(&bytes) != expected_sha256
+            {
+                return Err(bundle_rejected());
+            }
+            checkpoint();
+            let rebound = self.open_relative(relative)?;
+            let rebound = rebound.metadata().map_err(|_| bundle_rejected())?;
+            if !secure_public_corpus_file(&rebound)
+                || rebound.len() != expected_size
+                || PublicCorpusMetadata::from_metadata(&rebound) != before
+            {
+                return Err(bundle_rejected());
+            }
+            Ok(bytes)
+        }
+
+        fn open_relative(&self, relative: &str) -> Result<fs::File, SignError> {
+            if !safe_relative(relative) {
+                return Err(bundle_rejected());
+            }
+            let relative = CString::new(relative).map_err(|_| bundle_rejected())?;
+            openat2(
+                self.root.as_raw_fd(),
+                &relative,
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK,
+                // RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH.
+                0x02 | 0x04 | 0x08,
+            )
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct PublicCorpusMetadata {
+        device: u64,
+        inode: u64,
+        size: u64,
+        owner: u32,
+        links: u64,
+        mode: u32,
+        modified_seconds: i64,
+        modified_nanoseconds: i64,
+        changed_seconds: i64,
+        changed_nanoseconds: i64,
+    }
+
+    impl PublicCorpusMetadata {
+        fn from_metadata(metadata: &fs::Metadata) -> Self {
+            Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                size: metadata.len(),
+                owner: metadata.uid(),
+                links: metadata.nlink(),
+                mode: metadata.permissions().mode() & 0o7777,
+                modified_seconds: metadata.mtime(),
+                modified_nanoseconds: metadata.mtime_nsec(),
+                changed_seconds: metadata.ctime(),
+                changed_nanoseconds: metadata.ctime_nsec(),
+            }
+        }
+    }
+
+    fn secure_public_corpus_directory(metadata: &fs::Metadata) -> bool {
+        metadata.is_dir()
+            && !metadata.file_type().is_symlink()
+            && metadata.uid() == current_euid()
+            && matches!(metadata.permissions().mode() & 0o7777, 0o700 | 0o755)
+    }
+
+    fn secure_public_corpus_file(metadata: &fs::Metadata) -> bool {
+        metadata.is_file()
+            && !metadata.file_type().is_symlink()
+            && metadata.uid() == current_euid()
+            && metadata.nlink() == 1
+            && matches!(
+                metadata.permissions().mode() & 0o7777,
+                0o400 | 0o444 | 0o600 | 0o644
+            )
     }
 
     type FixtureObjects = BTreeMap<String, (String, Vec<u8>)>;

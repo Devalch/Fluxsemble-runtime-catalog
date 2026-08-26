@@ -228,4 +228,65 @@ for forbidden in ["PRIVATE KEY", "DecodePrivateKey", "from_pkcs8", "read_signing
     if forbidden in core_source:
         print(f"private-key parser in catalog-core: {forbidden}", file=sys.stderr)
         sys.exit(1)
+
+generator_source = Path("scripts/generate-approved-release-evidence.py").read_text(
+    encoding="utf-8"
+)
+signing_source = sign_sources["crates/catalog-sign/src/signing.rs"]
+retained_tar_call = (
+    'tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:*") as opened:'
+)
+
+def evidence_reader_errors(generator, signing):
+    errors = []
+    if re.search(r"\.read_bytes\s*\(", generator):
+        errors.append("pathname read_bytes in approved-release evidence generator")
+    tar_calls = re.findall(r"tarfile\.open\([^\n]*", generator)
+    if tar_calls != [retained_tar_call]:
+        errors.append("archive parsing is not exclusively retained-byte BytesIO parsing")
+    start = signing.find("    struct AuthenticatedCorpus {")
+    end = signing.find("    type FixtureObjects", start)
+    if start < 0 or end < 0:
+        errors.append("authenticated corpus capability boundary is missing")
+    else:
+        corpus_reader = signing[start:end]
+        if re.search(r"\bfs::read\s*\(", corpus_reader):
+            errors.append("pathname fs::read in authenticated corpus reader")
+        for required in [
+            "libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK",
+            "0x02 | 0x04 | 0x08",
+            ".take(expected_size + 1)",
+            "PublicCorpusMetadata::from_metadata(&rebound) != before",
+        ]:
+            if required not in corpus_reader:
+                errors.append(f"missing retained corpus reader boundary: {required}")
+    return errors
+
+errors = evidence_reader_errors(generator_source, signing_source)
+if errors:
+    print(errors[0], file=sys.stderr)
+    sys.exit(1)
+
+read_mutation = generator_source + '\nPath("mutation").read_bytes()\n'
+if not evidence_reader_errors(read_mutation, signing_source):
+    print("evidence scanner accepted a Path.read_bytes mutation", file=sys.stderr)
+    sys.exit(1)
+
+tar_mutation = generator_source.replace(
+    retained_tar_call,
+    'tarfile.open(archive_label, mode="r:*") as opened:',
+    1,
+)
+if not evidence_reader_errors(tar_mutation, signing_source):
+    print("evidence scanner accepted a pathname tar reopen mutation", file=sys.stderr)
+    sys.exit(1)
+
+rust_mutation = signing_source.replace(
+    "            let mut file = self.open_relative(relative)?;",
+    "            let bytes = fs::read(relative)?;\n            let mut file = self.open_relative(relative)?;",
+    1,
+)
+if not evidence_reader_errors(generator_source, rust_mutation):
+    print("evidence scanner accepted an fs::read mutation", file=sys.stderr)
+    sys.exit(1)
 PY
