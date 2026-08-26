@@ -188,6 +188,16 @@ impl VerifiedTransferredBundle {
         self.manifest.source_tree_sha256.as_deref()
     }
 
+    #[must_use]
+    pub(crate) fn transfer_manifest_sha256(&self) -> &str {
+        &self
+            .files
+            .get(TRANSFER_MANIFEST_NAME)
+            .expect("verified transfer retains its manifest")
+            .entry
+            .sha256
+    }
+
     /// Revalidates the retained transfer and duplicates its exact root for the audited launcher.
     pub fn isolated_launch_capability(&self) -> Result<(fs::File, String), SignError> {
         self.reverify_all()?;
@@ -343,7 +353,7 @@ impl UnsignedReleaseCandidateV1 {
     }
 }
 
-pub struct SignReleaseRequest<'a> {
+struct SignReleaseRequest<'a> {
     pub bundle: &'a VerifiedTransferredBundle,
     pub source: &'a CatalogSourceV1,
     pub qualification: &'a CompatibilityQualificationV1,
@@ -774,7 +784,7 @@ fn require_candidate_bounds(candidate: &UnsignedReleaseCandidateV1) -> Result<()
     Ok(())
 }
 
-pub fn sign_release(request: SignReleaseRequest<'_>) -> Result<SignedReleaseBundleV1, SignError> {
+fn sign_release(request: SignReleaseRequest<'_>) -> Result<SignedReleaseBundleV1, SignError> {
     let candidate = finalize_candidate(request.bundle, request.source, request.qualification)?;
     let output = OutputPreflight::new(request.output)?;
     let signing_key = read_production_signing_key(request.key_path)?;
@@ -2400,27 +2410,10 @@ pub fn finalize_candidate_from_path(path: &Path) -> Result<UnsignedReleaseCandid
     finalize_candidate(&bundle, &source, &qualification)
 }
 
-pub fn sign_release_from_path(
-    bundle_path: &Path,
-    key_path: &Path,
-    output: &Path,
-) -> Result<SignedReleaseBundleV1, SignError> {
-    let bundle = verify_transferred_bundle(bundle_path)?;
-    let source = CatalogSourceV1::from_json(&bundle.record_bytes("catalog_source")?)
-        .map_err(|_| candidate_rejected())?;
-    let qualification =
-        CompatibilityQualificationV1::from_json(&bundle.record_bytes("qualification")?)
-            .map_err(|_| candidate_rejected())?;
-    sign_release(SignReleaseRequest {
-        bundle: &bundle,
-        source: &source,
-        qualification: &qualification,
-        key_path,
-        output,
-    })
-}
-
-pub(crate) fn run_cli(args: &[String]) -> Result<String, SignError> {
+pub(crate) fn run_isolated_cli(
+    bundle: &VerifiedTransferredBundle,
+    args: &[String],
+) -> Result<String, SignError> {
     if args.is_empty()
         || args.len() > MAX_ARGUMENTS
         || args.iter().map(String::len).sum::<usize>() > MAX_ARGUMENT_BYTES
@@ -2431,7 +2424,10 @@ pub(crate) fn run_cli(args: &[String]) -> Result<String, SignError> {
     match args[0].as_str() {
         "assemble-intent" => {
             let values = exact_flags(&args[1..], &["--input", "--output"])?;
-            let candidate = assemble_release_intent_from_path(Path::new(&values[0]))?;
+            let bytes = bundle.record_bytes("release_intent")?;
+            let intent =
+                InitialPiReleaseIntentV1::from_json(&bytes).map_err(|_| candidate_rejected())?;
+            let candidate = assemble_release_intent(bundle, &intent)?;
             write_candidate(Path::new(&values[1]), &candidate)?;
             Ok(format!(
                 "assembled runtime_semantic_sha256={}",
@@ -2440,7 +2436,12 @@ pub(crate) fn run_cli(args: &[String]) -> Result<String, SignError> {
         }
         "finalize" => {
             let values = exact_flags(&args[1..], &["--input", "--output"])?;
-            let candidate = finalize_candidate_from_path(Path::new(&values[0]))?;
+            let source = CatalogSourceV1::from_json(&bundle.record_bytes("catalog_source")?)
+                .map_err(|_| candidate_rejected())?;
+            let qualification =
+                CompatibilityQualificationV1::from_json(&bundle.record_bytes("qualification")?)
+                    .map_err(|_| candidate_rejected())?;
+            let candidate = finalize_candidate(bundle, &source, &qualification)?;
             write_candidate(Path::new(&values[1]), &candidate)?;
             Ok(format!(
                 "finalized runtime_semantic_sha256={}",
@@ -2449,11 +2450,18 @@ pub(crate) fn run_cli(args: &[String]) -> Result<String, SignError> {
         }
         "sign" => {
             let values = exact_flags(&args[1..], &["--input", "--key", "--output"])?;
-            let signed = sign_release_from_path(
-                Path::new(&values[0]),
-                Path::new(&values[1]),
-                Path::new(&values[2]),
-            )?;
+            let source = CatalogSourceV1::from_json(&bundle.record_bytes("catalog_source")?)
+                .map_err(|_| candidate_rejected())?;
+            let qualification =
+                CompatibilityQualificationV1::from_json(&bundle.record_bytes("qualification")?)
+                    .map_err(|_| candidate_rejected())?;
+            let signed = sign_release(SignReleaseRequest {
+                bundle,
+                source: &source,
+                qualification: &qualification,
+                key_path: Path::new(&values[1]),
+                output: Path::new(&values[2]),
+            })?;
             Ok(format!(
                 "signed key_id={} tag={}",
                 signed.manifest.signature().key_id().as_str(),
@@ -4012,6 +4020,32 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
         reset_key_open_count();
         let output = fixture.root.path.join("object-substitution-output");
+        assert!(
+            sign_release(SignReleaseRequest {
+                bundle: &bundle,
+                source: &fixture.source,
+                qualification: &fixture.qualification,
+                key_path: &fixture.fixture_key,
+                output: &output,
+            })
+            .is_err()
+        );
+        assert_eq!(key_open_count(), 0);
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn retained_manifest_rejects_a_to_b_identity_substitution_before_key_open() {
+        let fixture = CandidateFixture::new();
+        let bundle = verify_transferred_bundle(&fixture.final_bundle).unwrap();
+        let manifest = fixture.final_bundle.join(TRANSFER_MANIFEST_NAME);
+        let displaced = fixture.final_bundle.join("manifest-a.displaced");
+        fs::rename(&manifest, &displaced).unwrap();
+        fs::copy(&displaced, &manifest).unwrap();
+        fs::set_permissions(&manifest, fs::Permissions::from_mode(0o400)).unwrap();
+
+        reset_key_open_count();
+        let output = fixture.root.path.join("manifest-a-to-b-output");
         assert!(
             sign_release(SignReleaseRequest {
                 bundle: &bundle,

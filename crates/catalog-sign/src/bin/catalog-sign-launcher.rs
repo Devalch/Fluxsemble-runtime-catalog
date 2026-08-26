@@ -37,6 +37,7 @@ enum Ceremony {
     AssembleIntent,
     Finalize,
     Sign,
+    IsolationProbe,
 }
 
 impl Ceremony {
@@ -45,6 +46,7 @@ impl Ceremony {
             Self::AssembleIntent => "assemble-intent",
             Self::Finalize => "finalize",
             Self::Sign => "sign",
+            Self::IsolationProbe => "isolation-probe",
         }
     }
 }
@@ -117,15 +119,17 @@ fn parse_request(args: &[std::ffi::OsString]) -> Result<Request, SignError> {
             .ok_or_else(rejected)
     };
     match args.first().and_then(|value| value.to_str()) {
-        Some("assemble-intent") | Some("finalize") if args.len() == 7 => {
+        Some("assemble-intent") | Some("finalize") | Some("isolation-probe") if args.len() == 7 => {
             if args[1] != "--config" || args[3] != "--input" || args[5] != "--output" {
                 return Err(rejected());
             }
             Ok(Request {
                 ceremony: if args[0] == "assemble-intent" {
                     Ceremony::AssembleIntent
-                } else {
+                } else if args[0] == "finalize" {
                     Ceremony::Finalize
+                } else {
+                    Ceremony::IsolationProbe
                 },
                 config: value(2)?,
                 input: value(4)?,
@@ -175,6 +179,9 @@ fn launch(request: Request) -> Result<(), SignError> {
     rebind_executable(&signer, FilePolicy::Signer)?;
     verified_input.isolated_launch_capability()?;
 
+    // This process and every later exec inherit an irreversible no-core boundary before the key
+    // is opened. The inner signer separately resets dumpability because exec may restore it.
+    disable_core_dumps()?;
     let key = request
         .key
         .as_ref()
@@ -313,6 +320,9 @@ fn launch(request: Request) -> Result<(), SignError> {
         "/proc",
         "--dev",
         "/dev",
+        "--chmod",
+        "0555",
+        "/",
         "--chdir",
         "/home/signer",
         "--seccomp",
@@ -340,6 +350,9 @@ fn launch(request: Request) -> Result<(), SignError> {
                 "--output",
                 "/output/signed-release-bundle",
             ]);
+        }
+        Ceremony::IsolationProbe => {
+            command.arg("__isolation-probe");
         }
     }
 
@@ -615,7 +628,9 @@ fn verify_output_capability(
     identity: Identity,
 ) -> Result<(), SignError> {
     let metadata = output.file.metadata().map_err(|_| rejected())?;
-    if !secure_private_directory(&metadata) || Identity::from_metadata(&metadata) != identity {
+    if !secure_private_directory(&metadata)
+        || !same_directory_identity(Identity::from_metadata(&metadata), identity)
+    {
         return Err(rejected());
     }
     // SAFETY: retained parent/name are valid and no-follow rebinds the visible name.
@@ -631,10 +646,21 @@ fn verify_output_capability(
     }
     // SAFETY: openat returned one owned descriptor.
     let rebound = unsafe { fs::File::from_raw_fd(descriptor) };
-    if Identity::from_metadata(&rebound.metadata().map_err(|_| rejected())?) != identity {
+    if !same_directory_identity(
+        Identity::from_metadata(&rebound.metadata().map_err(|_| rejected())?),
+        identity,
+    ) {
         return Err(rejected());
     }
     Ok(())
+}
+
+fn same_directory_identity(left: Identity, right: Identity) -> bool {
+    left.device == right.device
+        && left.inode == right.inode
+        && left.uid == right.uid
+        && left.mode == right.mode
+        && left.links == right.links
 }
 
 fn require_canonical_absolute(path: &Path) -> Result<PathBuf, SignError> {
@@ -833,6 +859,28 @@ fn u64_le(bytes: &[u8], offset: usize) -> Result<u64, SignError> {
         .ok_or_else(rejected)
 }
 
+fn disable_core_dumps() -> Result<(), SignError> {
+    let limits = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: limits points to one initialized rlimit value; this only tightens this process.
+    if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limits) } != 0 {
+        return Err(rejected());
+    }
+    let mut verified = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    // SAFETY: verified points to writable storage for one rlimit value.
+    if unsafe { libc::getrlimit(libc::RLIMIT_CORE, verified.as_mut_ptr()) } != 0 {
+        return Err(rejected());
+    }
+    // SAFETY: successful getrlimit initialized verified.
+    let verified = unsafe { verified.assume_init() };
+    if verified.rlim_cur != 0 || verified.rlim_max != 0 {
+        return Err(rejected());
+    }
+    Ok(())
+}
+
 fn create_launcher_seccomp() -> Result<fs::File, SignError> {
     let denied = [
         libc::SYS_socket,
@@ -853,6 +901,9 @@ fn create_launcher_seccomp() -> Result<fs::File, SignError> {
         libc::SYS_getpeername,
         libc::SYS_setsockopt,
         libc::SYS_getsockopt,
+        libc::SYS_io_uring_setup,
+        libc::SYS_io_uring_enter,
+        libc::SYS_io_uring_register,
         libc::SYS_fork,
         libc::SYS_vfork,
         libc::SYS_clone,

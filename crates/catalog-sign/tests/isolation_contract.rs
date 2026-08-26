@@ -1,9 +1,12 @@
 use std::{
+    ffi::CString,
     fs,
-    io::{Seek, SeekFrom, Write},
     os::{
-        fd::AsRawFd,
-        unix::fs::{DirBuilderExt, PermissionsExt},
+        fd::RawFd,
+        unix::{
+            fs::{DirBuilderExt, PermissionsExt},
+            process::CommandExt,
+        },
     },
     path::{Path, PathBuf},
     process::Command,
@@ -14,49 +17,75 @@ use catalog_sign::{SignError, enter_signer_isolation};
 use sha2::{Digest, Sha256};
 
 #[test]
-fn direct_and_marker_only_inner_execution_fail_closed() {
-    assert_eq!(enter_signer_isolation(), Err(SignError::IsolationRejected));
+fn direct_and_exact_marker_only_sign_fail_before_key_open_or_output() {
+    assert!(matches!(
+        enter_signer_isolation(),
+        Err(SignError::IsolationRejected)
+    ));
 
-    let direct = Command::new(env!("CARGO_BIN_EXE_catalog-sign"))
-        .args([
-            "assemble-intent",
+    let root = TempRoot::new();
+    let key = root.path.join("nonproduction-fixture-key.pem");
+    fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/nonproduction-ed25519-pkcs8.pem"),
+        &key,
+    )
+    .unwrap();
+    fs::set_permissions(&key, fs::Permissions::from_mode(0o400)).unwrap();
+
+    for marker_only in [false, true] {
+        let output = root.path.join(if marker_only {
+            "marker-only-output"
+        } else {
+            "direct-output"
+        });
+        let witness = InotifyKeyOpenWitness::new(&key);
+        let mut command = Command::new(env!("CARGO_BIN_EXE_catalog-sign"));
+        command.env_clear().args([
+            "sign",
             "--input",
             "/input",
+            "--key",
+            key.to_str().unwrap(),
             "--output",
-            "/output/candidate.json",
-        ])
-        .output()
-        .unwrap();
-    assert!(!direct.status.success());
-    assert!(direct.stdout.is_empty());
-    assert_eq!(direct.stderr, b"catalog signing failed\n");
-
-    let marker_only = Command::new(env!("CARGO_BIN_EXE_catalog-sign"))
-        .env_clear()
-        .env("CATALOG_SIGN_ISOLATION", "1")
-        .env("CATALOG_SIGN_MODE", "assemble-intent")
-        .env("CATALOG_SIGN_INPUT_SHA256", "00".repeat(32))
-        .args([
-            "assemble-intent",
-            "--input",
-            "/input",
-            "--output",
-            "/output/candidate.json",
-        ])
-        .output()
-        .unwrap();
-    assert!(!marker_only.status.success());
-    assert!(marker_only.stdout.is_empty());
-    assert_eq!(marker_only.stderr, b"catalog signing failed\n");
+            output.to_str().unwrap(),
+        ]);
+        if marker_only {
+            for (name, value) in complete_marker_environment() {
+                command.env(name, value);
+            }
+            // SAFETY: this child-only hook invokes async-signal-safe setrlimit before exec.
+            unsafe {
+                command.pre_exec(|| {
+                    let limit = libc::rlimit {
+                        rlim_cur: 0,
+                        rlim_max: 0,
+                    };
+                    if libc::setrlimit(libc::RLIMIT_CORE, &limit) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        let result = command.output().unwrap();
+        assert!(!result.status.success());
+        assert!(result.stdout.is_empty());
+        assert_eq!(result.stderr, b"catalog signing failed\n");
+        assert!(!output.exists());
+        assert!(
+            !witness.observed_open(),
+            "rejected inner execution opened the fixture key"
+        );
+    }
 }
 
 #[test]
-fn real_bubblewrap_and_seccomp_probe_denies_syscalls_and_emits_authenticated_output() {
+fn real_launcher_prefilter_and_inner_filter_emit_kernel_attestation() {
     let root = TempRoot::new();
     let input = root.path.join("input");
     let output = root.path.join("output");
     write_verified_public_transfer(&input);
-    fs::DirBuilder::new().mode(0o700).create(&output).unwrap();
     catalog_sign::verify_transferred_bundle(&input).unwrap();
     let input_manifest = fs::read(input.join("transfer-manifest-v1.json")).unwrap();
 
@@ -67,102 +96,28 @@ fn real_bubblewrap_and_seccomp_probe_denies_syscalls_and_emits_authenticated_out
     let static_signer = root.path.join("catalog-sign-static");
     fs::copy(source_static, &static_signer).unwrap();
     fs::set_permissions(&static_signer, fs::Permissions::from_mode(0o500)).unwrap();
-    let seccomp = write_launcher_seccomp(&root.path.join("launcher-seccomp.bpf"));
-    clear_close_on_exec(seccomp.as_raw_fd());
+    let config = root.path.join("launcher-config-v1.json");
+    let config_bytes = serde_jcs::to_vec(&serde_json::json!({
+        "schema_version": 1,
+        "bwrap_path": "/usr/bin/bwrap",
+        "bwrap_sha256": format!("{:x}", Sha256::digest(fs::read("/usr/bin/bwrap").unwrap())),
+        "signer_path": static_signer,
+        "signer_sha256": format!("{:x}", Sha256::digest(fs::read(&static_signer).unwrap())),
+    }))
+    .unwrap();
+    fs::write(&config, config_bytes).unwrap();
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
 
-    let namespace = |name: &str| {
-        fs::read_link(format!("/proc/self/ns/{name}"))
-            .unwrap()
-            .to_string_lossy()
-            .into_owned()
-    };
     let digest = format!("{:x}", Sha256::digest(&input_manifest));
-    let result = Command::new("/usr/bin/bwrap")
+    let result = Command::new(env!("CARGO_BIN_EXE_catalog-sign-launcher"))
         .args([
-            "--unshare-all",
-            "--unshare-net",
-            "--die-with-parent",
-            "--new-session",
-            "--as-pid-1",
-            "--clearenv",
-            "--setenv",
-            "HOME",
-            "/home/signer",
-            "--setenv",
-            "PATH",
-            "/bin",
-            "--setenv",
-            "LANG",
-            "C",
-            "--setenv",
-            "LC_ALL",
-            "C",
-            "--setenv",
-            "TZ",
-            "UTC",
-            "--setenv",
-            "CATALOG_SIGN_ISOLATION",
-            "launcher-v1",
-            "--setenv",
-            "CATALOG_SIGN_MODE",
             "isolation-probe",
-            "--setenv",
-            "CATALOG_SIGN_INPUT_SHA256",
-            &digest,
-            "--setenv",
-            "CATALOG_SIGN_EUID",
-            &unsafe { libc::geteuid() }.to_string(),
-            "--setenv",
-            "CATALOG_SIGN_EGID",
-            &unsafe { libc::getegid() }.to_string(),
-            "--setenv",
-            "CATALOG_SIGN_HOST_PID_NS",
-            &namespace("pid"),
-            "--setenv",
-            "CATALOG_SIGN_HOST_USER_NS",
-            &namespace("user"),
-            "--setenv",
-            "CATALOG_SIGN_HOST_MOUNT_NS",
-            &namespace("mnt"),
-            "--setenv",
-            "CATALOG_SIGN_HOST_NETWORK_NS",
-            &namespace("net"),
-            "--cap-drop",
-            "ALL",
-            "--dir",
-            "/bin",
-            "--ro-bind",
-            static_signer.to_str().unwrap(),
-            "/bin/catalog-sign",
-            "--ro-bind",
+            "--config",
+            config.to_str().unwrap(),
+            "--input",
             input.to_str().unwrap(),
-            "/input",
-            "--bind",
+            "--output",
             output.to_str().unwrap(),
-            "/output",
-            "--dir",
-            "/home",
-            "--dir",
-            "/home/signer",
-            "--chmod",
-            "0700",
-            "/home/signer",
-            "--tmpfs",
-            "/tmp",
-            "--chmod",
-            "0700",
-            "/tmp",
-            "--proc",
-            "/proc",
-            "--dev",
-            "/dev",
-            "--chdir",
-            "/home/signer",
-            "--seccomp",
-            &seccomp.as_raw_fd().to_string(),
-            "--",
-            "/bin/catalog-sign",
-            "__isolation-probe",
         ])
         .output()
         .unwrap();
@@ -172,17 +127,51 @@ fn real_bubblewrap_and_seccomp_probe_denies_syscalls_and_emits_authenticated_out
         String::from_utf8_lossy(&result.stdout),
         String::from_utf8_lossy(&result.stderr)
     );
-    assert_eq!(result.stdout, b"isolation probe complete\n");
+    assert_eq!(result.stdout, b"catalog signer completed\n");
     assert!(result.stderr.is_empty());
 
     let probe: serde_json::Value =
         serde_json::from_slice(&fs::read(output.join("isolation-probe-v1.json")).unwrap()).unwrap();
     for syscall in [
-        "socket", "connect", "fork", "vfork", "clone", "clone3", "ptrace", "execve", "execveat",
-        "unshare", "setns", "mount", "umount2",
+        "socket",
+        "connect",
+        "fork",
+        "vfork",
+        "clone",
+        "clone3",
+        "ptrace",
+        "execve",
+        "execveat",
+        "unshare",
+        "setns",
+        "mount",
+        "umount2",
+        "io_uring_setup",
+        "io_uring_enter",
+        "io_uring_register",
     ] {
-        assert_eq!(probe["denied_errno"][syscall], libc::EPERM);
+        assert_eq!(probe["inner_filter_errno"][syscall], libc::EPERM);
     }
+    for syscall in [
+        "socket",
+        "connect",
+        "fork",
+        "unshare",
+        "setns",
+        "mount",
+        "umount2",
+        "open_tree",
+        "move_mount",
+        "io_uring_setup",
+        "io_uring_enter",
+        "io_uring_register",
+    ] {
+        assert_eq!(probe["launcher_prefilter_errno"][syscall], libc::EPERM);
+    }
+    assert_eq!(probe["launcher_prefilter_errno"]["execve"], libc::ENOENT);
+    assert_eq!(probe["core_limit_soft"], 0);
+    assert_eq!(probe["core_limit_hard"], 0);
+    assert_eq!(probe["dumpable"], false);
     let mounts = probe["mount_points"].as_array().unwrap();
     assert!(mounts.iter().any(|value| value == "/input"));
     assert!(mounts.iter().any(|value| value == "/output"));
@@ -209,6 +198,14 @@ fn real_bubblewrap_and_seccomp_probe_denies_syscalls_and_emits_authenticated_out
     assert_eq!(reverse["kind"], "signer_output");
     assert_eq!(reverse["input_transfer_sha256"], digest);
     assert_eq!(reverse["isolation_attestation"]["mode"], "isolation-probe");
+    assert_eq!(reverse["isolation_attestation"]["core_limit_soft"], 0);
+    assert_eq!(reverse["isolation_attestation"]["core_limit_hard"], 0);
+    assert_eq!(reverse["isolation_attestation"]["dumpable"], false);
+    assert_eq!(reverse["isolation_attestation"]["private_tmpfs_root"], true);
+    assert_eq!(
+        reverse["isolation_attestation"]["launcher_prefilter_errno"]["io_uring_setup"],
+        libc::EPERM
+    );
     assert_eq!(reverse["entries"].as_array().unwrap().len(), 1);
     assert!(
         !String::from_utf8(reverse_bytes)
@@ -314,84 +311,79 @@ fn write_read_only(path: &Path, bytes: &[u8]) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o400)).unwrap();
 }
 
-fn write_launcher_seccomp(path: &Path) -> fs::File {
-    let denied = [
-        libc::SYS_socket,
-        libc::SYS_socketpair,
-        libc::SYS_connect,
-        libc::SYS_bind,
-        libc::SYS_listen,
-        libc::SYS_accept,
-        libc::SYS_accept4,
-        libc::SYS_sendto,
-        libc::SYS_sendmsg,
-        libc::SYS_sendmmsg,
-        libc::SYS_recvfrom,
-        libc::SYS_recvmsg,
-        libc::SYS_recvmmsg,
-        libc::SYS_shutdown,
-        libc::SYS_fork,
-        libc::SYS_vfork,
-        libc::SYS_clone,
-        libc::SYS_clone3,
-        libc::SYS_ptrace,
-        libc::SYS_execveat,
-        libc::SYS_unshare,
-        libc::SYS_setns,
-        libc::SYS_mount,
-        libc::SYS_umount2,
-        libc::SYS_pivot_root,
-        libc::SYS_move_mount,
-        libc::SYS_open_tree,
-        libc::SYS_fsopen,
-        libc::SYS_fsconfig,
-        libc::SYS_fsmount,
-        libc::SYS_mount_setattr,
-    ];
-    let statement = |code, k| libc::sock_filter {
-        code,
-        jt: 0,
-        jf: 0,
-        k,
+fn complete_marker_environment() -> Vec<(&'static str, String)> {
+    let namespace = |name: &str| {
+        fs::read_link(format!("/proc/self/ns/{name}"))
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
     };
-    let jump = |code, k, jt, jf| libc::sock_filter { code, jt, jf, k };
-    let mut filters = vec![
-        statement(0x20, 4),
-        jump(0x15, 0xc000_003e, 1, 0),
-        statement(0x06, 0x8000_0000),
-        statement(0x20, 0),
-        jump(0x35, 0x4000_0000, 0, 1),
-        statement(0x06, 0x8000_0000),
-    ];
-    for syscall in denied {
-        filters.push(jump(0x15, syscall as u32, 0, 1));
-        filters.push(statement(0x06, 0x0005_0000 | libc::EPERM as u32));
-    }
-    filters.push(statement(0x06, 0x7fff_0000));
-    let bytes = unsafe {
-        std::slice::from_raw_parts(
-            filters.as_ptr().cast::<u8>(),
-            filters.len() * std::mem::size_of::<libc::sock_filter>(),
-        )
-    };
-    fs::write(path, bytes).unwrap();
-    let mut file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .unwrap();
-    file.flush().unwrap();
-    file.seek(SeekFrom::Start(0)).unwrap();
-    file
+    vec![
+        ("HOME", "/home/signer".to_owned()),
+        ("PATH", "/bin".to_owned()),
+        ("PWD", "/home/signer".to_owned()),
+        ("LANG", "C".to_owned()),
+        ("LC_ALL", "C".to_owned()),
+        ("TZ", "UTC".to_owned()),
+        ("CATALOG_SIGN_ISOLATION", "launcher-v1".to_owned()),
+        ("CATALOG_SIGN_MODE", "sign".to_owned()),
+        ("CATALOG_SIGN_INPUT_SHA256", "00".repeat(32)),
+        (
+            "CATALOG_SIGN_EUID",
+            // SAFETY: geteuid has no preconditions.
+            unsafe { libc::geteuid() }.to_string(),
+        ),
+        (
+            "CATALOG_SIGN_EGID",
+            // SAFETY: getegid has no preconditions.
+            unsafe { libc::getegid() }.to_string(),
+        ),
+        ("CATALOG_SIGN_HOST_PID_NS", namespace("pid")),
+        ("CATALOG_SIGN_HOST_USER_NS", namespace("user")),
+        ("CATALOG_SIGN_HOST_MOUNT_NS", namespace("mnt")),
+        ("CATALOG_SIGN_HOST_NETWORK_NS", namespace("net")),
+    ]
 }
 
-fn clear_close_on_exec(descriptor: i32) {
-    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
-    assert!(flags >= 0);
-    assert_eq!(
-        unsafe { libc::fcntl(descriptor, libc::F_SETFD, flags & !libc::FD_CLOEXEC) },
-        0
-    );
+struct InotifyKeyOpenWitness {
+    descriptor: RawFd,
+}
+
+impl InotifyKeyOpenWitness {
+    fn new(path: &Path) -> Self {
+        // SAFETY: inotify_init1 has no pointer arguments.
+        let descriptor = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
+        assert!(descriptor >= 0);
+        let path = CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: descriptor and NUL-terminated path are valid for this syscall.
+        let watch = unsafe {
+            libc::inotify_add_watch(descriptor, path.as_ptr(), libc::IN_OPEN | libc::IN_ACCESS)
+        };
+        assert!(watch >= 0);
+        Self { descriptor }
+    }
+
+    fn observed_open(&self) -> bool {
+        let mut buffer = [0_u8; 512];
+        // SAFETY: descriptor is open and buffer is writable for its exact length.
+        let result =
+            unsafe { libc::read(self.descriptor, buffer.as_mut_ptr().cast(), buffer.len()) };
+        if result >= 0 {
+            return result > 0;
+        }
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EAGAIN)
+        );
+        false
+    }
+}
+
+impl Drop for InotifyKeyOpenWitness {
+    fn drop(&mut self) {
+        // SAFETY: descriptor is uniquely owned by this witness.
+        unsafe { libc::close(self.descriptor) };
+    }
 }
 
 struct TempRoot {

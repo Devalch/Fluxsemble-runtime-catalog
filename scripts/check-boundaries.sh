@@ -673,18 +673,27 @@ PY
 
 python3 - <<'PY'
 from pathlib import Path
-import re
 import sys
 
-main = Path("crates/catalog-sign/src/main.rs").read_text(encoding="utf-8")
-inner = Path("crates/catalog-sign/src/isolation.rs").read_text(encoding="utf-8")
-signing = Path("crates/catalog-sign/src/signing.rs").read_text(encoding="utf-8")
-launcher = Path("crates/catalog-sign/src/bin/catalog-sign-launcher.rs").read_text(encoding="utf-8")
-lib = Path("crates/catalog-sign/src/lib.rs").read_text(encoding="utf-8")
+paths = [
+    "crates/catalog-sign/src/main.rs",
+    "crates/catalog-sign/src/isolation.rs",
+    "crates/catalog-sign/src/signing.rs",
+    "crates/catalog-sign/src/bin/catalog-sign-launcher.rs",
+    "crates/catalog-sign/src/lib.rs",
+    "crates/catalog-sign/tests/isolation_contract.rs",
+]
+sources = tuple(Path(path).read_text(encoding="utf-8") for path in paths)
+
+
+def section(source, start, end):
+    if start not in source or end not in source.split(start, 1)[1]:
+        return ""
+    return source.split(start, 1)[1].split(end, 1)[0]
 
 
 def isolation_boundary_errors(sources):
-    main, inner, signing, launcher, lib = sources
+    main, inner, signing, launcher, lib, isolation_test = sources
     errors = []
     main_body = main.split("fn main() {", 1)[-1]
     first = next((line.strip() for line in main_body.splitlines() if line.strip()), "")
@@ -709,47 +718,38 @@ def isolation_boundary_errors(sources):
         if forbidden in launcher:
             errors.append(f"launcher gained shell/arbitrary argv capability: {forbidden}")
 
-    inner_required = [
-        "libc::PR_SET_NO_NEW_PRIVS",
-        "libc::PR_GET_NO_NEW_PRIVS",
-        "libc::PR_GET_SECCOMP",
-        "libc::SYS_socket",
-        "libc::SYS_connect",
-        "libc::SYS_fork",
-        "libc::SYS_vfork",
-        "libc::SYS_clone",
-        "libc::SYS_clone3",
-        "libc::SYS_ptrace",
-        "libc::SYS_execve",
-        "libc::SYS_execveat",
-        "libc::SYS_unshare",
-        "libc::SYS_setns",
-        "libc::SYS_mount",
-        "libc::SYS_umount2",
-        "AUDIT_ARCH_X86_64",
-        "X32_SYSCALL_BIT",
-        "SECCOMP_RET_ERRNO | libc::EPERM as u32",
-        "verify_open_descriptors()?;",
-    ]
-    for required in inner_required:
+    inner_policy = section(inner, "fn inner_denied_syscalls()", "fn seccomp_filter(")
+    launcher_policy = section(launcher, "fn create_launcher_seccomp()", "fn seccomp_filter(")
+    prefilter = section(inner, "fn verify_launcher_prefilter()", "fn expect_prefilter_errno(")
+    inner_probe = section(inner, "pub(crate) fn run_isolation_probe", "#[derive(Debug, Serialize)]\nstruct ReverseTransferManifestV1")
+    for syscall in [
+        "socket", "connect", "fork", "vfork", "clone", "clone3", "ptrace", "execve",
+        "execveat", "unshare", "setns", "mount", "umount2",
+    ]:
+        if f"libc::SYS_{syscall}" not in inner_policy:
+            errors.append(f"missing inner seccomp denial: {syscall}")
+    for syscall in ["io_uring_setup", "io_uring_enter", "io_uring_register"]:
+        token = f"libc::SYS_{syscall}"
+        if token not in inner_policy:
+            errors.append(f"missing inner io_uring denial: {syscall}")
+        if token not in launcher_policy:
+            errors.append(f"missing launcher io_uring denial: {syscall}")
+        if token not in prefilter or f'"{syscall}"' not in prefilter:
+            errors.append(f"missing pre-inner launcher io_uring result: {syscall}")
+        if token not in inner_probe or f'"{syscall}"' not in inner_probe:
+            errors.append(f"missing post-inner io_uring result: {syscall}")
+    for required in [
+        "AUDIT_ARCH_X86_64", "X32_SYSCALL_BIT",
+        "SECCOMP_RET_ERRNO | libc::EPERM as u32", "verify_open_descriptors()?;",
+    ]:
         if required not in inner:
             errors.append(f"missing inner isolation/seccomp enforcement: {required}")
-    if inner.count("libc::SYS_execve,") != 2:
-        errors.append("inner exec denial and post-isolation probe are not both exact")
-    launcher_required = [
-        "fn create_launcher_seccomp()",
-        "libc::SYS_socket",
-        "libc::SYS_connect",
-        "libc::SYS_fork",
-        "libc::SYS_clone3",
-        "libc::SYS_ptrace",
-        "libc::SYS_unshare",
-        "libc::SYS_mount",
-        "0xc000_003e",
-        "0x4000_0000",
+    for required in [
+        "fn create_launcher_seccomp()", "libc::SYS_socket", "libc::SYS_connect",
+        "libc::SYS_fork", "libc::SYS_clone3", "libc::SYS_ptrace", "libc::SYS_unshare",
+        "libc::SYS_mount", "0xc000_003e", "0x4000_0000",
         "0x0005_0000 | libc::EPERM as u32",
-    ]
-    for required in launcher_required:
+    ]:
         if required not in launcher:
             errors.append(f"missing launcher seccomp enforcement: {required}")
 
@@ -757,7 +757,7 @@ def isolation_boundary_errors(sources):
         '"--unshare-all"', '"--unshare-net"', '"--die-with-parent"',
         '"--new-session"', '"--clearenv"', '"--cap-drop"', '"--seccomp"',
         '"--ro-bind-fd"', '"--bind-fd"', '"/home/signer"', '"/input"',
-        '"/output"', '"/key/runtime-catalog-private.pem"',
+        '"/output"', '"/key/runtime-catalog-private.pem"', '"0555"',
     ]:
         if required not in launcher:
             errors.append(f"missing fixed Bubblewrap boundary: {required}")
@@ -767,20 +767,30 @@ def isolation_boundary_errors(sources):
         '"CATALOG_SIGN_HOST_MOUNT_NS"', '"CATALOG_SIGN_HOST_NETWORK_NS"',
         '"HTTP_PROXY"', '"GITHUB_TOKEN"', '"SSH_AUTH_SOCK"',
     ]:
-        if required not in (inner + launcher + Path("crates/catalog-sign/tests/isolation_contract.rs").read_text(encoding="utf-8")):
+        if required not in inner + launcher + isolation_test:
             errors.append(f"missing exact environment boundary evidence: {required}")
-    if "let expected = BTreeSet::from([" not in inner or "mounts.keys()" not in inner:
-        errors.append("exact bounded mount inventory enforcement is missing")
-    if "verify_empty_directory(Path::new(\"/home/signer\"))?;" not in inner or "verify_empty_directory(Path::new(\"/tmp\"))?;" not in inner:
-        errors.append("private empty home/tmp enforcement is missing")
+    for required in [
+        'root.root != "/newroot"', 'root.filesystem != "tmpfs"',
+        'root.source != "tmpfs"', "root.options != expected_root_options",
+        "!root.optional_fields.is_empty()", "!root.super_options.contains(&expected_uid)",
+        "!root.super_options.contains(&expected_gid)",
+        "metadata.permissions().mode() & 0o7777 != 0o555",
+        "mount.parent_id != expected_parent", "mounts.keys()",
+    ]:
+        if required not in inner:
+            errors.append(f"missing private root/topology enforcement: {required}")
+    for required in [
+        'verify_empty_directory(Path::new("/home/signer"))?;',
+        'verify_empty_directory(Path::new("/tmp"))?;',
+    ]:
+        if required not in inner:
+            errors.append(f"missing empty private directory enforcement: {required}")
 
     for required in [
-        "verify_transferred_bundle(&input_path)?",
-        "verified_input.isolated_launch_capability()?",
+        "verify_transferred_bundle(&input_path)?", "verified_input.isolated_launch_capability()?",
         "hash_descriptor(&file, metadata.len())? != config.signer_sha256",
         "hash_descriptor(&file, metadata.len())? != config.bwrap_sha256",
-        "matches!(kind, 2 | 3)",
-        "set_close_on_exec(descriptor, false)?",
+        "matches!(kind, 2 | 3)", "set_close_on_exec(descriptor, false)?",
         'format!("/proc/self/fd/{}", bwrap.file.as_raw_fd())',
     ]:
         if required not in launcher:
@@ -791,17 +801,125 @@ def isolation_boundary_errors(sources):
         errors.append("bwrap replacement checkpoints are not exact")
     if "if (request.ceremony == Ceremony::Sign) != key.is_some()" not in launcher:
         errors.append("key mount ceremony matrix is not enforced")
-    if 'Ceremony::AssembleIntent | Ceremony::Finalize' not in launcher:
-        errors.append("assemble/finalize no-key command matrix is missing")
     if "let output = OutputPreflight::new(request.output)?;\n    let signing_key = read_production_signing_key(request.key_path)?;" not in signing:
-        errors.append("output preflight no-clobber ordering before key open changed")
+        errors.append("output preflight ordering before key open changed")
+
+    launcher_core = section(launcher, "fn disable_core_dumps()", "fn create_launcher_seccomp()")
+    for required in [
+        "rlim_cur: 0", "rlim_max: 0", "libc::setrlimit(libc::RLIMIT_CORE, &limits)",
+        "libc::getrlimit(libc::RLIMIT_CORE, verified.as_mut_ptr())",
+        "verified.rlim_cur != 0", "verified.rlim_max != 0",
+    ]:
+        if required not in launcher_core:
+            errors.append(f"missing launcher no-core enforcement: {required}")
+    if launcher.find("disable_core_dumps()?;") > launcher.find("open_key_capability(path)"):
+        errors.append("launcher no-core enforcement occurs after key open")
+    isolation_entry = section(inner, "pub fn enter_signer_isolation()", "fn exact_environment()")
+    for required in [
+        "libc::PR_SET_DUMPABLE", "libc::PR_GET_DUMPABLE", "if dumpable_status != 0",
+        "core_limit_soft != 0", "core_limit_hard != 0",
+    ]:
+        if required not in isolation_entry:
+            errors.append(f"missing inner nondumpability enforcement: {required}")
+    if isolation_entry.find("libc::PR_SET_DUMPABLE") > isolation_entry.find("exact_environment()?"):
+        errors.append("dumpability is not disabled before input/environment processing")
+
+    attestation_decl = section(inner, "pub struct IsolationAttestationV1", "impl IsolationAttestationV1")
+    capability_decl = section(inner, "pub struct SignerIsolation", "impl SignerIsolation")
+    if "Deserialize" in inner.split("pub struct IsolationAttestationV1", 1)[0].rsplit("#[derive", 1)[-1]:
+        errors.append("isolation attestation remains deserializable")
+    if "attestation: IsolationAttestationV1" not in capability_decl or "verified_transfer: VerifiedTransferredBundle" not in capability_decl:
+        errors.append("non-constructible isolation capability lost its private authority")
+    if "pub fn run_cli(" in lib or "pub fn sign_release(" in signing or "pub fn sign_release_from_path(" in signing:
+        errors.append("raw CLI/signing authority is publicly exported")
+    for required in [
+        "isolation: &SignerIsolation", "signing::run_isolated_cli(isolation.verified_transfer(), args)",
+    ]:
+        if required not in lib:
+            errors.append(f"production CLI lost isolation capability requirement: {required}")
+    if "struct SignReleaseRequest" not in signing or "pub struct SignReleaseRequest" in signing:
+        errors.append("raw signing request became publicly constructible")
 
     for required in [
-        "pub fn emit_reverse_transfer_manifest(",
-        'kind: "signer_output"',
+        'verify_transferred_bundle(Path::new("/input"))?',
+        "verified_transfer.transfer_manifest_sha256().to_owned()",
+        "if input_transfer_sha256 != expected_input_digest",
+        "verified_transfer,",
+    ]:
+        if required not in isolation_entry:
+            errors.append(f"attested transfer binding is missing: {required}")
+    isolated_cli = section(signing, "pub(crate) fn run_isolated_cli", "fn exact_flags(")
+    if "bundle: &VerifiedTransferredBundle" not in isolated_cli:
+        errors.append("isolated CLI does not consume retained transfer")
+    if "verify_transferred_bundle(" in isolated_cli or "_from_path(" in isolated_cli:
+        errors.append("isolated CLI reopens the attested transfer by path")
+
+    expected_prefilter_results = [
+        'expect_prefilter_errno("socket", socket, libc::EPERM',
+        'expect_prefilter_errno("connect", connect, libc::EPERM',
+        'expect_prefilter_errno("fork", fork, libc::EPERM',
+        'expect_prefilter_errno("execve", execve, libc::ENOENT',
+        'expect_prefilter_errno("unshare", unshare, libc::EPERM',
+        'expect_prefilter_errno("setns", setns, libc::EPERM',
+        'expect_prefilter_errno("mount", mount, libc::EPERM',
+        'expect_prefilter_errno("umount2", umount, libc::EPERM',
+        'expect_prefilter_errno("open_tree", open_tree, libc::EPERM',
+        'expect_prefilter_errno("move_mount", move_mount, libc::EPERM',
+        'expect_prefilter_errno("io_uring_setup", setup, libc::EPERM',
+        'expect_prefilter_errno("io_uring_enter", enter, libc::EPERM',
+        '"io_uring_register",\n        register,\n        libc::EPERM',
+    ]
+    for required in expected_prefilter_results:
+        if required not in prefilter:
+            errors.append(f"missing exact launcher prefilter result: {required.splitlines()[0]}")
+    if "libc::waitpid(fork as libc::pid_t" not in prefilter:
+        errors.append("unexpected prefilter fork child is not cleaned up")
+
+    assertion_sections = isolation_test.split("for syscall in [")
+    first_assertions = assertion_sections[1].split("] {", 1)[0] if len(assertion_sections) > 1 else ""
+    second_assertions = assertion_sections[2].split("] {", 1)[0] if len(assertion_sections) > 2 else ""
+    for syscall in ["io_uring_setup", "io_uring_enter", "io_uring_register"]:
+        if f'"{syscall}"' not in first_assertions or f'"{syscall}"' not in second_assertions:
+            errors.append(f"real launcher probe lacks exact io_uring assertion: {syscall}")
+    for syscall in [
+        "socket", "connect", "fork", "unshare", "setns", "mount", "umount2",
+        "open_tree", "move_mount", "io_uring_setup", "io_uring_enter", "io_uring_register",
+    ]:
+        if f'"{syscall}"' not in second_assertions:
+            errors.append(f"real launcher probe lacks exact prefilter assertion: {syscall}")
+    if 'probe["launcher_prefilter_errno"]["execve"], libc::ENOENT' not in isolation_test:
+        errors.append("real launcher probe lacks exact prefilter exec assertion")
+    marker_test = section(
+        isolation_test,
+        "fn direct_and_exact_marker_only_sign_fail_before_key_open_or_output()",
+        "#[test]\nfn real_launcher_prefilter_and_inner_filter_emit_kernel_attestation()",
+    )
+    for required in [
+        "for (name, value) in complete_marker_environment()",
+        "InotifyKeyOpenWitness::new(&key)", "!witness.observed_open()",
+        "assert!(!output.exists())", '"sign",\n            "--input"',
+    ]:
+        if required not in marker_test:
+            errors.append(f"exact marker-only sign boundary missing: {required}")
+    for required in [
+        '"CATALOG_SIGN_ISOLATION", "launcher-v1"',
+        '("CATALOG_SIGN_MODE", "sign".to_owned())',
+        '"sign",\n            "--input"',
+        "complete_marker_environment()", "InotifyKeyOpenWitness::new(&key)",
+        "!witness.observed_open()", "assert!(!output.exists())",
+        "libc::setrlimit(libc::RLIMIT_CORE, &limit)",
+        'Command::new(env!("CARGO_BIN_EXE_catalog-sign-launcher"))',
+    ]:
+        if required not in isolation_test:
+            errors.append(f"marker-only/key-open witness evidence missing: {required}")
+    for forbidden in ["write_launcher_seccomp", "libc::sock_filter", 'Command::new("/usr/bin/bwrap")']:
+        if forbidden in isolation_test:
+            errors.append(f"isolation test duplicates/bypasses launcher policy: {forbidden}")
+
+    for required in [
+        "pub fn emit_reverse_transfer_manifest(", 'kind: "signer_output"',
         "input_transfer_sha256: attestation.input_transfer_sha256()",
-        "isolation_attestation: attestation",
-        'mode: "0400".to_owned()',
+        "isolation_attestation: attestation", 'mode: "0400".to_owned()',
         "write_fresh_public_file(Path::new(OUTPUT_MANIFEST), &bytes)?",
     ]:
         if required not in inner:
@@ -810,27 +928,122 @@ def isolation_boundary_errors(sources):
         errors.append("fixture authority crossed into signer isolation/launcher")
     return errors
 
-sources = (main, inner, signing, launcher, lib)
+
 errors = isolation_boundary_errors(sources)
 if errors:
     print(errors[0], file=sys.stderr)
     sys.exit(1)
 
+# One-at-a-time removals target the actual enforcement expressions rather than documentation tokens.
 mutations = [
-    (0, "catalog_sign::enter_signer_isolation()", "catalog_sign::enter_signer_isolation_removed()", "first-operation isolation"),
-    (0, "catalog_sign::emit_reverse_transfer_manifest(&isolation)?;", "", "reverse transfer emission"),
-    (1, "libc::SYS_execve,", "", "inner exec denial"),
-    (1, 'verify_empty_directory(Path::new("/home/signer"))?;', "", "empty private home"),
-    (1, "verify_open_descriptors()?;", "", "ambient descriptor rejection"),
-    (3, "hash_descriptor(&file, metadata.len())? != config.signer_sha256", "false", "signer descriptor hash"),
-    (3, "matches!(kind, 2 | 3)", "false", "static ELF dynamic/interpreter rejection"),
-    (3, "rebind_executable(&signer, FilePolicy::Signer)?;", "", "first signer replacement checkpoint"),
-    (3, "if (request.ceremony == Ceremony::Sign) != key.is_some()", "if false", "key ceremony matrix"),
-    (3, "std::process::Command::new(&bwrap_exec)", "std::process::Command::new(\"/bin/sh\")", "retained exact bwrap execution"),
+    (0, "catalog_sign::enter_signer_isolation()", "catalog_sign::enter_signer_isolation_removed()", "first-operation isolation", 1),
+    (0, "catalog_sign::emit_reverse_transfer_manifest(&isolation)?;", "", "reverse transfer emission", 1),
+    (1, 'verify_empty_directory(Path::new("/home/signer"))?;', "", "empty private home", 1),
+    (1, "verify_open_descriptors()?;", "", "ambient descriptor rejection", 1),
+    (3, "hash_descriptor(&file, metadata.len())? != config.signer_sha256", "false", "signer descriptor hash", 1),
+    (3, "matches!(kind, 2 | 3)", "false", "static ELF dynamic/interpreter rejection", 1),
+    (3, "rebind_executable(&signer, FilePolicy::Signer)?;", "", "first signer replacement checkpoint", 1),
+    (3, "if (request.ceremony == Ceremony::Sign) != key.is_some()", "if false", "key ceremony matrix", 1),
+    (3, "std::process::Command::new(&bwrap_exec)", 'std::process::Command::new("/bin/sh")', "retained exact bwrap execution", 1),
+    # Each io_uring syscall in each real policy.
+    (1, "        libc::SYS_io_uring_setup,", "", "inner io_uring_setup policy", 1),
+    (1, "        libc::SYS_io_uring_enter,", "", "inner io_uring_enter policy", 1),
+    (1, "        libc::SYS_io_uring_register,", "", "inner io_uring_register policy", 1),
+    (3, "        libc::SYS_io_uring_setup,", "", "launcher io_uring_setup policy", 1),
+    (3, "        libc::SYS_io_uring_enter,", "", "launcher io_uring_enter policy", 1),
+    (3, "        libc::SYS_io_uring_register,", "", "launcher io_uring_register policy", 1),
+    # Both post-inner and actual-launcher probe assertions.
+    (5, '        "io_uring_setup",', "", "post-inner io_uring_setup assertion", 1),
+    (5, '        "io_uring_enter",', "", "post-inner io_uring_enter assertion", 1),
+    (5, '        "io_uring_register",', "", "post-inner io_uring_register assertion", 1),
+    (5, '        "io_uring_setup",', "", "prefilter io_uring_setup assertion", 2),
+    (5, '        "io_uring_enter",', "", "prefilter io_uring_enter assertion", 2),
+    (5, '        "io_uring_register",', "", "prefilter io_uring_register assertion", 2),
+    (5, '        "socket",', "", "prefilter socket assertion", 2),
+    (5, '        "connect",', "", "prefilter connect assertion", 2),
+    (5, '        "fork",', "", "prefilter fork assertion", 2),
+    (5, '        "unshare",', "", "prefilter unshare assertion", 2),
+    (5, '        "setns",', "", "prefilter setns assertion", 2),
+    (5, '        "mount",', "", "prefilter mount assertion", 2),
+    (5, '        "umount2",', "", "prefilter umount assertion", 2),
+    (5, '        "open_tree",', "", "prefilter open_tree assertion", 1),
+    (5, '        "move_mount",', "", "prefilter move_mount assertion", 1),
+    (5, 'probe["launcher_prefilter_errno"]["execve"], libc::ENOENT', 'probe["launcher_prefilter_errno"]["execve"], libc::EPERM', "prefilter exec assertion", 1),
+    # Both core-limit values and verification, plus dumpable set/get.
+    (3, "        rlim_cur: 0,", "        rlim_cur: 1,", "launcher soft core limit", 1),
+    (3, "        rlim_max: 0,", "        rlim_max: 1,", "launcher hard core limit", 1),
+    (3, "verified.rlim_cur != 0", "false", "launcher soft core verification", 1),
+    (3, "verified.rlim_max != 0", "false", "launcher hard core verification", 1),
+    (1, "libc::PR_SET_DUMPABLE", "libc::REMOVED_PR_SET_DUMPABLE", "inner dumpable set", 1),
+    (1, "libc::PR_GET_DUMPABLE", "libc::REMOVED_PR_GET_DUMPABLE", "inner dumpable get", 1),
+    (1, "if dumpable_status != 0", "if false", "inner dumpable verification", 1),
+    (1, "core_limit_soft != 0", "false", "inner soft core verification", 1),
+    (1, "core_limit_hard != 0", "false", "inner hard core verification", 1),
+    # Unforgeable capability, signature requirement, and retained transfer binding.
+    (1, "pub struct SignerIsolation", "pub struct RemovedSignerIsolation", "isolation capability", 1),
+    (1, "#[derive(Debug, Clone, PartialEq, Eq, Serialize)]", "#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]", "non-deserializable attestation", 1),
+    (2, "fn sign_release(request: SignReleaseRequest", "pub fn sign_release(request: SignReleaseRequest", "private raw signing seam", 1),
+    (4, "isolation: &SignerIsolation", "isolation: &IsolationAttestationV1", "CLI capability signature", 1),
+    (4, "signing::run_isolated_cli(isolation.verified_transfer(), args)", "signing::run_isolated_cli_removed(args)", "retained CLI consumption", 1),
+    (1, 'verify_transferred_bundle(Path::new("/input"))?', 'verify_transferred_bundle(Path::new("/other"))?', "exact isolated transfer verification", 1),
+    (1, "if input_transfer_sha256 != expected_input_digest", "if false", "attested digest comparison", 1),
+    (1, "verified_transfer,", "", "retained transfer capability", 1),
+    # Private root type/options/topology.
+    (1, 'root.root != "/newroot"', "false", "private root origin", 1),
+    (1, 'root.filesystem != "tmpfs"', "false", "private root filesystem", 1),
+    (1, 'root.source != "tmpfs"', "false", "private root source", 1),
+    (1, "root.options != expected_root_options", "false", "private root options", 1),
+    (1, "!root.optional_fields.is_empty()", "false", "private root propagation", 1),
+    (1, "!root.super_options.contains(&expected_uid)", "false", "private root owner uid", 1),
+    (1, "!root.super_options.contains(&expected_gid)", "false", "private root owner gid", 1),
+    (1, "metadata.permissions().mode() & 0o7777 != 0o555", "false", "private root mode", 1),
+    (1, "mount.parent_id != expected_parent", "false", "private mount topology", 1),
+    # Every exact inherited-prefilter result and unexpected-child cleanup.
+    (1, 'expect_prefilter_errno("socket", socket, libc::EPERM', 'expect_prefilter_errno("socket", socket, libc::ENOENT', "prefilter socket result", 1),
+    (1, 'expect_prefilter_errno("connect", connect, libc::EPERM', 'expect_prefilter_errno("connect", connect, libc::ENOENT', "prefilter connect result", 1),
+    (1, 'expect_prefilter_errno("fork", fork, libc::EPERM', 'expect_prefilter_errno("fork", fork, libc::ENOENT', "prefilter fork result", 1),
+    (1, 'expect_prefilter_errno("execve", execve, libc::ENOENT', 'expect_prefilter_errno("execve", execve, libc::EPERM', "prefilter exec result", 1),
+    (1, 'expect_prefilter_errno("unshare", unshare, libc::EPERM', 'expect_prefilter_errno("unshare", unshare, libc::ENOENT', "prefilter unshare result", 1),
+    (1, 'expect_prefilter_errno("setns", setns, libc::EPERM', 'expect_prefilter_errno("setns", setns, libc::ENOENT', "prefilter setns result", 1),
+    (1, 'expect_prefilter_errno("mount", mount, libc::EPERM', 'expect_prefilter_errno("mount", mount, libc::ENOENT', "prefilter mount result", 1),
+    (1, 'expect_prefilter_errno("umount2", umount, libc::EPERM', 'expect_prefilter_errno("umount2", umount, libc::ENOENT', "prefilter umount result", 1),
+    (1, 'expect_prefilter_errno("open_tree", open_tree, libc::EPERM', 'expect_prefilter_errno("open_tree", open_tree, libc::ENOENT', "prefilter open_tree result", 1),
+    (1, 'expect_prefilter_errno("move_mount", move_mount, libc::EPERM', 'expect_prefilter_errno("move_mount", move_mount, libc::ENOENT', "prefilter move_mount result", 1),
+    (1, 'expect_prefilter_errno("io_uring_setup", setup, libc::EPERM', 'expect_prefilter_errno("io_uring_setup", setup, libc::ENOENT', "prefilter io_uring_setup result", 1),
+    (1, 'expect_prefilter_errno("io_uring_enter", enter, libc::EPERM', 'expect_prefilter_errno("io_uring_enter", enter, libc::ENOENT', "prefilter io_uring_enter result", 1),
+    (1, '"io_uring_register",\n        register,\n        libc::EPERM', '"io_uring_register",\n        register,\n        libc::ENOENT', "prefilter io_uring_register result", 1),
+    (1, "libc::waitpid(fork as libc::pid_t", "libc::waitpid_removed(fork as libc::pid_t", "unexpected fork cleanup", 1),
+    # Exact marker-only sign setup and cross-process no-key-open witness.
+    (5, "for (name, value) in complete_marker_environment()", "for (name, value) in removed_marker_environment()", "complete marker-only environment", 1),
+    (5, '("CATALOG_SIGN_ISOLATION", "launcher-v1".to_owned())', '("CATALOG_SIGN_ISOLATION", "wrong".to_owned())', "exact accepted marker", 1),
+    (5, '("CATALOG_SIGN_MODE", "sign".to_owned())', '("CATALOG_SIGN_MODE", "assemble-intent".to_owned())', "marker-only sign mode", 1),
+    (5, "InotifyKeyOpenWitness::new(&key)", "RemovedKeyOpenWitness::new(&key)", "key-open witness", 1),
+    (5, "!witness.observed_open()", "true", "no key-open assertion", 1),
+    (5, "assert!(!output.exists())", "", "no output assertion", 1),
 ]
-for index, old, new, label in mutations:
+
+
+def replace_nth(source, old, new, occurrence):
+    start = 0
+    for _ in range(occurrence):
+        index = source.find(old, start)
+        if index < 0:
+            return source
+        start = index + len(old)
+    index = source.find(old, 0 if occurrence == 1 else 0)
+    if occurrence > 1:
+        start = 0
+        for _ in range(occurrence):
+            index = source.find(old, start)
+            if index < 0:
+                return source
+            start = index + len(old)
+    return source[:index] + new + source[index + len(old):]
+
+
+for index, old, new, label, occurrence in mutations:
     mutated = list(sources)
-    mutated[index] = mutated[index].replace(old, new, 1)
+    mutated[index] = replace_nth(mutated[index], old, new, occurrence)
     if mutated[index] == sources[index]:
         print(f"isolation policy mutation could not be applied: {label}", file=sys.stderr)
         sys.exit(1)

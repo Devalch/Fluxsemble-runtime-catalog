@@ -8,13 +8,13 @@ mod signing;
 pub use signing::generate_fixture_envelope;
 
 pub use isolation::{
-    IsolationAttestationV1, IsolationMode, emit_reverse_transfer_manifest, enter_signer_isolation,
+    IsolationAttestationV1, IsolationMode, SignerIsolation, emit_reverse_transfer_manifest,
+    enter_signer_isolation,
 };
 pub use signing::{
-    SignReleaseRequest, SignedReleaseBundleV1, UnsignedBundleEntryV1, UnsignedReleaseCandidateV1,
+    SignedReleaseBundleV1, UnsignedBundleEntryV1, UnsignedReleaseCandidateV1,
     VerifiedTransferredBundle, assemble_release_intent, assemble_release_intent_from_path,
-    finalize_candidate, finalize_candidate_from_path, sign_release, sign_release_from_path,
-    verify_transferred_bundle,
+    finalize_candidate, finalize_candidate_from_path, verify_transferred_bundle,
 };
 
 /// Closed, non-echoing failures from the offline signer.
@@ -43,15 +43,15 @@ pub fn summary() -> String {
     format!("catalog-sign:{}", catalog_core::PACKAGES.join(","))
 }
 
-pub fn run_cli(args: &[String]) -> Result<String, SignError> {
-    signing::run_cli(args)
-}
-
-pub fn run_isolated_cli(
-    isolation: &IsolationAttestationV1,
-    args: &[String],
-) -> Result<String, SignError> {
-    let expected = match isolation.mode() {
+/// Runs the closed inner CLI only with capability returned by [`enter_signer_isolation`].
+///
+/// Raw signing seams are intentionally not exported.
+///
+/// ```compile_fail
+/// let _ = catalog_sign::sign_release_from_path;
+/// ```
+pub fn run_isolated_cli(isolation: &SignerIsolation, args: &[String]) -> Result<String, SignError> {
+    let expected = match isolation.attestation().mode() {
         IsolationMode::AssembleIntent => &[
             "assemble-intent",
             "--input",
@@ -80,11 +80,11 @@ pub fn run_isolated_cli(
     if args.iter().map(String::as_str).ne(expected.iter().copied()) {
         return Err(SignError::ArgumentRejected);
     }
-    if isolation.mode() == IsolationMode::IsolationProbe {
+    if isolation.attestation().mode() == IsolationMode::IsolationProbe {
         isolation::run_isolation_probe(isolation)?;
         Ok("isolation probe complete".to_owned())
     } else {
-        signing::run_cli(args)
+        signing::run_isolated_cli(isolation.verified_transfer(), args)
     }
 }
 

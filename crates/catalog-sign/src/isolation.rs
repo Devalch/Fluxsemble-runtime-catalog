@@ -3,20 +3,16 @@ use std::{
     ffi::CString,
     fs::{self, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
-    os::{
-        fd::FromRawFd,
-        unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
-    },
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::SignError;
+use crate::{SignError, signing::VerifiedTransferredBundle, verify_transferred_bundle};
 
 const MARKER: &str = "launcher-v1";
-const INPUT_MANIFEST: &str = "/input/transfer-manifest-v1.json";
 const OUTPUT_MANIFEST: &str = "/output/transfer-manifest-v1.json";
 const MAX_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_OUTPUT_ENTRIES: usize = 64;
@@ -47,7 +43,14 @@ impl IsolationMode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Public evidence emitted into the reverse transfer, not isolation authority.
+///
+/// It deliberately cannot be deserialized into an authority-bearing value.
+///
+/// ```compile_fail
+/// let _: catalog_sign::IsolationAttestationV1 = serde_json::from_str("{}").unwrap();
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct IsolationAttestationV1 {
     schema_version: u16,
@@ -55,7 +58,12 @@ pub struct IsolationAttestationV1 {
     input_transfer_sha256: String,
     no_new_privileges: bool,
     launcher_seccomp_filter: bool,
+    launcher_prefilter_errno: BTreeMap<String, i32>,
     inner_seccomp_filter: bool,
+    core_limit_soft: u64,
+    core_limit_hard: u64,
+    dumpable: bool,
+    private_tmpfs_root: bool,
     pid_namespace: String,
     user_namespace: String,
     mount_namespace: String,
@@ -76,11 +84,47 @@ impl IsolationAttestationV1 {
     }
 }
 
+/// Non-constructible authority proving the current process passed the complete inner boundary.
+///
+/// ```compile_fail
+/// let _ = catalog_sign::SignerIsolation {};
+/// ```
+pub struct SignerIsolation {
+    attestation: IsolationAttestationV1,
+    verified_transfer: VerifiedTransferredBundle,
+}
+
+impl SignerIsolation {
+    #[must_use]
+    pub fn attestation(&self) -> &IsolationAttestationV1 {
+        &self.attestation
+    }
+
+    pub(crate) fn verified_transfer(&self) -> &VerifiedTransferredBundle {
+        &self.verified_transfer
+    }
+}
+
 /// Verifies every launcher-established fact and installs the final signer seccomp policy.
 ///
 /// This function is intentionally the first operation in the inner binary. It performs no
 /// argument parsing, production-identity lookup, output preflight, or signing-key access.
-pub fn enter_signer_isolation() -> Result<IsolationAttestationV1, SignError> {
+pub fn enter_signer_isolation() -> Result<SignerIsolation, SignError> {
+    // Exec can restore dumpability, so the inner boundary disables it again as its first action.
+    // SAFETY: PR_SET_DUMPABLE has no pointer argument and affects only this process.
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+        return Err(rejected());
+    }
+    // SAFETY: PR_GET_DUMPABLE has no pointer argument.
+    let dumpable_status = unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) };
+    if dumpable_status != 0 {
+        return Err(rejected());
+    }
+    let dumpable = false;
+    let (core_limit_soft, core_limit_hard) = core_limits()?;
+    if core_limit_soft != 0 || core_limit_hard != 0 {
+        return Err(rejected());
+    }
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         return Err(rejected());
     }
@@ -104,6 +148,7 @@ pub fn enter_signer_isolation() -> Result<IsolationAttestationV1, SignError> {
     if !no_new_privileges || !launcher_seccomp_filter {
         return Err(rejected());
     }
+    let launcher_prefilter_errno = verify_launcher_prefilter()?;
 
     let namespaces = verify_namespaces(&environment)?;
     let mount_points = verify_mounts(mode)?;
@@ -112,7 +157,8 @@ pub fn enter_signer_isolation() -> Result<IsolationAttestationV1, SignError> {
     verify_network_namespace()?;
     verify_capabilities_and_kernel_status()?;
     verify_open_descriptors()?;
-    let input_transfer_sha256 = hash_isolated_input_manifest()?;
+    let verified_transfer = verify_transferred_bundle(Path::new("/input"))?;
+    let input_transfer_sha256 = verified_transfer.transfer_manifest_sha256().to_owned();
     if input_transfer_sha256 != expected_input_digest {
         return Err(rejected());
     }
@@ -125,19 +171,27 @@ pub fn enter_signer_isolation() -> Result<IsolationAttestationV1, SignError> {
         return Err(rejected());
     }
 
-    Ok(IsolationAttestationV1 {
-        schema_version: 1,
-        mode,
-        input_transfer_sha256,
-        no_new_privileges,
-        launcher_seccomp_filter,
-        inner_seccomp_filter,
-        pid_namespace: namespaces[0].clone(),
-        user_namespace: namespaces[1].clone(),
-        mount_namespace: namespaces[2].clone(),
-        network_namespace: namespaces[3].clone(),
-        mount_points,
-        environment_names: environment.keys().cloned().collect(),
+    Ok(SignerIsolation {
+        attestation: IsolationAttestationV1 {
+            schema_version: 1,
+            mode,
+            input_transfer_sha256,
+            no_new_privileges,
+            launcher_seccomp_filter,
+            launcher_prefilter_errno,
+            inner_seccomp_filter,
+            core_limit_soft,
+            core_limit_hard,
+            dumpable,
+            private_tmpfs_root: true,
+            pid_namespace: namespaces[0].clone(),
+            user_namespace: namespaces[1].clone(),
+            mount_namespace: namespaces[2].clone(),
+            network_namespace: namespaces[3].clone(),
+            mount_points,
+            environment_names: environment.keys().cloned().collect(),
+        },
+        verified_transfer,
     })
 }
 
@@ -254,6 +308,17 @@ fn valid_namespace_identity(value: &str) -> bool {
         })
 }
 
+struct MountRecord {
+    mount_id: u64,
+    parent_id: u64,
+    root: String,
+    options: BTreeSet<String>,
+    optional_fields: Vec<String>,
+    filesystem: String,
+    source: String,
+    super_options: BTreeSet<String>,
+}
+
 fn verify_mounts(mode: IsolationMode) -> Result<Vec<String>, SignError> {
     let bytes = fs::read_to_string("/proc/self/mountinfo").map_err(|_| rejected())?;
     if bytes.len() > 64 * 1024 || bytes.is_empty() {
@@ -263,15 +328,25 @@ fn verify_mounts(mode: IsolationMode) -> Result<Vec<String>, SignError> {
     for line in bytes.lines() {
         let (left, right) = line.split_once(" - ").ok_or_else(rejected)?;
         let fields = left.split_ascii_whitespace().collect::<Vec<_>>();
-        let filesystem = right.split_ascii_whitespace().next().ok_or_else(rejected)?;
-        if fields.len() < 6 {
+        let right_fields = right.split_ascii_whitespace().collect::<Vec<_>>();
+        if fields.len() < 6 || right_fields.len() != 3 {
             return Err(rejected());
         }
         let point = decode_mount_field(fields[4])?;
-        if mounts
-            .insert(point, (fields[5].to_owned(), filesystem.to_owned()))
-            .is_some()
-        {
+        let record = MountRecord {
+            mount_id: fields[0].parse().map_err(|_| rejected())?,
+            parent_id: fields[1].parse().map_err(|_| rejected())?,
+            root: decode_mount_field(fields[3])?,
+            options: fields[5].split(',').map(str::to_owned).collect(),
+            optional_fields: fields[6..]
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
+            filesystem: right_fields[0].to_owned(),
+            source: right_fields[1].to_owned(),
+            super_options: right_fields[2].split(',').map(str::to_owned).collect(),
+        };
+        if mounts.insert(point, record).is_some() {
             return Err(rejected());
         }
     }
@@ -297,6 +372,7 @@ fn verify_mounts(mode: IsolationMode) -> Result<Vec<String>, SignError> {
     if mounts.keys().map(String::as_str).collect::<BTreeSet<_>>() != expected {
         return Err(rejected());
     }
+    verify_private_root_topology(&mounts)?;
     for path in ["/bin/catalog-sign", "/input"] {
         if !mount_is_read_only(&mounts, path) {
             return Err(rejected());
@@ -306,10 +382,18 @@ fn verify_mounts(mode: IsolationMode) -> Result<Vec<String>, SignError> {
         return Err(rejected());
     }
     if mount_is_read_only(&mounts, "/output")
-        || mounts.get("/proc").is_none_or(|(_, fs)| fs != "proc")
-        || mounts.get("/dev").is_none_or(|(_, fs)| fs != "tmpfs")
-        || mounts.get("/dev/pts").is_none_or(|(_, fs)| fs != "devpts")
-        || mounts.get("/tmp").is_none_or(|(_, fs)| fs != "tmpfs")
+        || mounts
+            .get("/proc")
+            .is_none_or(|mount| mount.filesystem != "proc")
+        || mounts
+            .get("/dev")
+            .is_none_or(|mount| mount.filesystem != "tmpfs")
+        || mounts
+            .get("/dev/pts")
+            .is_none_or(|mount| mount.filesystem != "devpts")
+        || mounts
+            .get("/tmp")
+            .is_none_or(|mount| mount.filesystem != "tmpfs")
     {
         return Err(rejected());
     }
@@ -339,10 +423,61 @@ fn decode_mount_field(value: &str) -> Result<String, SignError> {
     String::from_utf8(output).map_err(|_| rejected())
 }
 
-fn mount_is_read_only(mounts: &BTreeMap<String, (String, String)>, path: &str) -> bool {
+fn verify_private_root_topology(mounts: &BTreeMap<String, MountRecord>) -> Result<(), SignError> {
+    let root = mounts.get("/").ok_or_else(rejected)?;
+    let expected_root_options = BTreeSet::from([
+        "rw".to_owned(),
+        "nosuid".to_owned(),
+        "nodev".to_owned(),
+        "relatime".to_owned(),
+    ]);
+    let expected_uid = format!("uid={}", current_euid());
+    let expected_gid = format!("gid={}", current_egid());
+    let metadata = fs::symlink_metadata("/").map_err(|_| rejected())?;
+    if root.root != "/newroot"
+        || root.filesystem != "tmpfs"
+        || root.source != "tmpfs"
+        || root.options != expected_root_options
+        || !root.optional_fields.is_empty()
+        || !root.super_options.contains("rw")
+        || !root.super_options.contains(&expected_uid)
+        || !root.super_options.contains(&expected_gid)
+        || !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != current_euid()
+        || metadata.permissions().mode() & 0o7777 != 0o555
+    {
+        return Err(rejected());
+    }
+
+    let dev_id = mounts.get("/dev").ok_or_else(rejected)?.mount_id;
+    let mount_ids = mounts
+        .values()
+        .map(|mount| mount.mount_id)
+        .collect::<BTreeSet<_>>();
+    if mount_ids.contains(&root.parent_id) {
+        return Err(rejected());
+    }
+    for (path, mount) in mounts {
+        if path == "/" {
+            continue;
+        }
+        let expected_parent = if path.starts_with("/dev/") {
+            dev_id
+        } else {
+            root.mount_id
+        };
+        if mount.parent_id != expected_parent {
+            return Err(rejected());
+        }
+    }
+    Ok(())
+}
+
+fn mount_is_read_only(mounts: &BTreeMap<String, MountRecord>, path: &str) -> bool {
     mounts
         .get(path)
-        .is_some_and(|(options, _)| options.split(',').any(|option| option == "ro"))
+        .is_some_and(|mount| mount.options.contains("ro"))
 }
 
 fn verify_empty_directory(path: &Path) -> Result<(), SignError> {
@@ -412,32 +547,140 @@ fn verify_open_descriptors() -> Result<(), SignError> {
     Ok(())
 }
 
-fn hash_isolated_input_manifest() -> Result<String, SignError> {
-    let path = CString::new(INPUT_MANIFEST).expect("fixed input manifest path");
-    // SAFETY: the path is fixed, NUL-terminated, and open receives no variadic mode without create.
-    let descriptor = unsafe {
-        libc::open(
-            path.as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+fn core_limits() -> Result<(u64, u64), SignError> {
+    let mut limits = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    // SAFETY: limits points to writable storage for one rlimit value.
+    if unsafe { libc::getrlimit(libc::RLIMIT_CORE, limits.as_mut_ptr()) } != 0 {
+        return Err(rejected());
+    }
+    // SAFETY: successful getrlimit initialized limits.
+    let limits = unsafe { limits.assume_init() };
+    Ok((limits.rlim_cur, limits.rlim_max))
+}
+
+fn verify_launcher_prefilter() -> Result<BTreeMap<String, i32>, SignError> {
+    let mut observed = BTreeMap::new();
+
+    let socket = unsafe { libc::syscall(libc::SYS_socket, libc::AF_INET, libc::SOCK_STREAM, 0) };
+    expect_prefilter_errno("socket", socket, libc::EPERM, &mut observed, true)?;
+
+    // SAFETY: the launcher filter resolves before the invalid descriptor is used.
+    let connect = unsafe { libc::syscall(libc::SYS_connect, -1, 0, 0) };
+    expect_prefilter_errno("connect", connect, libc::EPERM, &mut observed, false)?;
+
+    // A missing process-creation denial must not leave a child behind.
+    // SAFETY: fork has no pointer arguments; an unexpected child exits immediately.
+    let fork = unsafe { libc::syscall(libc::SYS_fork) };
+    if fork == 0 {
+        // SAFETY: _exit terminates only the unexpected child without running inherited destructors.
+        unsafe { libc::_exit(125) };
+    }
+    if fork > 0 {
+        let mut status = 0;
+        // SAFETY: fork returned this child pid and status is writable.
+        unsafe { libc::waitpid(fork as libc::pid_t, &mut status, 0) };
+        return Err(rejected());
+    }
+    expect_prefilter_errno("fork", fork, libc::EPERM, &mut observed, false)?;
+
+    let missing = CString::new("/catalog-sign-fixed-nonexistent-exec").expect("fixed path");
+    let argv = [missing.as_ptr(), std::ptr::null()];
+    let envp = [std::ptr::null::<libc::c_char>()];
+    // The launcher must permit its one signer exec. This fixed missing target therefore proves the
+    // final exec-denying inner filter is not yet installed: ENOENT, not EPERM, is authoritative.
+    // SAFETY: path, argv, and envp remain valid for the syscall duration.
+    let execve = unsafe {
+        libc::syscall(
+            libc::SYS_execve,
+            missing.as_ptr(),
+            argv.as_ptr(),
+            envp.as_ptr(),
         )
     };
-    if descriptor < 0 {
+    expect_prefilter_errno("execve", execve, libc::ENOENT, &mut observed, false)?;
+
+    let mut io_uring_parameters = [0_u64; 32];
+    // SAFETY: the filter rejects before the kernel consumes this writable, over-sized parameter
+    // storage. Any unexpected returned ring descriptor is closed by expect_prefilter_errno.
+    let setup = unsafe {
+        libc::syscall(
+            libc::SYS_io_uring_setup,
+            1,
+            io_uring_parameters.as_mut_ptr(),
+        )
+    };
+    expect_prefilter_errno("io_uring_setup", setup, libc::EPERM, &mut observed, true)?;
+    // SAFETY: denied policy resolves before the invalid ring descriptor is inspected.
+    let enter = unsafe { libc::syscall(libc::SYS_io_uring_enter, -1, 0, 0, 0, 0, 0) };
+    expect_prefilter_errno("io_uring_enter", enter, libc::EPERM, &mut observed, false)?;
+    // SAFETY: denied policy resolves before the invalid ring descriptor is inspected.
+    let register = unsafe { libc::syscall(libc::SYS_io_uring_register, -1, 0, 0, 0) };
+    expect_prefilter_errno(
+        "io_uring_register",
+        register,
+        libc::EPERM,
+        &mut observed,
+        false,
+    )?;
+
+    // unshare(0) is a safe no-op when allowed, while setns(-1, 0) is EBADF when allowed. Their
+    // EPERM results therefore distinguish the inherited filter from capability-only failures.
+    // SAFETY: both syscalls use scalar arguments only.
+    let unshare = unsafe { libc::syscall(libc::SYS_unshare, 0) };
+    expect_prefilter_errno("unshare", unshare, libc::EPERM, &mut observed, false)?;
+    // SAFETY: invalid descriptor is intentional and the filter resolves first.
+    let setns = unsafe { libc::syscall(libc::SYS_setns, -1, 0) };
+    expect_prefilter_errno("setns", setns, libc::EPERM, &mut observed, false)?;
+
+    let missing_mount = CString::new("/catalog-sign-fixed-nonexistent-mount").expect("fixed path");
+    // SAFETY: the filter resolves before any null mount arguments can be consumed.
+    let mount = unsafe { libc::syscall(libc::SYS_mount, 0, missing_mount.as_ptr(), 0, 0, 0) };
+    expect_prefilter_errno("mount", mount, libc::EPERM, &mut observed, false)?;
+    // SAFETY: fixed path is NUL-terminated and the filter resolves before lookup.
+    let umount = unsafe { libc::syscall(libc::SYS_umount2, missing_mount.as_ptr(), 0) };
+    expect_prefilter_errno("umount2", umount, libc::EPERM, &mut observed, false)?;
+    let relative = CString::new(".").expect("fixed relative path");
+    // Without the filter these invalid descriptors produce EBADF before any mount authority can be
+    // used, so EPERM safely distinguishes the inherited mount-family policy.
+    // SAFETY: fixed path is valid and the launcher filter resolves before descriptor lookup.
+    let open_tree = unsafe { libc::syscall(libc::SYS_open_tree, -1, relative.as_ptr(), 0) };
+    expect_prefilter_errno("open_tree", open_tree, libc::EPERM, &mut observed, true)?;
+    // SAFETY: both fixed paths are valid and the launcher filter resolves before descriptor lookup.
+    let move_mount = unsafe {
+        libc::syscall(
+            libc::SYS_move_mount,
+            -1,
+            relative.as_ptr(),
+            -1,
+            relative.as_ptr(),
+            0,
+        )
+    };
+    expect_prefilter_errno("move_mount", move_mount, libc::EPERM, &mut observed, false)?;
+
+    Ok(observed)
+}
+
+fn expect_prefilter_errno(
+    name: &str,
+    result: libc::c_long,
+    expected: i32,
+    observed: &mut BTreeMap<String, i32>,
+    close_unexpected_descriptor: bool,
+) -> Result<(), SignError> {
+    if result >= 0 {
+        if close_unexpected_descriptor {
+            // SAFETY: a nonnegative syscall result in these probes is an owned descriptor.
+            unsafe { libc::close(result as i32) };
+        }
         return Err(rejected());
     }
-    // SAFETY: open returned one owned descriptor.
-    let file = unsafe { fs::File::from_raw_fd(descriptor) };
-    let metadata = file.metadata().map_err(|_| rejected())?;
-    if !metadata.is_file()
-        || metadata.file_type().is_symlink()
-        || metadata.uid() != current_euid()
-        || metadata.nlink() != 1
-        || metadata.permissions().mode() & 0o7777 != 0o400
-        || metadata.len() == 0
-        || metadata.len() > MAX_MANIFEST_BYTES
-    {
+    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    if errno != expected {
         return Err(rejected());
     }
-    hash_descriptor(&file, metadata.len())
+    observed.insert(name.to_owned(), errno);
+    Ok(())
 }
 
 fn install_inner_seccomp_filter() -> Result<(), SignError> {
@@ -483,6 +726,9 @@ fn inner_denied_syscalls() -> Vec<i64> {
         libc::SYS_getpeername,
         libc::SYS_setsockopt,
         libc::SYS_getsockopt,
+        libc::SYS_io_uring_setup,
+        libc::SYS_io_uring_enter,
+        libc::SYS_io_uring_register,
         libc::SYS_fork,
         libc::SYS_vfork,
         libc::SYS_clone,
@@ -541,19 +787,24 @@ fn seccomp_filter(denied: &[i64]) -> Vec<libc::sock_filter> {
 #[derive(Debug, Serialize)]
 struct ProbeReportV1 {
     schema_version: u16,
-    denied_errno: BTreeMap<String, i32>,
+    launcher_prefilter_errno: BTreeMap<String, i32>,
+    inner_filter_errno: BTreeMap<String, i32>,
+    core_limit_soft: u64,
+    core_limit_hard: u64,
+    dumpable: bool,
     environment_names: Vec<String>,
     mount_points: Vec<String>,
 }
 
-/// Exercises denied raw syscalls only after successful isolation. The audited launcher has no
-/// probe ceremony, so this cannot authorize normal signing behavior.
-pub fn run_isolation_probe(attestation: &IsolationAttestationV1) -> Result<(), SignError> {
+/// Exercises denied raw syscalls only after successful isolation. The probe has no key mount and
+/// cannot authorize normal signing behavior.
+pub(crate) fn run_isolation_probe(isolation: &SignerIsolation) -> Result<(), SignError> {
+    let attestation = isolation.attestation();
     if attestation.mode != IsolationMode::IsolationProbe {
         return Err(rejected());
     }
-    let mut denied_errno = BTreeMap::new();
-    let probes: [(&str, i64, [usize; 3]); 13] = [
+    let mut inner_filter_errno = BTreeMap::new();
+    let probes: [(&str, i64, [usize; 3]); 16] = [
         (
             "socket",
             libc::SYS_socket,
@@ -579,6 +830,17 @@ pub fn run_isolation_probe(attestation: &IsolationAttestationV1) -> Result<(), S
         ),
         ("mount", libc::SYS_mount, [0, 0, 0]),
         ("umount2", libc::SYS_umount2, [0, 0, 0]),
+        ("io_uring_setup", libc::SYS_io_uring_setup, [1, 0, 0]),
+        (
+            "io_uring_enter",
+            libc::SYS_io_uring_enter,
+            [usize::MAX, 0, 0],
+        ),
+        (
+            "io_uring_register",
+            libc::SYS_io_uring_register,
+            [usize::MAX, 0, 0],
+        ),
     ];
     for (name, syscall, arguments) in probes {
         // SAFETY: the denied filter resolves before pointer arguments are dereferenced.
@@ -587,11 +849,15 @@ pub fn run_isolation_probe(attestation: &IsolationAttestationV1) -> Result<(), S
         if result != -1 || errno != libc::EPERM {
             return Err(rejected());
         }
-        denied_errno.insert(name.to_owned(), errno);
+        inner_filter_errno.insert(name.to_owned(), errno);
     }
     let report = ProbeReportV1 {
         schema_version: 1,
-        denied_errno,
+        launcher_prefilter_errno: attestation.launcher_prefilter_errno.clone(),
+        inner_filter_errno,
+        core_limit_soft: attestation.core_limit_soft,
+        core_limit_hard: attestation.core_limit_hard,
+        dumpable: attestation.dumpable,
         environment_names: attestation.environment_names.clone(),
         mount_points: attestation.mount_points.clone(),
     };
@@ -616,9 +882,8 @@ struct ReverseTransferEntryV1 {
     sha256: String,
 }
 
-pub fn emit_reverse_transfer_manifest(
-    attestation: &IsolationAttestationV1,
-) -> Result<(), SignError> {
+pub fn emit_reverse_transfer_manifest(isolation: &SignerIsolation) -> Result<(), SignError> {
+    let attestation = isolation.attestation();
     let expected_top = match attestation.mode {
         IsolationMode::AssembleIntent | IsolationMode::Finalize => "candidate.json",
         IsolationMode::Sign => "signed-release-bundle",
