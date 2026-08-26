@@ -7,9 +7,12 @@ import argparse
 import hashlib
 import io
 import json
+import lzma
 import os
 import stat
 import tarfile
+import tempfile
+import zlib
 from pathlib import Path
 from typing import Any, Callable
 
@@ -27,8 +30,10 @@ SOURCE_COMMIT = "2d5d104cec3c68b51469ca8ffa34642558fdfd67"
 
 MAX_SMALL_INPUT_BYTES = 1024 * 1024
 MAX_ARCHIVE_INPUT_BYTES = 64 * 1024 * 1024
+MAX_ARCHIVE_EXPANDED_BYTES = 512 * 1024 * 1024
 MAX_ARCHIVE_MEMBER_BYTES = 256 * 1024 * 1024
 MAX_ARCHIVE_MEMBERS = 32_768
+DECOMPRESSION_CHUNK_BYTES = 64 * 1024
 MAX_JSON_DEPTH = 64
 MAX_JSON_NODES = 100_000
 MAX_COLLECTION_MEMBERS = 10_000
@@ -134,20 +139,30 @@ def _require_public_directory(metadata: os.stat_result, label: str) -> None:
         raise ValueError(f"authenticated input directory policy mismatch: {label}")
 
 
+def _public_file_policy_matches(
+    metadata: os.stat_result,
+    expected_size: int,
+    maximum_size: int,
+    expected_owner: int,
+) -> bool:
+    return (
+        0 < expected_size <= maximum_size
+        and stat.S_ISREG(metadata.st_mode)
+        and metadata.st_uid == expected_owner
+        and metadata.st_nlink == 1
+        and stat.S_IMODE(metadata.st_mode) in SAFE_PUBLIC_FILE_MODES
+        and metadata.st_size == expected_size
+    )
+
+
 def _require_public_file(
     metadata: os.stat_result,
     expected_size: int,
     maximum_size: int,
     label: str,
 ) -> None:
-    if (
-        expected_size <= 0
-        or expected_size > maximum_size
-        or not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_uid != os.geteuid()
-        or metadata.st_nlink != 1
-        or stat.S_IMODE(metadata.st_mode) not in SAFE_PUBLIC_FILE_MODES
-        or metadata.st_size != expected_size
+    if not _public_file_policy_matches(
+        metadata, expected_size, maximum_size, os.geteuid()
     ):
         raise ValueError(f"authenticated input file policy mismatch: {label}")
 
@@ -265,7 +280,8 @@ class AuthenticatedInputRoot:
                 _require_public_file(
                     rebound_metadata, expected_size, maximum_size, relative
                 )
-                if _metadata_snapshot(before) != _metadata_snapshot(rebound_metadata):
+                retained_name_snapshot = _metadata_snapshot(rebound_metadata)
+                if _metadata_snapshot(before) != retained_name_snapshot:
                     raise ValueError(
                         f"authenticated input name changed while reading: {relative}"
                     )
@@ -278,7 +294,8 @@ class AuthenticatedInputRoot:
                 _require_public_file(
                     rebound_metadata, expected_size, maximum_size, relative
                 )
-                if _metadata_snapshot(before) != _metadata_snapshot(rebound_metadata):
+                full_path_snapshot = _metadata_snapshot(rebound_metadata)
+                if _metadata_snapshot(before) != full_path_snapshot:
                     raise ValueError(
                         f"authenticated input path changed while reading: {relative}"
                     )
@@ -393,6 +410,240 @@ def load_unique_relative(
     return parse_unique_object(data, relative), data
 
 
+def _write_expanded_chunk(
+    output: io.BufferedRandom,
+    chunk: bytes,
+    expanded_size: int,
+    maximum_expanded_bytes: int,
+    archive_label: str,
+) -> int:
+    expanded_size += len(chunk)
+    if expanded_size > maximum_expanded_bytes:
+        raise ValueError(f"archive expanded-byte bound exceeded: {archive_label}")
+    output.write(chunk)
+    return expanded_size
+
+
+def _decompress_gzip(
+    archive_bytes: bytes,
+    output: io.BufferedRandom,
+    maximum_expanded_bytes: int,
+    archive_label: str,
+) -> int:
+    decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    compressed_offset = 0
+    pending = b""
+    expanded_size = 0
+    while not decompressor.eof:
+        if pending:
+            compressed = pending
+        elif compressed_offset < len(archive_bytes):
+            compressed = archive_bytes[
+                compressed_offset : compressed_offset + DECOMPRESSION_CHUNK_BYTES
+            ]
+            compressed_offset += len(compressed)
+        else:
+            compressed = b""
+        maximum_output = min(
+            DECOMPRESSION_CHUNK_BYTES,
+            maximum_expanded_bytes - expanded_size + 1,
+        )
+        chunk = decompressor.decompress(compressed, maximum_output)
+        pending = decompressor.unconsumed_tail
+        expanded_size = _write_expanded_chunk(
+            output, chunk, expanded_size, maximum_expanded_bytes, archive_label
+        )
+        if not compressed and not pending and not chunk and not decompressor.eof:
+            raise ValueError(f"authenticated gzip archive is truncated: {archive_label}")
+    if decompressor.unused_data or pending or compressed_offset != len(archive_bytes):
+        raise ValueError(f"authenticated gzip archive has trailing data: {archive_label}")
+    return expanded_size
+
+
+def _decompress_xz(
+    archive_bytes: bytes,
+    output: io.BufferedRandom,
+    maximum_expanded_bytes: int,
+    archive_label: str,
+) -> int:
+    decompressor = lzma.LZMADecompressor(format=lzma.FORMAT_XZ)
+    compressed_offset = 0
+    expanded_size = 0
+    while not decompressor.eof:
+        if decompressor.needs_input:
+            if compressed_offset >= len(archive_bytes):
+                raise ValueError(f"authenticated XZ archive is truncated: {archive_label}")
+            compressed = archive_bytes[
+                compressed_offset : compressed_offset + DECOMPRESSION_CHUNK_BYTES
+            ]
+            compressed_offset += len(compressed)
+        else:
+            compressed = b""
+        maximum_output = min(
+            DECOMPRESSION_CHUNK_BYTES,
+            maximum_expanded_bytes - expanded_size + 1,
+        )
+        chunk = decompressor.decompress(compressed, max_length=maximum_output)
+        expanded_size = _write_expanded_chunk(
+            output, chunk, expanded_size, maximum_expanded_bytes, archive_label
+        )
+    if decompressor.unused_data or compressed_offset != len(archive_bytes):
+        raise ValueError(f"authenticated XZ archive has trailing data: {archive_label}")
+    return expanded_size
+
+
+def _decompress_archive_to_temporary(
+    archive_bytes: bytes,
+    archive_label: str,
+    maximum_expanded_bytes: int,
+) -> tuple[io.BufferedRandom, int]:
+    if not 0 < maximum_expanded_bytes <= MAX_ARCHIVE_EXPANDED_BYTES:
+        raise ValueError(f"archive expanded-byte bound is invalid: {archive_label}")
+    output = tempfile.TemporaryFile(mode="w+b")
+    try:
+        os.fchmod(output.fileno(), 0o600)
+        if archive_bytes.startswith(b"\x1f\x8b"):
+            expanded_size = _decompress_gzip(
+                archive_bytes, output, maximum_expanded_bytes, archive_label
+            )
+        elif archive_bytes.startswith(b"\xfd7zXZ\x00"):
+            expanded_size = _decompress_xz(
+                archive_bytes, output, maximum_expanded_bytes, archive_label
+            )
+        else:
+            raise ValueError(f"authenticated archive compression is unsupported: {archive_label}")
+        if expanded_size <= 0:
+            raise ValueError(f"authenticated archive is empty: {archive_label}")
+        output.flush()
+        output.seek(0)
+        return output, expanded_size
+    except Exception:
+        output.close()
+        raise
+
+
+def _tar_header_size(header: bytes, archive_label: str) -> int:
+    try:
+        size = tarfile.nti(header[124:136])
+    except (tarfile.InvalidHeaderError, ValueError) as error:
+        raise ValueError(f"archive member size is invalid: {archive_label}") from error
+    if not isinstance(size, int) or size < 0:
+        raise ValueError(f"archive member size is invalid: {archive_label}")
+    return size
+
+
+def _validate_raw_tar_placement(
+    expanded: io.BufferedRandom,
+    expanded_size: int,
+    maximum_expanded_bytes: int,
+    maximum_member_bytes: int,
+    maximum_members: int,
+    archive_label: str,
+) -> None:
+    offset = 0
+    member_count = 0
+    data_types = frozenset(
+        (
+            tarfile.REGTYPE,
+            tarfile.AREGTYPE,
+            tarfile.CONTTYPE,
+            tarfile.XHDTYPE,
+            tarfile.XGLTYPE,
+            tarfile.GNUTYPE_LONGNAME,
+            tarfile.GNUTYPE_LONGLINK,
+        )
+    )
+    no_data_types = frozenset(
+        (
+            tarfile.LNKTYPE,
+            tarfile.SYMTYPE,
+            tarfile.CHRTYPE,
+            tarfile.BLKTYPE,
+            tarfile.DIRTYPE,
+            tarfile.FIFOTYPE,
+        )
+    )
+    while offset < expanded_size:
+        if offset % tarfile.BLOCKSIZE != 0 or offset + tarfile.BLOCKSIZE > expanded_size:
+            raise ValueError(f"archive member offset is invalid: {archive_label}")
+        expanded.seek(offset)
+        header = expanded.read(tarfile.BLOCKSIZE)
+        if len(header) != tarfile.BLOCKSIZE:
+            raise ValueError(f"archive member header is truncated: {archive_label}")
+        if header == tarfile.NUL * tarfile.BLOCKSIZE:
+            while True:
+                trailing = expanded.read(DECOMPRESSION_CHUNK_BYTES)
+                if not trailing:
+                    return
+                if trailing.strip(tarfile.NUL):
+                    raise ValueError(f"archive has data after its end marker: {archive_label}")
+        member_count += 1
+        if member_count > maximum_members:
+            raise ValueError(f"archive member bound exceeded: {archive_label}")
+        size = _tar_header_size(header, archive_label)
+        if size > maximum_member_bytes:
+            raise ValueError(f"archive member size bound exceeded: {archive_label}")
+        typeflag = header[156:157]
+        if typeflag in no_data_types:
+            if size != 0:
+                raise ValueError(f"archive member type has invalid size: {archive_label}")
+        elif typeflag not in data_types:
+            raise ValueError(f"archive member type is unsupported: {archive_label}")
+        data_offset = offset + tarfile.BLOCKSIZE
+        padded_size = (size + tarfile.BLOCKSIZE - 1) // tarfile.BLOCKSIZE * tarfile.BLOCKSIZE
+        padded_end = data_offset + padded_size
+        if (
+            data_offset > expanded_size
+            or padded_end > expanded_size
+            or padded_end > maximum_expanded_bytes
+        ):
+            raise ValueError(f"archive member placement exceeds bound: {archive_label}")
+        offset = padded_end
+
+
+def _validate_yielded_member(
+    member: tarfile.TarInfo,
+    previous_padded_end: int,
+    expanded_size: int,
+    maximum_expanded_bytes: int,
+    maximum_member_bytes: int,
+    archive_label: str,
+) -> int:
+    if (
+        type(member.size) is not int
+        or type(member.offset) is not int
+        or type(member.offset_data) is not int
+        or member.size < 0
+        or member.size > maximum_member_bytes
+        or member.offset < previous_padded_end
+        or member.offset % tarfile.BLOCKSIZE != 0
+        or member.offset_data < member.offset + tarfile.BLOCKSIZE
+        or member.offset_data % tarfile.BLOCKSIZE != 0
+    ):
+        raise ValueError(f"archive yielded member metadata is invalid: {archive_label}")
+    if not (
+        member.isfile()
+        or member.isdir()
+        or member.issym()
+        or member.islnk()
+        or member.ischr()
+        or member.isblk()
+        or member.isfifo()
+    ):
+        raise ValueError(f"archive yielded member type is unsupported: {archive_label}")
+    if not member.isfile() and member.size != 0:
+        raise ValueError(f"archive yielded member type has invalid size: {archive_label}")
+    padded_size = (
+        (member.size + tarfile.BLOCKSIZE - 1)
+        // tarfile.BLOCKSIZE
+        * tarfile.BLOCKSIZE
+    )
+    padded_end = member.offset_data + padded_size
+    if padded_end > expanded_size or padded_end > maximum_expanded_bytes:
+        raise ValueError(f"archive yielded member placement exceeds bound: {archive_label}")
+    return padded_end
+
+
 def require_regular_member(
     archive_bytes: bytes,
     archive_label: str,
@@ -401,6 +652,10 @@ def require_regular_member(
     member_name: str,
     expected_member_size: int,
     expected_member_sha256: str,
+    *,
+    maximum_expanded_bytes: int = MAX_ARCHIVE_EXPANDED_BYTES,
+    maximum_member_bytes: int = MAX_ARCHIVE_MEMBER_BYTES,
+    maximum_members: int = MAX_ARCHIVE_MEMBERS,
 ) -> bytes:
     if (
         expected_archive_size <= 0
@@ -408,34 +663,58 @@ def require_regular_member(
         or len(archive_bytes) != expected_archive_size
         or sha256(archive_bytes) != expected_archive_sha256
         or expected_member_size <= 0
-        or expected_member_size > MAX_ARCHIVE_MEMBER_BYTES
+        or expected_member_size > maximum_member_bytes
+        or not 0 < maximum_member_bytes <= MAX_ARCHIVE_MEMBER_BYTES
+        or not 0 < maximum_members <= MAX_ARCHIVE_MEMBERS
     ):
         raise ValueError(f"authenticated archive mismatch: {archive_label}")
-    with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:*") as opened:
-        matched = None
-        member_count = 0
-        for member in opened:
-            member_count += 1
-            if member_count > MAX_ARCHIVE_MEMBERS:
-                raise ValueError(f"archive member bound exceeded: {archive_label}")
-            if member.name == member_name:
-                if matched is not None:
-                    raise ValueError(f"required archive member is not unique: {member_name}")
-                matched = member
-        if matched is None:
-            raise ValueError(f"required archive member is not unique: {member_name}")
-        if (
-            not matched.isfile()
-            or matched.issym()
-            or matched.islnk()
-            or matched.size != expected_member_size
-        ):
-            raise ValueError(f"required archive member is not regular: {member_name}")
-        extracted = opened.extractfile(matched)
-        if extracted is None:
-            raise ValueError(f"required archive member cannot be read: {member_name}")
-        data = extracted.read(expected_member_size)
-        probe = extracted.read(1)
+    expanded, expanded_size = _decompress_archive_to_temporary(
+        archive_bytes, archive_label, maximum_expanded_bytes
+    )
+    with expanded:
+        _validate_raw_tar_placement(
+            expanded,
+            expanded_size,
+            maximum_expanded_bytes,
+            maximum_member_bytes,
+            maximum_members,
+            archive_label,
+        )
+        expanded.seek(0)
+        with tarfile.open(fileobj=expanded, mode="r:") as opened:
+            matched = None
+            member_count = 0
+            previous_padded_end = 0
+            for member in opened:
+                member_count += 1
+                if member_count > maximum_members:
+                    raise ValueError(f"archive member bound exceeded: {archive_label}")
+                previous_padded_end = _validate_yielded_member(
+                    member,
+                    previous_padded_end,
+                    expanded_size,
+                    maximum_expanded_bytes,
+                    maximum_member_bytes,
+                    archive_label,
+                )
+                if member.name == member_name:
+                    if matched is not None:
+                        raise ValueError(f"required archive member is not unique: {member_name}")
+                    matched = member
+            if matched is None:
+                raise ValueError(f"required archive member is not unique: {member_name}")
+            if (
+                not matched.isfile()
+                or matched.issym()
+                or matched.islnk()
+                or matched.size != expected_member_size
+            ):
+                raise ValueError(f"required archive member is not regular: {member_name}")
+            extracted = opened.extractfile(matched)
+            if extracted is None:
+                raise ValueError(f"required archive member cannot be read: {member_name}")
+            data = extracted.read(expected_member_size)
+            probe = extracted.read(1)
     if (
         len(data) != expected_member_size
         or probe

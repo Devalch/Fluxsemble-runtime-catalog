@@ -25,7 +25,9 @@ const ED25519_PRIVATE_KEY_INFO_PREFIX: [u8; 16] = [
 ];
 
 #[cfg(test)]
-static KEY_OPEN_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+std::thread_local! {
+    static KEY_OPEN_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// Local zeroizable wrapper. Dalek zeroizes its secret on drop; replacement makes that drop
 /// happen when `Zeroizing` invokes this wrapper's `Zeroize` implementation.
@@ -84,7 +86,7 @@ fn read_signing_key_for_identity(
 ) -> Result<Zeroizing<SigningKey>, SignError> {
     validate_key_path(path)?;
     #[cfg(test)]
-    KEY_OPEN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    KEY_OPEN_COUNT.set(KEY_OPEN_COUNT.get() + 1);
 
     let mut file = open_key(path)?;
     let before = MetadataFacts::from_metadata(&file.metadata().map_err(|_| rejected())?);
@@ -378,12 +380,12 @@ pub(crate) fn fixture_signing_key_for_test() -> Zeroizing<SigningKey> {
 
 #[cfg(test)]
 pub(crate) fn key_open_count() -> usize {
-    KEY_OPEN_COUNT.load(std::sync::atomic::Ordering::SeqCst)
+    KEY_OPEN_COUNT.get()
 }
 
 #[cfg(test)]
 pub(crate) fn reset_key_open_count() {
-    KEY_OPEN_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+    KEY_OPEN_COUNT.set(0);
 }
 
 #[cfg(test)]
@@ -507,6 +509,42 @@ mod tests {
             0o600,
         );
         assert!(read_signing_key_for_identity(&oversized, fixture_identity(), || {}).is_err());
+    }
+
+    #[test]
+    fn key_open_instrumentation_is_isolated_between_executing_test_threads() {
+        reset_key_open_count();
+        let temp = TempDirectory::new();
+        let path = temp.write("thread-isolated.pem", FIXTURE, 0o600);
+        let (opened_sender, opened_receiver) = std::sync::mpsc::channel();
+        let (reset_sender, reset_receiver) = std::sync::mpsc::channel();
+
+        let reader = std::thread::spawn(move || {
+            reset_key_open_count();
+            assert_eq!(key_open_count(), 0);
+            assert!(read_signing_key_for_identity(&path, fixture_identity(), || {}).is_ok());
+            assert_eq!(key_open_count(), 1);
+            opened_sender.send(()).unwrap();
+            reset_receiver.recv().unwrap();
+            assert_eq!(
+                key_open_count(),
+                1,
+                "another test thread altered this thread's key-open count"
+            );
+        });
+        opened_receiver.recv().unwrap();
+        let resetter = std::thread::spawn(|| {
+            reset_key_open_count();
+            assert_eq!(key_open_count(), 0);
+        });
+        resetter.join().unwrap();
+        reset_sender.send(()).unwrap();
+        reader.join().unwrap();
+        assert_eq!(
+            key_open_count(),
+            0,
+            "worker-thread key reads leaked into the executing test thread"
+        );
     }
 
     #[test]

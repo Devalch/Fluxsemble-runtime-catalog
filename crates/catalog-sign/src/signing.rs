@@ -3672,7 +3672,7 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_corpus_reader_rejects_links_fifo_oversize_and_replacement() {
+    fn authenticated_corpus_reader_enforces_complete_file_and_capability_policy() {
         use std::os::unix::fs::symlink;
 
         let root = TempDirectory::new();
@@ -3687,11 +3687,30 @@ mod tests {
         let regular = root.path.join("regular.bin");
         fs::write(&regular, bytes).unwrap();
         fs::set_permissions(&regular, fs::Permissions::from_mode(0o644)).unwrap();
+        let regular_metadata = regular.metadata().unwrap();
+        assert!(secure_public_corpus_file_for_owner(
+            &regular_metadata,
+            current_euid()
+        ));
+        assert!(
+            !secure_public_corpus_file_for_owner(&regular_metadata, current_euid().wrapping_add(1)),
+            "a deterministic synthetic foreign owner satisfied the corpus policy"
+        );
         assert_eq!(
             corpus
                 .read_object("regular.bin", bytes.len() as u64, &digest)
                 .unwrap(),
             bytes
+        );
+        assert!(
+            corpus
+                .read_object("regular.bin", bytes.len() as u64 - 1, &digest)
+                .is_err()
+        );
+        assert!(
+            corpus
+                .read_object("regular.bin", bytes.len() as u64, &sha256(b"wrong"))
+                .is_err()
         );
 
         symlink("regular.bin", root.path.join("linked.bin")).unwrap();
@@ -3725,12 +3744,15 @@ mod tests {
                 .is_err()
         );
         fs::remove_file(root.path.join("hard-linked.bin")).unwrap();
-        fs::set_permissions(&regular, fs::Permissions::from_mode(0o666)).unwrap();
-        assert!(
-            corpus
-                .read_object("regular.bin", bytes.len() as u64, &digest)
-                .is_err()
-        );
+        for mode in [0o000, 0o440, 0o666, 0o700, 0o1000, 0o2644] {
+            fs::set_permissions(&regular, fs::Permissions::from_mode(mode)).unwrap();
+            assert!(
+                corpus
+                    .read_object("regular.bin", bytes.len() as u64, &digest)
+                    .is_err(),
+                "accepted mode {mode:o}"
+            );
+        }
         fs::set_permissions(&regular, fs::Permissions::from_mode(0o644)).unwrap();
 
         let fifo_name = CString::new(root.path.join("object.fifo").as_os_str().as_bytes()).unwrap();
@@ -3755,6 +3777,53 @@ mod tests {
                 .is_err()
         );
 
+        let changed = root.path.join("changed-during-read.bin");
+        fs::write(&changed, bytes).unwrap();
+        fs::set_permissions(&changed, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            corpus
+                .read_object_with_checkpoints(
+                    "changed-during-read.bin",
+                    bytes.len() as u64,
+                    &digest,
+                    || {},
+                    || {
+                        fs::set_permissions(&changed, fs::Permissions::from_mode(0o600)).unwrap();
+                        fs::set_permissions(&changed, fs::Permissions::from_mode(0o644)).unwrap();
+                    },
+                    || {},
+                    || {},
+                )
+                .is_err(),
+            "pre/post descriptor identity mutation was accepted"
+        );
+
+        let growth = root.path.join("growth.bin");
+        fs::write(&growth, bytes).unwrap();
+        fs::set_permissions(&growth, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            corpus
+                .read_object_with_checkpoints(
+                    "growth.bin",
+                    bytes.len() as u64,
+                    &digest,
+                    || {
+                        use std::io::Write as _;
+                        fs::OpenOptions::new()
+                            .append(true)
+                            .open(&growth)
+                            .unwrap()
+                            .write_all(b"!")
+                            .unwrap();
+                    },
+                    || {},
+                    || {},
+                    || {},
+                )
+                .is_err(),
+            "bounded one-byte excess probe accepted file growth"
+        );
+
         let replace = root.path.join("replace.bin");
         let displaced = root.path.join("displaced.bin");
         fs::write(&replace, bytes).unwrap();
@@ -3766,7 +3835,41 @@ mod tests {
                     fs::write(&replace, bytes).unwrap();
                     fs::set_permissions(&replace, fs::Permissions::from_mode(0o644)).unwrap();
                 },)
-                .is_err()
+                .is_err(),
+            "retained final-name identity mutation was accepted"
+        );
+
+        let nested = root.path.join("full-relative");
+        let moved_nested = root.path.join("moved-full-relative");
+        fs::create_dir(&nested).unwrap();
+        fs::write(nested.join("replace.bin"), bytes).unwrap();
+        fs::set_permissions(
+            nested.join("replace.bin"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        assert!(
+            corpus
+                .read_object_with_checkpoints(
+                    "full-relative/replace.bin",
+                    bytes.len() as u64,
+                    &digest,
+                    || {},
+                    || {},
+                    || {},
+                    || {
+                        fs::rename(&nested, &moved_nested).unwrap();
+                        fs::create_dir(&nested).unwrap();
+                        fs::write(nested.join("replace.bin"), bytes).unwrap();
+                        fs::set_permissions(
+                            nested.join("replace.bin"),
+                            fs::Permissions::from_mode(0o644),
+                        )
+                        .unwrap();
+                    },
+                )
+                .is_err(),
+            "full-relative-path identity mutation was accepted"
         );
     }
 
@@ -4271,6 +4374,12 @@ mod tests {
         root: fs::File,
     }
 
+    struct OpenedCorpusObject {
+        file: fs::File,
+        parent: fs::File,
+        final_name: CString,
+    }
+
     impl AuthenticatedCorpus {
         fn open(path: &Path) -> Result<Self, SignError> {
             if !is_absolute_bounded_path(path) {
@@ -4290,7 +4399,15 @@ mod tests {
             expected_size: u64,
             expected_sha256: &str,
         ) -> Result<Vec<u8>, SignError> {
-            self.read_object_with_checkpoint(relative, expected_size, expected_sha256, || {})
+            self.read_object_with_checkpoints(
+                relative,
+                expected_size,
+                expected_sha256,
+                || {},
+                || {},
+                || {},
+                || {},
+            )
         }
 
         fn read_object_with_checkpoint(
@@ -4298,7 +4415,29 @@ mod tests {
             relative: &str,
             expected_size: u64,
             expected_sha256: &str,
-            checkpoint: impl FnOnce(),
+            before_retained_name_rebind: impl FnOnce(),
+        ) -> Result<Vec<u8>, SignError> {
+            self.read_object_with_checkpoints(
+                relative,
+                expected_size,
+                expected_sha256,
+                || {},
+                || {},
+                before_retained_name_rebind,
+                || {},
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn read_object_with_checkpoints(
+            &self,
+            relative: &str,
+            expected_size: u64,
+            expected_sha256: &str,
+            before_read: impl FnOnce(),
+            after_read: impl FnOnce(),
+            before_retained_name_rebind: impl FnOnce(),
+            before_full_path_rebind: impl FnOnce(),
         ) -> Result<Vec<u8>, SignError> {
             if !safe_relative(relative)
                 || expected_size == 0
@@ -4307,17 +4446,23 @@ mod tests {
             {
                 return Err(bundle_rejected());
             }
-            let mut file = self.open_relative(relative)?;
+            let OpenedCorpusObject {
+                mut file,
+                parent,
+                final_name,
+            } = self.open_relative_with_parent(relative)?;
             let before = file.metadata().map_err(|_| bundle_rejected())?;
             if !secure_public_corpus_file(&before) || before.len() != expected_size {
                 return Err(bundle_rejected());
             }
             let before = PublicCorpusMetadata::from_metadata(&before);
+            before_read();
             let mut bytes = Vec::with_capacity(expected_size as usize);
             (&mut file)
                 .take(expected_size + 1)
                 .read_to_end(&mut bytes)
                 .map_err(|_| bundle_rejected())?;
+            after_read();
             let after = file.metadata().map_err(|_| bundle_rejected())?;
             if bytes.len() as u64 != expected_size
                 || PublicCorpusMetadata::from_metadata(&after) != before
@@ -4325,16 +4470,70 @@ mod tests {
             {
                 return Err(bundle_rejected());
             }
-            checkpoint();
-            let rebound = self.open_relative(relative)?;
-            let rebound = rebound.metadata().map_err(|_| bundle_rejected())?;
-            if !secure_public_corpus_file(&rebound)
-                || rebound.len() != expected_size
-                || PublicCorpusMetadata::from_metadata(&rebound) != before
+
+            before_retained_name_rebind();
+            let retained_name = openat2(
+                parent.as_raw_fd(),
+                &final_name,
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK,
+                // RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH.
+                0x02 | 0x04 | 0x08,
+            )?;
+            let retained_name = retained_name.metadata().map_err(|_| bundle_rejected())?;
+            if !secure_public_corpus_file(&retained_name)
+                || retained_name.len() != expected_size
+                || PublicCorpusMetadata::from_metadata(&retained_name) != before
+            {
+                return Err(bundle_rejected());
+            }
+
+            before_full_path_rebind();
+            let full_path = self.open_relative(relative)?;
+            let full_path = full_path.metadata().map_err(|_| bundle_rejected())?;
+            if !secure_public_corpus_file(&full_path)
+                || full_path.len() != expected_size
+                || PublicCorpusMetadata::from_metadata(&full_path) != before
             {
                 return Err(bundle_rejected());
             }
             Ok(bytes)
+        }
+
+        fn open_relative_with_parent(
+            &self,
+            relative: &str,
+        ) -> Result<OpenedCorpusObject, SignError> {
+            if !safe_relative(relative) {
+                return Err(bundle_rejected());
+            }
+            let (parent_name, final_name) = relative
+                .rsplit_once('/')
+                .map_or((None, relative), |(parent, name)| (Some(parent), name));
+            let parent = if let Some(parent_name) = parent_name {
+                let parent_name = CString::new(parent_name).map_err(|_| bundle_rejected())?;
+                openat2(
+                    self.root.as_raw_fd(),
+                    &parent_name,
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                    // RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH.
+                    0x02 | 0x04 | 0x08,
+                )?
+            } else {
+                self.root.try_clone().map_err(|_| bundle_rejected())?
+            };
+            let final_name = CString::new(final_name).map_err(|_| bundle_rejected())?;
+            let file = openat2(
+                parent.as_raw_fd(),
+                &final_name,
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK,
+                // RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH.
+                0x02 | 0x04 | 0x08,
+            )?;
+            Ok(OpenedCorpusObject {
+                file,
+                parent,
+                final_name,
+            })
         }
 
         fn open_relative(&self, relative: &str) -> Result<fs::File, SignError> {
@@ -4384,16 +4583,27 @@ mod tests {
     }
 
     fn secure_public_corpus_directory(metadata: &fs::Metadata) -> bool {
+        secure_public_corpus_directory_for_owner(metadata, current_euid())
+    }
+
+    fn secure_public_corpus_directory_for_owner(
+        metadata: &fs::Metadata,
+        expected_owner: u32,
+    ) -> bool {
         metadata.is_dir()
             && !metadata.file_type().is_symlink()
-            && metadata.uid() == current_euid()
+            && metadata.uid() == expected_owner
             && matches!(metadata.permissions().mode() & 0o7777, 0o700 | 0o755)
     }
 
     fn secure_public_corpus_file(metadata: &fs::Metadata) -> bool {
+        secure_public_corpus_file_for_owner(metadata, current_euid())
+    }
+
+    fn secure_public_corpus_file_for_owner(metadata: &fs::Metadata, expected_owner: u32) -> bool {
         metadata.is_file()
             && !metadata.file_type().is_symlink()
-            && metadata.uid() == current_euid()
+            && metadata.uid() == expected_owner
             && metadata.nlink() == 1
             && matches!(
                 metadata.permissions().mode() & 0o7777,
