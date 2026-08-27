@@ -16,10 +16,8 @@ use sha2::{Digest, Sha256};
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const FIXTURE_KEY_ID: &str = "catalog-test-key-v1";
-const FIXTURE_SEED: [u8; 32] = [
-    0x4b, 0xf6, 0x2d, 0x9f, 0x4c, 0x1e, 0x87, 0x47, 0x74, 0x1a, 0x66, 0x17, 0x2a, 0xdb, 0x23, 0x55,
-    0xcd, 0x17, 0xf4, 0xf2, 0x55, 0xd8, 0x22, 0xde, 0xab, 0x7d, 0xb3, 0x94, 0x61, 0xdb, 0xb6, 0x65,
-];
+const FIXTURE_PKCS8: &[u8] =
+    include_bytes!("../../../catalog-sign/tests/fixtures/nonproduction-ed25519-pkcs8.pem");
 
 pub struct TempTree(pub PathBuf);
 
@@ -54,7 +52,7 @@ pub fn fixture_transfer(root: &Path, sequence: u64, support: &[u8]) {
     fs::DirBuilder::new().mode(0o700).create(root).unwrap();
     fs::DirBuilder::new().mode(0o700).create(&bundle).unwrap();
 
-    let signing_key = SigningKey::from_bytes(&FIXTURE_SEED);
+    let signing_key = fixture_signing_key();
     let payload_source = include_bytes!("../../../../conformance/catalog-v1/valid-payload.json");
     let mut payload_value: Value = serde_json::from_slice(payload_source).unwrap();
     payload_value["sequence"] = json!(sequence.to_string());
@@ -185,6 +183,49 @@ pub fn fixture_transfer(root: &Path, sequence: u64, support: &[u8]) {
     let path = root.join("transfer-manifest-v1.json");
     fs::write(&path, transfer).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o400)).unwrap();
+}
+
+fn fixture_signing_key() -> SigningKey {
+    const BEGIN: &[u8] = b"-----BEGIN PRIVATE KEY-----\n";
+    const END: &[u8] = b"\n-----END PRIVATE KEY-----\n";
+    const DER_PREFIX: [u8; 16] = [
+        0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04,
+        0x20,
+    ];
+
+    let body = FIXTURE_PKCS8
+        .strip_prefix(BEGIN)
+        .and_then(|bytes| bytes.strip_suffix(END))
+        .expect("canonical fixture PKCS#8 PEM");
+    assert_eq!(body.len(), 64);
+    let mut der = [0_u8; 48];
+    for (input, output) in body.chunks_exact(4).zip(der.chunks_exact_mut(3)) {
+        let a = standard_base64_value(input[0]);
+        let b = standard_base64_value(input[1]);
+        let c = standard_base64_value(input[2]);
+        let d = standard_base64_value(input[3]);
+        output[0] = (a << 2) | (b >> 4);
+        output[1] = (b << 4) | (c >> 2);
+        output[2] = (c << 6) | d;
+    }
+    assert_eq!(der[..DER_PREFIX.len()], DER_PREFIX);
+    let mut seed = [0_u8; 32];
+    seed.copy_from_slice(&der[DER_PREFIX.len()..]);
+    let key = SigningKey::from_bytes(&seed);
+    seed.fill(0);
+    der.fill(0);
+    key
+}
+
+fn standard_base64_value(byte: u8) -> u8 {
+    match byte {
+        b'A'..=b'Z' => byte - b'A',
+        b'a'..=b'z' => byte - b'a' + 26,
+        b'0'..=b'9' => byte - b'0' + 52,
+        b'+' => 62,
+        b'/' => 63,
+        _ => panic!("noncanonical fixture PKCS#8 PEM"),
+    }
 }
 
 pub fn private_directory(path: &Path) {

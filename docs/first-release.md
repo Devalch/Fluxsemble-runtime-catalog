@@ -45,8 +45,8 @@ The production static `catalog-sign 0.1.0` executable used for keyless assembly 
 
 The exact candidate is also carried in a nonproduction fixture envelope whose key ID is exactly `catalog-test-key-v1`. Fixture verification accepts it; production verification rejects it.
 
-- Fixture envelope: 55,994 bytes, SHA-256 `036191a94f62afe8a7a547790b1c9d4c54a7c277dc76bfae191601dea5738cac`.
-- Conformance manifest: 743 bytes, SHA-256 `91618c929ef725673435347ad9fc3122f338c14030f12e4b90c17618f5d55757`.
+- Fixture envelope: 55,994 bytes, SHA-256 `e5e239bf4b3c10841ffc3105f7788782b3376289be3e17b3ae82cef8081d972f`.
+- Conformance manifest: 743 bytes, SHA-256 `fc9808c8228ed4cfeddbab96fb0f0327a8e1eb672c82df230ca021f14f840b7a`.
 - Support asset `pi-package-e02deae1cec07035807436c1864c88342e2f7d49050d03b858a3719f0c7aedbf.json` uses its immutable sequence tag URL and exact 3,560-byte digest-bound bytes.
 - Support asset `pi-shrinkwrap-9a17a6b9ba0a57b37773644f7945b1bf0bc10aa8923b87233fee6f75af1e1772.json` uses its immutable sequence tag URL and exact 61,540-byte digest-bound bytes.
 

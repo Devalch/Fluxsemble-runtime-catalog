@@ -135,7 +135,7 @@ fn manifest_value() -> Value {
             }
         ],
         "signature": {
-            "key_id": "catalog-test-key-v1",
+            "key_id": "catalog-unit-test-key-bundle-v1",
             "signature": "fixture-signature"
         }
     })

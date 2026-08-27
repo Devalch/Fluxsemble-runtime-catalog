@@ -1465,10 +1465,10 @@ subprocess.run(
 )
 production_binary = Path("target/debug/catalog-publish").read_bytes()
 fixture_public_key = bytes([
-    0x1B, 0xD3, 0x6A, 0xFE, 0xE9, 0x32, 0x3F, 0x1E,
-    0x38, 0x13, 0xF6, 0x8C, 0x4D, 0x5F, 0x2F, 0x2B,
-    0x1B, 0xAE, 0x44, 0xC0, 0xEF, 0x69, 0x17, 0x62,
-    0x8E, 0xD6, 0xAF, 0xE1, 0x6A, 0xAE, 0x44, 0xA9,
+    0x03, 0xA1, 0x07, 0xBF, 0xF3, 0xCE, 0x10, 0xBE,
+    0x1D, 0x70, 0xDD, 0x18, 0xE7, 0x4B, 0xC0, 0x99,
+    0x67, 0xE4, 0xD6, 0x30, 0x9B, 0xA5, 0x0D, 0x5F,
+    0x1D, 0xDC, 0x86, 0x64, 0x12, 0x55, 0x31, 0xB8,
 ])
 for forbidden in [
     b"catalog-test-key-v1",
@@ -3000,7 +3000,7 @@ def task11_errors(source, names, regular_identities):
             errors.append("candidate is not the exact intent projection")
     if len(source["payload"]) != 55797 or digest(source["payload"]) != "7dba62c8b44883cbd7b3615fd9fe3b1a08a3aa2c75c7729704c14804d1cc2a2b":
         errors.append("candidate frozen digest changed")
-    if not isinstance(envelope, dict) or envelope.get("key_id") != "catalog-test-key-v1" or envelope.get("payload") != payload or len(source["envelope"]) != 55994 or digest(source["envelope"]) != "036191a94f62afe8a7a547790b1c9d4c54a7c277dc76bfae191601dea5738cac":
+    if not isinstance(envelope, dict) or envelope.get("key_id") != "catalog-test-key-v1" or envelope.get("payload") != payload or len(source["envelope"]) != 55994 or digest(source["envelope"]) != "e5e239bf4b3c10841ffc3105f7788782b3376289be3e17b3ae82cef8081d972f":
         errors.append("fixture envelope relation changed")
     expected_entries = []
     for name in ["initial-exact-candidate-envelope.json", "initial-exact-candidate-payload.json", "rejected-fields.json", "valid-envelope.json", "valid-payload.json"]:
@@ -3124,5 +3124,284 @@ for basename in sorted(SUPPORT_BASENAMES):
         dict(current), list(tracked) + [virtual_path], virtual_identities
     ):
         print(f"tracked deterministic support-basename mutation was accepted: {basename}", file=sys.stderr)
+        sys.exit(1)
+PY
+
+python3 - <<'PY'
+from pathlib import Path
+import base64
+import hashlib
+import json
+import re
+import subprocess
+import sys
+
+EXPECTED_PUBLIC = bytes.fromhex(
+    "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8"
+)
+OLD_PUBLIC = bytes.fromhex(
+    "1bd36afee9323f1e3813f68c4d5f2f2b1bae44c0ef6917628ed6afe16aae44a9"
+)
+PEM_PATH = "crates/catalog-sign/tests/fixtures/nonproduction-ed25519-pkcs8.pem"
+EXPECTED_DIGESTS = {
+    "initial_envelope": "e5e239bf4b3c10841ffc3105f7788782b3376289be3e17b3ae82cef8081d972f",
+    "valid_envelope": "716c57e3e361c3f0bcf50ad9eb8c9152eabfa2f0d25fb0dd61430e048616fcc4",
+    "manifest": "fc9808c8228ed4cfeddbab96fb0f0327a8e1eb672c82df230ca021f14f840b7a",
+    "initial_payload": "7dba62c8b44883cbd7b3615fd9fe3b1a08a3aa2c75c7729704c14804d1cc2a2b",
+    "valid_payload": "f3e1b4e54a283158c9328ef3f5ffd2dbdb9c441fb4720040e2b7743aec14b640",
+    "rejected": "dd4d3dfd78312bc02b43d0b7b6766941742ced42c897bd086cf8cf15d4f1bcb4",
+    "pem": "b859bbad04b8b7cfb16533d1e3bfb1ae091adefddad8c7272b59380bae231841",
+}
+PATHS = {
+    "core": "crates/catalog-core/src/signature.rs",
+    "key": "crates/catalog-sign/src/key.rs",
+    "signing": "crates/catalog-sign/src/signing.rs",
+    "launcher_test": "crates/catalog-sign/tests/launcher_contract.rs",
+    "publish_support": "crates/catalog-publish/tests/support/mod.rs",
+    "cross_test": "crates/catalog-core/tests/conformance_fixture_identity.rs",
+    "generator": "crates/catalog-sign/examples/sign-fixture.rs",
+    "correction_docs": "docs/conformance-v2-correction.md",
+    "first_release": "docs/first-release.md",
+    "initial_envelope": "conformance/catalog-v1/initial-exact-candidate-envelope.json",
+    "valid_envelope": "conformance/catalog-v1/valid-envelope.json",
+    "manifest": "conformance/catalog-v1/manifest-v1.json",
+    "initial_payload": "conformance/catalog-v1/initial-exact-candidate-payload.json",
+    "valid_payload": "conformance/catalog-v1/valid-payload.json",
+    "rejected": "conformance/catalog-v1/rejected-fields.json",
+    "pem": PEM_PATH,
+}
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def arrays(source, name):
+    pattern = re.compile(rf"const\s+{re.escape(name)}[^=]*=\s*\[(.*?)\];", re.DOTALL)
+    return [bytes(int(value, 16) for value in re.findall(r"0x([0-9a-fA-F]{2})", body)) for body in pattern.findall(source)]
+
+
+def fixture_identity_errors(source, tags, virtual_files=()):
+    errors = []
+    text = {name: data.decode("utf-8") for name, data in source.items() if name not in {
+        "initial_envelope", "valid_envelope", "manifest", "initial_payload", "valid_payload", "rejected", "pem"
+    }}
+
+    if arrays(text["core"], "FIXTURE_PUBLIC_KEY") != [EXPECTED_PUBLIC]:
+        errors.append("catalog-core fixture identity differs from Flux authority")
+    if arrays(text["key"], "FIXTURE_PUBLIC") != [EXPECTED_PUBLIC, EXPECTED_PUBLIC]:
+        errors.append("fixture key readers do not pin the shared public key")
+    if arrays(text["signing"], "FIXTURE_PUBLIC_KEY") != [EXPECTED_PUBLIC]:
+        errors.append("fixture release verifier differs from shared public key")
+    launcher_region = text["launcher_test"].split("fn fixture_public_key()", 1)[-1].split("fn decode_signature", 1)[0]
+    launcher_values = bytes(int(value, 16) for value in re.findall(r"0x([0-9a-fA-F]{2})", launcher_region))
+    if launcher_values != EXPECTED_PUBLIC:
+        errors.append("launcher fixture verifier differs from shared public key")
+    if arrays(text["cross_test"], "FLUX_FIXTURE_PUBLIC_KEY") != [EXPECTED_PUBLIC]:
+        errors.append("independent conformance verifier lost the Flux public key")
+    if arrays(text["cross_test"], "OLD_PRODUCER_PUBLIC_KEY") != [OLD_PUBLIC]:
+        errors.append("immutable v1 negative identity evidence changed")
+
+    key_tokens = [
+        'const FIXTURE_RUNTIME_KEY_ID: &str = "runtime-catalog-ed25519-56475aa75463474c";',
+        "key.verifying_key().to_bytes().ct_eq(&FIXTURE_PUBLIC)",
+        'include_bytes!("../tests/fixtures/nonproduction-ed25519-pkcs8.pem")',
+    ]
+    if any(token not in text["key"] for token in key_tokens):
+        errors.append("fixture signer no longer derives and checks the shared identity")
+    publish_tokens = [
+        'include_bytes!("../../../catalog-sign/tests/fixtures/nonproduction-ed25519-pkcs8.pem")',
+        "let signing_key = fixture_signing_key();",
+        "assert_eq!(der[..DER_PREFIX.len()], DER_PREFIX);",
+    ]
+    if any(token not in text["publish_support"] for token in publish_tokens):
+        errors.append("publisher fixture helper no longer derives the one committed fixture seed")
+    if "catalog-unit-test-key-core-v1" not in text["core"]:
+        errors.append("catalog-core arbitrary unit identity collides with conformance identity")
+
+    required_cross_tokens = [
+        "verify_fixture_signed_catalog(envelope).expect(\"producer fixture verifier\")",
+        "verify_with_pinned_identity(envelope, FIXTURE_KEY_ID, &FLUX_FIXTURE_PUBLIC_KEY)",
+        "assert!(verify_signed_catalog(envelope).is_err());",
+        "verify_with_pinned_identity(envelope, FIXTURE_KEY_ID, &OLD_PRODUCER_PUBLIC_KEY)",
+        'Value::String("catalog-test-key-v2".to_owned())',
+    ]
+    if any(token not in text["cross_test"] for token in required_cross_tokens):
+        errors.append("cross-identity fixture/production rejection evidence changed")
+
+    for name in ("initial_envelope", "valid_envelope", "manifest", "initial_payload", "valid_payload", "rejected", "pem"):
+        if digest(source[name]) != EXPECTED_DIGESTS[name]:
+            errors.append(f"exact conformance-v2 artifact changed: {name}")
+    if len(source["initial_envelope"]) != 55_994 or len(source["initial_payload"]) != 55_797:
+        errors.append("initial fixture size changed")
+    if len(source["valid_envelope"]) != 2_750 or len(source["valid_payload"]) != 4_224:
+        errors.append("valid fixture size changed")
+    if len(source["manifest"]) != 743 or len(source["rejected"]) != 1_676:
+        errors.append("manifest or rejection fixture size changed")
+
+    try:
+        manifest = json.loads(source["manifest"])
+        entries = {
+            entry["path"]: (entry["size"], entry["sha256"])
+            for entry in manifest["entries"]
+        }
+    except Exception:
+        errors.append("conformance manifest is malformed")
+        entries = {}
+    expected_entries = {
+        "initial-exact-candidate-envelope.json": (55_994, EXPECTED_DIGESTS["initial_envelope"]),
+        "initial-exact-candidate-payload.json": (55_797, EXPECTED_DIGESTS["initial_payload"]),
+        "rejected-fields.json": (1_676, EXPECTED_DIGESTS["rejected"]),
+        "valid-envelope.json": (2_750, EXPECTED_DIGESTS["valid_envelope"]),
+        "valid-payload.json": (4_224, EXPECTED_DIGESTS["valid_payload"]),
+    }
+    if entries != expected_entries or manifest.get("fixture_key_id") != "catalog-test-key-v1":
+        errors.append("conformance manifest contains stale signature digests")
+
+    try:
+        pem_body = source["pem"].split(b"\n")[1]
+        der = base64.b64decode(pem_body, validate=True)
+        if len(der) != 48 or der[:16] != bytes.fromhex("302e020100300506032b657004220420"):
+            raise ValueError
+        seed = der[16:]
+    except Exception:
+        errors.append("fixture PKCS#8 is not the exact seed container")
+        seed = b""
+    if seed:
+        encoded_seed_forms = (
+            seed,
+            seed.hex().encode(),
+            base64.b64encode(seed),
+            ", ".join(f"0x{byte:02x}" for byte in seed).encode(),
+        )
+        for path in Path(".").rglob("*"):
+            if not path.is_file() or str(path).startswith(("target/", ".git/")) or str(path) == PEM_PATH:
+                continue
+            data = path.read_bytes()
+            if any(value in data for value in encoded_seed_forms):
+                errors.append(f"fixture seed copied outside approved PKCS#8 boundary: {path}")
+                break
+        for path, data in virtual_files:
+            if any(value in data for value in encoded_seed_forms):
+                errors.append(f"fixture seed copied outside approved PKCS#8 boundary: {path}")
+    pem_paths = [str(path) for path in Path(".").rglob("*.pem") if not str(path).startswith(("target/", ".git/"))]
+    pem_paths.extend(path for path, _data in virtual_files if path.endswith(".pem"))
+    if pem_paths != [PEM_PATH]:
+        errors.append("fixture PEM copied outside its exact approved path")
+
+    allowed_id_sources = {
+        "crates/catalog-core/src/signature.rs",
+        "crates/catalog-core/tests/conformance_fixture_identity.rs",
+        "crates/catalog-core/tests/initial_exact_candidate.rs",
+        "crates/catalog-publish/tests/support/mod.rs",
+        "crates/catalog-sign/examples/sign-fixture.rs",
+        "crates/catalog-sign/src/signing.rs",
+        "crates/catalog-sign/tests/key_boundary.rs",
+        "crates/catalog-sign/tests/launcher_contract.rs",
+    }
+    actual_id_sources = {
+        str(path) for path in Path("crates").rglob("*.rs")
+        if "catalog-test-key-v1" in path.read_text(encoding="utf-8")
+    }
+    if actual_id_sources != allowed_id_sources:
+        errors.append("catalog-test-key-v1 appeared in an unrelated signer or test identity")
+    production_id_sources = {
+        path for path in actual_id_sources if "/src/" in path
+    }
+    if production_id_sources != {
+        "crates/catalog-core/src/signature.rs", "crates/catalog-sign/src/signing.rs"
+    }:
+        errors.append("fixture key ID crossed into a non-fixture production source")
+
+    generator_tokens = [
+        '"initial-exact-candidate-payload.json"',
+        '"initial-exact-candidate-envelope.json"',
+        '("valid-payload.json", "valid-envelope.json")',
+        "catalog_sign::generate_fixture_envelope(&payload)",
+    ]
+    if any(token not in text["generator"] for token in generator_tokens):
+        errors.append("fixture generator no longer regenerates every signed envelope")
+
+    correction_tokens = [
+        "catalog-v1-conformance-v1",
+        "c31d3e747ff5bcc14ed5b82e1f39f37c712591aa",
+        OLD_PUBLIC.hex(),
+        EXPECTED_PUBLIC.hex(),
+        "f9c107510a84f55282b1c83d63b370f5515127e9",
+        "630dcd2966c4336691125448bbb25b4ff412a49c732db2c8abc1b8581bd710dd",
+        "It has not been created or published",
+        EXPECTED_DIGESTS["initial_payload"],
+        EXPECTED_DIGESTS["valid_payload"],
+        EXPECTED_DIGESTS["rejected"],
+        "Production trust",
+    ]
+    if any(token not in text["correction_docs"] for token in correction_tokens):
+        errors.append("conformance-v2 correction record lost required evidence")
+    if "It has been created" in text["correction_docs"] or "has been published" in text["correction_docs"]:
+        errors.append("documentation falsely claims conformance-v2 publication")
+    if EXPECTED_DIGESTS["initial_envelope"] not in text["first_release"] or EXPECTED_DIGESTS["manifest"] not in text["first_release"]:
+        errors.append("first-release fixture digests are stale")
+
+    if tags.get("catalog-v1-conformance-v1") != "c31d3e747ff5bcc14ed5b82e1f39f37c712591aa":
+        errors.append("immutable conformance-v1 tag moved")
+    if "catalog-v1-conformance-v2" in tags:
+        errors.append("conformance-v2 tag exists before authorization")
+    return errors
+
+
+source = {name: Path(path).read_bytes() for name, path in PATHS.items()}
+tags = {}
+for line in subprocess.check_output(["git", "show-ref", "--tags", "-d"], text=True).splitlines():
+    commit, ref = line.split()
+    if ref.endswith("^{}"):
+        continue
+    tags[ref.removeprefix("refs/tags/")] = subprocess.check_output(
+        ["git", "rev-parse", f"{ref}^{{commit}}"], text=True
+    ).strip()
+errors = fixture_identity_errors(dict(source), dict(tags))
+if errors:
+    print(errors[0], file=sys.stderr)
+    sys.exit(1)
+
+mutations = []
+def replace_mutation(name, old, new):
+    changed = dict(source)
+    changed[name] = changed[name].replace(old, new, 1)
+    if changed[name] == source[name]:
+        print(f"conformance-v2 mutation could not be applied: {name}", file=sys.stderr)
+        sys.exit(1)
+    mutations.append(changed)
+
+replace_mutation("core", b"0x03, 0xa1, 0x07, 0xbf", b"0x04, 0xa1, 0x07, 0xbf")
+replace_mutation("key", b"0x03, 0xa1, 0x07, 0xbf", b"0x04, 0xa1, 0x07, 0xbf")
+replace_mutation("signing", b"0x03, 0xa1, 0x07, 0xbf", b"0x04, 0xa1, 0x07, 0xbf")
+replace_mutation("launcher_test", b"0x03, 0xa1, 0x07, 0xbf", b"0x04, 0xa1, 0x07, 0xbf")
+replace_mutation("cross_test", b"0x03, 0xa1, 0x07, 0xbf", b"0x04, 0xa1, 0x07, 0xbf")
+replace_mutation("publish_support", b"let signing_key = fixture_signing_key();", b"let signing_key = unrelated_signing_key();")
+replace_mutation("cross_test", b"assert!(verify_signed_catalog(envelope).is_err());", b"assert!(true);")
+replace_mutation("generator", b"catalog_sign::generate_fixture_envelope(&payload)", b"stale_fixture_envelope(&payload)")
+replace_mutation("correction_docs", b"It has not been created or published", b"It has been created and published")
+for name in ("initial_envelope", "valid_envelope", "manifest", "initial_payload", "valid_payload", "rejected", "pem"):
+    changed = dict(source)
+    changed[name] = source[name][:-1] + bytes([source[name][-1] ^ 1])
+    mutations.append(changed)
+for index, changed in enumerate(mutations):
+    if not fixture_identity_errors(changed, dict(tags)):
+        print(f"conformance-v2 boundary mutation {index} was accepted", file=sys.stderr)
+        sys.exit(1)
+for label, changed_tags in [
+    ("v1 replacement", {**tags, "catalog-v1-conformance-v1": "0" * 40}),
+    ("premature v2", {**tags, "catalog-v1-conformance-v2": "0" * 40}),
+]:
+    if not fixture_identity_errors(dict(source), changed_tags):
+        print(f"conformance-v2 tag mutation was accepted: {label}", file=sys.stderr)
+        sys.exit(1)
+fixture_der = base64.b64decode(source["pem"].split(b"\n")[1], validate=True)
+for path, data in [
+    ("crates/unrelated/tests/copied-fixture.seed", fixture_der[16:]),
+    ("crates/unrelated/tests/copied-fixture.pem", source["pem"]),
+]:
+    if not fixture_identity_errors(dict(source), dict(tags), [(path, data)]):
+        print(f"conformance-v2 fixture-copy mutation was accepted: {path}", file=sys.stderr)
         sys.exit(1)
 PY
