@@ -76,16 +76,20 @@ fn make_tree_writable(path: &Path) -> std::io::Result<()> {
 }
 
 const FAKE_C: &str = r#"
-#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <linux/sched.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -135,6 +139,83 @@ static void flood(FILE *stream, size_t count) {
         if (fwrite(buffer, 1, amount, stream) != amount) break;
         fflush(stream);
         count -= amount;
+    }
+}
+
+static int syscall_errno(long result) {
+    return result == -1 ? errno : 0;
+}
+
+static volatile int thread_clone_ran;
+static unsigned char thread_stack[64 * 1024];
+
+static int thread_clone_main(void *unused) {
+    (void)unused;
+    thread_clone_ran = 1;
+    return 0;
+}
+
+static void append_containment_probe(void) {
+    char path[PATH_MAX];
+    unsigned char path_bytes[PATH_MAX];
+    config_path(path, sizeof(path), "snapshot_path");
+    size_t path_size = read_file(path, path_bytes, sizeof(path_bytes) - 1);
+    while (path_size != 0 && (path_bytes[path_size - 1] == '\n' || path_bytes[path_size - 1] == '\r')) path_size--;
+    path_bytes[path_size] = 0;
+    FILE *snapshot = fopen((char *)path_bytes, "ab");
+    if (snapshot == NULL) _exit(80);
+
+    errno = 0; int setsid_errno = syscall_errno(syscall(SYS_setsid));
+    errno = 0; int setpgid_errno = syscall_errno(syscall(SYS_setpgid, 0, 0));
+    errno = 0; long fork_result = syscall(SYS_fork); int fork_errno = syscall_errno(fork_result);
+    if (fork_result == 0) _exit(81);
+    errno = 0; long vfork_result = syscall(SYS_vfork); int vfork_errno = syscall_errno(vfork_result);
+    if (vfork_result == 0) _exit(82);
+    errno = 0; long clone_result = syscall(SYS_clone, SIGCHLD, 0, 0, 0, 0); int clone_errno = syscall_errno(clone_result);
+    if (clone_result == 0) _exit(83);
+    errno = 0; int clone3_errno = syscall_errno(syscall(SYS_clone3, NULL, 0));
+    errno = 0; int unshare_errno = syscall_errno(syscall(SYS_unshare, 0));
+    errno = 0; int setns_errno = syscall_errno(syscall(SYS_setns, -1, 0));
+    errno = 0; int mount_errno = syscall_errno(syscall(SYS_mount, NULL, NULL, NULL, 0, NULL));
+
+    const int thread_flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
+        CLONE_SYSVSEM | CLONE_THREAD;
+    errno = 0;
+    int thread_result = clone(thread_clone_main, thread_stack + sizeof(thread_stack), thread_flags, NULL);
+    int thread_errno = syscall_errno(thread_result);
+    for (int attempt = 0; thread_result >= 0 && !thread_clone_ran && attempt < 1000; attempt++) sleep_ms(1);
+
+    fputs("PROBE_BEGIN\n", snapshot);
+    fprintf(snapshot,
+        "setsid=%d\nsetpgid=%d\nfork=%d\nvfork=%d\nprocess_clone=%d\nclone3=%d\nunshare=%d\nsetns=%d\nmount=%d\nthread_clone=%d\nthread_ran=%d\n",
+        setsid_errno, setpgid_errno, fork_errno, vfork_errno, clone_errno, clone3_errno,
+        unshare_errno, setns_errno, mount_errno, thread_errno, thread_clone_ran);
+    fputs("PROBE_END\n", snapshot);
+    fclose(snapshot);
+}
+
+static void attempt_config_retention(void) {
+    pid_t child = fork();
+    if (child < 0 && errno == EPERM) return;
+    if (child < 0) _exit(84);
+    if (child == 0) {
+        close(STDIN_FILENO);
+        close(STDOUT_FILENO);
+        close(STDERR_FILENO);
+        sleep_ms(750);
+        char config[PATH_MAX], marker_config[PATH_MAX];
+        unsigned char marker_path[PATH_MAX], canary[256];
+        config_path(config, sizeof(config), "canary");
+        config_path(marker_config, sizeof(marker_config), "escape_marker_path");
+        size_t marker_size = read_file(marker_config, marker_path, sizeof(marker_path) - 1);
+        marker_path[marker_size] = 0;
+        size_t canary_size = read_file(config, canary, sizeof(canary));
+        int marker = open((char *)marker_path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+        if (marker >= 0) {
+            (void)write(marker, canary, canary_size);
+            close(marker);
+        }
+        _exit(0);
     }
 }
 
@@ -193,6 +274,13 @@ static void capture_snapshot(int argc, char **argv, const char *behavior) {
 
 int main(int argc, char **argv) {
     char path[PATH_MAX];
+    if (argc == 2 && strcmp(argv[1], "--post-exec-containment-probe") == 0) {
+        append_containment_probe();
+        config_path(path, sizeof(path), "response");
+        copy_file_to(path, stdout);
+        fflush(stdout);
+        return 0;
+    }
     unsigned char behavior_bytes[128];
     config_path(path, sizeof(path), "behavior");
     size_t behavior_size = read_file(path, behavior_bytes, sizeof(behavior_bytes) - 1);
@@ -214,10 +302,24 @@ int main(int argc, char **argv) {
     if (strcmp(behavior, "signal") == 0) { raise(SIGTERM); return 0; }
     if (strcmp(behavior, "invalid_utf8") == 0) { fputc(0xff, stdout); fputc(0xfe, stdout); return 0; }
     if (strcmp(behavior, "download_overflow") == 0) { flood(stdout, 65537); return 0; }
+    if (strcmp(behavior, "containment_probe") == 0) append_containment_probe();
+    if (strcmp(behavior, "exec_persistence") == 0) {
+        char *const arguments[] = {argv[0], "--post-exec-containment-probe", NULL};
+        execve("/proc/self/exe", arguments, environ);
+        return 85;
+    }
+    if (strcmp(behavior, "config_retention") == 0) attempt_config_retention();
+    if (strcmp(behavior, "stubborn") == 0) {
+        signal(SIGTERM, SIG_IGN);
+        close(STDIN_FILENO);
+        close(STDOUT_FILENO);
+        close(STDERR_FILENO);
+        for (;;) pause();
+    }
     if (strcmp(behavior, "leader_hold") == 0 || strcmp(behavior, "download_hold") == 0) {
         pid_t child = fork();
-        if (child == 0) { sleep_ms(10000); _exit(0); }
-        if (child < 0) return 88;
+        if (child == 0) { close(0); close(1); close(2); sleep_ms(10000); _exit(0); }
+        if (child < 0 && errno != EPERM) return 88;
         copy_file_to(path, stdout);
         fflush(stdout);
         return 0;
@@ -225,7 +327,7 @@ int main(int argc, char **argv) {
     if (strcmp(behavior, "descendant_flood") == 0) {
         pid_t child = fork();
         if (child == 0) { flood(stdout, 262144); flood(stderr, 131072); sleep_ms(10000); _exit(0); }
-        if (child < 0) return 87;
+        if (child < 0 && errno != EPERM) return 87;
         copy_file_to(path, stdout);
         fflush(stdout);
         return 0;
@@ -282,6 +384,10 @@ enum FakeBehavior {
     DescendantFlood,
     DownloadOverflow,
     DownloadHold,
+    ContainmentProbe,
+    ExecPersistence,
+    ConfigRetention,
+    Stubborn,
 }
 
 impl FakeBehavior {
@@ -301,6 +407,10 @@ impl FakeBehavior {
             Self::DescendantFlood => "descendant_flood",
             Self::DownloadOverflow => "download_overflow",
             Self::DownloadHold => "download_hold",
+            Self::ContainmentProbe => "containment_probe",
+            Self::ExecPersistence => "exec_persistence",
+            Self::ConfigRetention => "config_retention",
+            Self::Stubborn => "stubborn",
         }
     }
 }
@@ -322,11 +432,16 @@ impl Fixture {
             .create(&config_dir)
             .unwrap();
         let snapshot = root.path("snapshot");
+        let escape_marker = root.path("escaped-config-marker");
         for (name, bytes) in [
             ("canary", CONFIG_CANARY.as_bytes()),
             ("behavior", behavior.name().as_bytes()),
             ("response", response),
             ("snapshot_path", snapshot.as_os_str().as_encoded_bytes()),
+            (
+                "escape_marker_path",
+                escape_marker.as_os_str().as_encoded_bytes(),
+            ),
         ] {
             fs::write(config_dir.join(name), bytes).unwrap();
             fs::set_permissions(config_dir.join(name), fs::Permissions::from_mode(0o600)).unwrap();
@@ -431,13 +546,13 @@ fn broker_requests_are_a_closed_command_family_and_protocol_is_strict() {
     let upload = BrokerRequestV1::UploadAsset {
         schema_version: 1,
         repository: REPOSITORY.to_owned(),
-        release_id: "7".to_owned(),
         tag: TAG.to_owned(),
         name: "support.bin".to_owned(),
         input_path: "/private/input".to_owned(),
     };
     let encoded = String::from_utf8(upload.to_canonical_bytes().unwrap()).unwrap();
     assert!(encoded.contains(&format!("\"tag\":\"{TAG}\"")));
+    assert!(!encoded.contains("release_id"));
 
     for bytes in [
         br#"{"kind":"auth","repository":"owner/name","schema_version":1}"#.as_slice(),
@@ -446,9 +561,16 @@ fn broker_requests_are_a_closed_command_family_and_protocol_is_strict() {
         br#"{"kind":"read_tag","repository":"owner/name","schema_version":1,"tag":"catalog-v1-sequence-1"} "#,
         br#"{"kind":"read_tag","repository":"owner/name","schema_version":1,"tag":"refs/tags/main"}"#,
         br#"{"kind":"read_tag","repository":"owner//name","schema_version":1,"tag":"catalog-v1-sequence-1"}"#,
+        br#"{"input_path":"/private/input","kind":"upload_asset","name":"support.bin","release_id":"7","repository":"owner/name","schema_version":1,"tag":"catalog-v1-sequence-1"}"#,
     ] {
         assert!(BrokerRequestV1::from_canonical_bytes(bytes).is_err());
     }
+    assert!(
+        BrokerResponseV1::from_canonical_bytes(
+            br#"{"kind":"asset_uploaded","name":"support.bin","release_id":"7","schema_version":1,"sha256":"0000000000000000000000000000000000000000000000000000000000000000","size":1,"status":"asset_uploaded"}"#
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -590,7 +712,6 @@ fn exact_seven_command_families_have_fixed_argv_body_environment_and_projection(
     let upload = BrokerRequestV1::UploadAsset {
         schema_version: 1,
         repository: REPOSITORY.to_owned(),
-        release_id: "7".to_owned(),
         tag: TAG.to_owned(),
         name: "support.bin".to_owned(),
         input_path: input.to_str().unwrap().to_owned(),
@@ -693,7 +814,6 @@ fn release_upload_materializes_private_exact_file_and_returns_no_fabricated_id()
     let request = BrokerRequestV1::UploadAsset {
         schema_version: 1,
         repository: REPOSITORY.to_owned(),
-        release_id: "7".to_owned(),
         tag: TAG.to_owned(),
         name: "support.bin".to_owned(),
         input_path: input.to_str().unwrap().to_owned(),
@@ -711,6 +831,7 @@ fn release_upload_materializes_private_exact_file_and_returns_no_fabricated_id()
     );
     let canonical = String::from_utf8(response.to_canonical_bytes().unwrap()).unwrap();
     assert!(!canonical.contains("asset_id"));
+    assert!(!canonical.contains("release_id"));
     assert!(!canonical.contains("child-token-path-canary"));
     assert_eq!(
         fixture.snapshot_section("INPUT_BEGIN\n", "\nINPUT_END"),
@@ -742,7 +863,6 @@ fn release_upload_materializes_private_exact_file_and_returns_no_fabricated_id()
     let duplicate_request = BrokerRequestV1::UploadAsset {
         schema_version: 1,
         repository: REPOSITORY.to_owned(),
-        release_id: "7".to_owned(),
         tag: TAG.to_owned(),
         name: "support.bin".to_owned(),
         input_path: duplicate_input.to_str().unwrap().to_owned(),
@@ -763,7 +883,7 @@ fn release_upload_materializes_private_exact_file_and_returns_no_fabricated_id()
 }
 
 #[test]
-fn one_nonblocking_deadline_supervises_stdin_leader_and_descendant_pipes() {
+fn one_nonblocking_deadline_supervises_stdin_and_has_no_blocking_post_deadline_wait() {
     let large_notes = "n".repeat(16 * 1024);
     let delayed = Fixture::new("delayed-stdin", FakeBehavior::DelayedStdin, &draft_json());
     let delayed_request = BrokerRequestV1::CreateDraft {
@@ -794,15 +914,11 @@ fn one_nonblocking_deadline_supervises_stdin_leader_and_descendant_pipes() {
     assert_bounded_failure(&never, &request);
 
     for (label, behavior) in [
-        (
-            "leader-exits-descendant-holds-stdout-stderr",
-            FakeBehavior::LeaderHold,
-        ),
-        ("descendant-flood", FakeBehavior::DescendantFlood),
         ("stdout-one-byte-overflow", FakeBehavior::FloodStdout),
         ("stderr-one-byte-overflow", FakeBehavior::FloodStderr),
         ("simultaneous-deadlock-flood", FakeBehavior::Deadlock),
         ("timeout", FakeBehavior::Timeout),
+        ("stubborn-closed-stdio", FakeBehavior::Stubborn),
         ("signal", FakeBehavior::Signal),
         ("invalid-utf8", FakeBehavior::InvalidUtf8),
     ] {
@@ -811,12 +927,80 @@ fn one_nonblocking_deadline_supervises_stdin_leader_and_descendant_pipes() {
     }
 }
 
+#[test]
+fn seccomp_denies_process_and_session_escape_but_allows_runtime_thread_clone() {
+    let probe = Fixture::new(
+        "containment-syscall-probe",
+        FakeBehavior::ContainmentProbe,
+        &tag_json(),
+    );
+    assert!(execute(&probe, &read_tag_request()).is_ok());
+    let outcomes = probe.snapshot_section("PROBE_BEGIN\n", "\nPROBE_END");
+    for syscall in [
+        "setsid",
+        "setpgid",
+        "fork",
+        "vfork",
+        "process_clone",
+        "clone3",
+        "unshare",
+        "setns",
+        "mount",
+    ] {
+        assert!(
+            outcomes.lines().any(|line| line == format!("{syscall}=1")),
+            "missing EPERM containment outcome for {syscall}: {outcomes}"
+        );
+    }
+    assert!(outcomes.lines().any(|line| line == "thread_clone=0"));
+    assert!(outcomes.lines().any(|line| line == "thread_ran=1"));
+
+    let post_exec = Fixture::new(
+        "containment-persists-across-later-exec",
+        FakeBehavior::ExecPersistence,
+        &tag_json(),
+    );
+    assert!(execute(&post_exec, &read_tag_request()).is_ok());
+    let post_exec_outcomes = post_exec.snapshot_section("PROBE_BEGIN\n", "\nPROBE_END");
+    assert!(post_exec_outcomes.lines().any(|line| line == "fork=1"));
+    assert!(
+        post_exec_outcomes
+            .lines()
+            .any(|line| line == "thread_clone=0")
+    );
+
+    for (label, behavior) in [
+        (
+            "leader-exits-after-denied-closed-stdio-fork",
+            FakeBehavior::LeaderHold,
+        ),
+        (
+            "denied-descendant-cannot-flood-retained-pipes",
+            FakeBehavior::DescendantFlood,
+        ),
+        (
+            "denied-descendant-cannot-retain-config",
+            FakeBehavior::ConfigRetention,
+        ),
+    ] {
+        let fixture = Fixture::new(label, behavior, &tag_json());
+        let started = Instant::now();
+        assert!(execute(&fixture, &read_tag_request()).is_ok());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        thread::sleep(Duration::from_millis(900));
+        assert!(
+            !fixture.root.path("escaped-config-marker").exists(),
+            "descendant retained config after successful return: {label}"
+        );
+    }
+}
+
 fn assert_bounded_failure(fixture: &Fixture, request: &BrokerRequestV1) {
     let start = Instant::now();
     let error = execute(fixture, request).unwrap_err();
     assert_eq!(error.to_string(), "github broker failed");
     assert!(
-        start.elapsed() < Duration::from_secs(4),
+        start.elapsed() < Duration::from_secs(5),
         "unbounded broker failure: {:?}",
         start.elapsed()
     );
@@ -845,6 +1029,22 @@ fn download_is_broker_streamed_bounded_and_removes_partial_or_descendant_output(
     );
     assert!(matches!(response, BrokerResponseV1::Asset { .. }));
 
+    let contained = Fixture::new(
+        "download-descendant-denied-before-final-settlement",
+        FakeBehavior::DownloadHold,
+        b"contained-download",
+    );
+    let contained_output = contained.root.path("contained.bin");
+    let contained_request = BrokerRequestV1::DownloadAsset {
+        schema_version: 1,
+        repository: REPOSITORY.to_owned(),
+        asset_id: "9".to_owned(),
+        name: "contained.bin".to_owned(),
+        output_path: contained_output.to_str().unwrap().to_owned(),
+    };
+    assert!(execute(&contained, &contained_request).is_ok());
+    assert_eq!(fs::read(contained_output).unwrap(), b"contained-download");
+
     let no_clobber = Fixture::new("download-no-clobber", FakeBehavior::Success, b"new");
     let existing = no_clobber.root.path("downloaded.bin");
     fs::write(&existing, b"prior").unwrap();
@@ -858,22 +1058,55 @@ fn download_is_broker_streamed_bounded_and_removes_partial_or_descendant_output(
     assert!(execute(&no_clobber, &request).is_err());
     assert_eq!(fs::read(existing).unwrap(), b"prior");
 
-    for (label, behavior) in [
-        ("download-overflow", FakeBehavior::DownloadOverflow),
-        ("download-descendant", FakeBehavior::DownloadHold),
-    ] {
-        let fixture = Fixture::new(label, behavior, b"partial-download-canary");
-        let output = fixture.root.path("failed.bin");
-        let request = BrokerRequestV1::DownloadAsset {
-            schema_version: 1,
-            repository: REPOSITORY.to_owned(),
-            asset_id: "9".to_owned(),
-            name: "failed.bin".to_owned(),
-            output_path: output.to_str().unwrap().to_owned(),
-        };
-        assert_bounded_failure(&fixture, &request);
-        assert!(!output.exists(), "failed streamed output survived: {label}");
+    let overflow = Fixture::new(
+        "download-overflow",
+        FakeBehavior::DownloadOverflow,
+        b"partial-download-canary",
+    );
+    let overflow_output = overflow.root.path("failed.bin");
+    let overflow_request = BrokerRequestV1::DownloadAsset {
+        schema_version: 1,
+        repository: REPOSITORY.to_owned(),
+        asset_id: "9".to_owned(),
+        name: "failed.bin".to_owned(),
+        output_path: overflow_output.to_str().unwrap().to_owned(),
+    };
+    assert_bounded_failure(&overflow, &overflow_request);
+    assert!(
+        !overflow_output.exists(),
+        "failed streamed output survived: download-overflow"
+    );
+
+    struct BlockSettlement;
+    impl BrokerTestCheckpoints for BlockSettlement {
+        fn block_download_settlement_after_first_write(&mut self) -> bool {
+            true
+        }
     }
+    let blocked = Fixture::new(
+        "download-blocked-settlement-writer",
+        FakeBehavior::Success,
+        b"partial-download-canary",
+    );
+    let output = blocked.root.path("blocked.bin");
+    let request = BrokerRequestV1::DownloadAsset {
+        schema_version: 1,
+        repository: REPOSITORY.to_owned(),
+        asset_id: "9".to_owned(),
+        name: "blocked.bin".to_owned(),
+        output_path: output.to_str().unwrap().to_owned(),
+    };
+    let started = Instant::now();
+    assert!(
+        broker::execute_with_test_checkpoints(&blocked.config, &request, &mut BlockSettlement)
+            .is_err()
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "settlement exceeded its separate hard deadline: {:?}",
+        started.elapsed()
+    );
+    assert!(!output.exists(), "exact partial settlement inode survived");
 }
 
 #[test]

@@ -5,7 +5,7 @@ use std::{
     fmt, fs,
     io::{ErrorKind, Read, Seek, SeekFrom, Write},
     os::{
-        fd::{AsRawFd, FromRawFd},
+        fd::{AsRawFd, FromRawFd, RawFd},
         unix::{
             ffi::{OsStrExt, OsStringExt},
             fs::{MetadataExt, PermissionsExt},
@@ -13,7 +13,7 @@ use std::{
         },
     },
     path::{Component, Path, PathBuf},
-    process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio},
+    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     time::{Duration, Instant},
 };
 
@@ -36,9 +36,18 @@ const MAX_JSON_NODES: usize = 1_024;
 const MAX_COLLECTION_MEMBERS: usize = 256;
 const MAX_RELEASE_ASSETS: usize = 128;
 #[cfg(test)]
-const CHILD_TIMEOUT: Duration = Duration::from_secs(2);
+const CHILD_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(not(test))]
 const CHILD_TIMEOUT: Duration = Duration::from_secs(120);
+#[cfg(test)]
+const DOWNLOAD_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(not(test))]
+const DOWNLOAD_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(120);
+#[cfg(test)]
+const DOWNLOAD_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(not(test))]
+const DOWNLOAD_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
+const CLEANUP_REAP_RESERVE: Duration = Duration::from_millis(100);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const IO_CHUNK_BYTES: usize = 8 * 1024;
 const ELF_HEADER_BYTES: usize = 64;
@@ -85,10 +94,11 @@ pub enum BrokerRequestV1 {
         repository: String,
         tag: String,
     },
+    /// Upload authority is only this exact validated tag. The caller must bind `read_draft(tag)`
+    /// immediately before and after the upload; no release ID is accepted or returned here.
     UploadAsset {
         schema_version: u16,
         repository: String,
-        release_id: String,
         tag: String,
         name: String,
         input_path: String,
@@ -178,14 +188,12 @@ impl BrokerRequestV1 {
             Self::UploadAsset {
                 schema_version,
                 repository,
-                release_id,
                 tag,
                 name,
                 input_path,
             } => {
                 valid_schema(*schema_version)?;
                 valid_repository(repository)?;
-                valid_decimal_id(release_id)?;
                 valid_tag(tag)?;
                 valid_asset_name(name)?;
                 valid_path_text(input_path)
@@ -496,78 +504,51 @@ struct DownloadCapability {
     settled: bool,
 }
 
+struct DownloadSpool {
+    file: fs::File,
+}
+
 impl Drop for DownloadCapability {
     fn drop(&mut self) {
-        if self.settled {
-            return;
-        }
-        let Ok(metadata) = self.file.metadata() else {
-            return;
-        };
-        if !same_file_node(Identity::from_metadata(&metadata), self.identity) {
-            return;
-        }
-        let Ok(rebound) = openat_regular(&self.parent, &self.name, libc::O_RDONLY) else {
-            return;
-        };
-        let Ok(rebound_metadata) = rebound.metadata() else {
-            return;
-        };
-        if !same_file_node(Identity::from_metadata(&rebound_metadata), self.identity) {
-            return;
-        }
-        // SAFETY: retained parent and validated single component are valid.
-        unsafe {
-            libc::unlinkat(self.parent.as_raw_fd(), self.name.as_ptr(), 0);
+        if !self.settled {
+            // Regular-file cleanup is itself isolated in a killable helper. If that helper cannot
+            // complete by its deadline, the exact retained partial inode is preserved rather than
+            // risking deletion of a replacement or blocking the broker response.
+            let _ = supervise_download_cleanup(self, Instant::now() + DOWNLOAD_CLEANUP_TIMEOUT);
         }
     }
 }
 
 impl DownloadCapability {
-    fn finish(
+    fn finish_from_spool(
         &mut self,
+        spool: &DownloadSpool,
         streamed_size: u64,
         streamed_sha256: &str,
+        block_after_first_write: bool,
     ) -> Result<(u64, String), BrokerError> {
-        let metadata = self.file.metadata().map_err(|_| rejected())?;
-        if !secure_download_file(&metadata, self.identity, 0o600)
-            || metadata.len() == 0
-            || metadata.len() > MAX_ASSET_BYTES
-        {
+        if streamed_size == 0 || streamed_size > MAX_ASSET_BYTES {
             return Err(rejected());
         }
-        self.file.sync_all().map_err(|_| rejected())?;
-        // SAFETY: this retained descriptor belongs to the fresh output file.
-        if unsafe { libc::fchmod(self.file.as_raw_fd(), 0o400) } != 0 {
+        let expected_digest = decode_sha256(streamed_sha256)?;
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
             return Err(rejected());
         }
-        self.file.sync_all().map_err(|_| rejected())?;
-        let after = self.file.metadata().map_err(|_| rejected())?;
-        let final_identity = Identity::from_metadata(&after);
-        if final_identity.device != self.identity.device
-            || final_identity.inode != self.identity.inode
-            || final_identity.owner != self.identity.owner
-            || final_identity.links != 1
-            || final_identity.mode != 0o400
-            || final_identity.size == 0
-            || final_identity.size > MAX_ASSET_BYTES
-        {
-            return Err(rejected());
+        if pid == 0 {
+            settlement_helper_main(
+                spool.file.as_raw_fd(),
+                self,
+                streamed_size,
+                expected_digest,
+                block_after_first_write,
+            );
         }
-        let digest = hash_descriptor(&self.file, final_identity.size)?;
-        verify_directory_rebind(&self.parent_path, &self.parent, self.parent_identity)?;
-        let rebound = openat_regular(&self.parent, &self.name, libc::O_RDONLY)?;
-        let rebound_metadata = rebound.metadata().map_err(|_| rejected())?;
-        if final_identity.size != streamed_size
-            || digest != streamed_sha256
-            || Identity::from_metadata(&rebound_metadata) != final_identity
-            || hash_descriptor(&rebound, final_identity.size)? != digest
-        {
-            return Err(rejected());
-        }
-        self.identity = final_identity;
+        supervise_raw_helper(pid, Instant::now() + DOWNLOAD_SETTLEMENT_TIMEOUT)?;
+        self.identity.size = streamed_size;
+        self.identity.mode = 0o400;
         self.settled = true;
-        Ok((final_identity.size, digest))
+        Ok((streamed_size, streamed_sha256.to_owned()))
     }
 }
 
@@ -599,6 +580,9 @@ pub(crate) trait BrokerTestCheckpoints {
     fn after_executable_hash(&mut self) {}
     fn before_spawn(&mut self) {}
     fn after_final_rebind(&mut self) {}
+    fn block_download_settlement_after_first_write(&mut self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -649,6 +633,10 @@ fn execute_impl(
         }
         _ => None,
     };
+    let mut download_spool = match request {
+        BrokerRequestV1::DownloadAsset { .. } => Some(create_download_spool()?),
+        _ => None,
+    };
     let home = create_fresh_home()?;
     #[cfg(test)]
     checkpoints.before_spawn();
@@ -687,7 +675,9 @@ fn execute_impl(
     command.stderr(Stdio::piped());
     let executable_descriptor = config.executable.file.as_raw_fd();
     let config_directory_descriptor = config.config_directory.file.as_raw_fd();
-    // SAFETY: setpgid and fcntl are async-signal-safe and touch only child descriptor state.
+    let mut containment_filter = process_containment_filter();
+    // SAFETY: setpgid, fcntl, prctl, and seccomp installation are child-local; the filter was
+    // completely allocated before fork and remains live through the pre-exec callback.
     unsafe {
         command.pre_exec(move || {
             if libc::setpgid(0, 0) != 0 {
@@ -701,22 +691,36 @@ fn execute_impl(
                     return Err(std::io::Error::last_os_error());
                 }
             }
-            Ok(())
+            install_process_containment(&mut containment_filter)
         });
     }
 
     let deadline = Instant::now() + CHILD_TIMEOUT;
-    let mut child = command.spawn().map_err(|_| rejected())?;
+    let child = command.spawn().map_err(|_| rejected())?;
     let supervised = supervise_child(
-        &mut child,
+        child,
         plan.stdin.as_deref().unwrap_or_default(),
-        download.as_mut(),
+        download_spool.as_mut(),
         deadline,
     )?;
+    drop(command);
+    drop(home);
+    drop(config);
 
     let response = if let Some(capability) = &mut download {
         let stream = supervised.download.ok_or_else(rejected)?;
-        let (size, sha256) = capability.finish(stream.size, &stream.sha256)?;
+        let spool = download_spool.as_ref().ok_or_else(rejected)?;
+        seal_download_spool(spool)?;
+        #[cfg(test)]
+        let block_after_first_write = checkpoints.block_download_settlement_after_first_write();
+        #[cfg(not(test))]
+        let block_after_first_write = false;
+        let (size, sha256) = capability.finish_from_spool(
+            spool,
+            stream.size,
+            &stream.sha256,
+            block_after_first_write,
+        )?;
         let BrokerRequestV1::DownloadAsset { asset_id, name, .. } = request else {
             return Err(rejected());
         };
@@ -1281,6 +1285,398 @@ fn verify_download_before_spawn(capability: &DownloadCapability) -> Result<(), B
     Ok(())
 }
 
+fn create_download_spool() -> Result<DownloadSpool, BrokerError> {
+    let name = CString::new("catalog-gh-download-spool").expect("fixed memfd name");
+    // SAFETY: fixed name and Linux memfd flags are valid.
+    let descriptor = unsafe {
+        libc::syscall(
+            libc::SYS_memfd_create,
+            name.as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
+    } as i32;
+    if descriptor < 0 {
+        return Err(rejected());
+    }
+    // SAFETY: memfd_create returned one owned descriptor.
+    let file = unsafe { fs::File::from_raw_fd(descriptor) };
+    Ok(DownloadSpool { file })
+}
+
+fn seal_download_spool(spool: &DownloadSpool) -> Result<(), BrokerError> {
+    let seals = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+    // SAFETY: F_ADD_SEALS applies to this retained anonymous memfd only.
+    if unsafe { libc::fcntl(spool.file.as_raw_fd(), libc::F_ADD_SEALS, seals) } != 0 {
+        return Err(rejected());
+    }
+    Ok(())
+}
+
+fn decode_sha256(value: &str) -> Result<[u8; 32], BrokerError> {
+    valid_sha256(value)?;
+    let mut output = [0_u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let nibble = |byte| match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            _ => None,
+        };
+        output[index] =
+            (nibble(pair[0]).ok_or_else(rejected)? << 4) | nibble(pair[1]).ok_or_else(rejected)?;
+    }
+    Ok(output)
+}
+
+fn settlement_helper_main(
+    spool: RawFd,
+    capability: &DownloadCapability,
+    expected_size: u64,
+    expected_digest: [u8; 32],
+    block_after_first_write: bool,
+) -> ! {
+    let successful = unsafe {
+        settle_download_raw(
+            spool,
+            capability.file.as_raw_fd(),
+            capability.parent.as_raw_fd(),
+            capability.name.as_ptr(),
+            capability.identity,
+            capability.parent_identity,
+            expected_size,
+            expected_digest,
+            block_after_first_write,
+        )
+    };
+    // SAFETY: the post-fork helper must not run inherited Rust destructors.
+    unsafe { libc::_exit(if successful { 0 } else { 125 }) }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn settle_download_raw(
+    spool: RawFd,
+    output: RawFd,
+    parent: RawFd,
+    name: *const libc::c_char,
+    initial: Identity,
+    parent_identity: Identity,
+    expected_size: u64,
+    expected_digest: [u8; 32],
+    block_after_first_write: bool,
+) -> bool {
+    let mut output_stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    let mut parent_stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: both fstat pointers refer to initialized writable storage.
+    if unsafe { libc::fstat(output, output_stat.as_mut_ptr()) } != 0
+        || unsafe { libc::fstat(parent, parent_stat.as_mut_ptr()) } != 0
+    {
+        return false;
+    }
+    // SAFETY: successful fstat initialized both values.
+    let output_stat = unsafe { output_stat.assume_init() };
+    let parent_stat = unsafe { parent_stat.assume_init() };
+    if !raw_identity_matches(&output_stat, initial, 0o600, 0)
+        || !raw_directory_identity_matches(&parent_stat, parent_identity)
+        || unsafe { libc::lseek(spool, 0, libc::SEEK_SET) } != 0
+        || unsafe { libc::lseek(output, 0, libc::SEEK_SET) } != 0
+    {
+        return false;
+    }
+
+    let mut copied = 0_u64;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; IO_CHUNK_BYTES];
+    loop {
+        // SAFETY: buffer is writable for its exact length.
+        let read = unsafe { libc::read(spool, buffer.as_mut_ptr().cast(), buffer.len()) };
+        if read < 0 {
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if read == 0 {
+            break;
+        }
+        let read = read as usize;
+        copied = match copied.checked_add(read as u64) {
+            Some(value) if value <= expected_size && value <= MAX_ASSET_BYTES => value,
+            _ => return false,
+        };
+        let mut written = 0_usize;
+        while written < read {
+            // SAFETY: unwritten buffer suffix is readable for its exact length.
+            let result = unsafe {
+                libc::write(
+                    output,
+                    buffer[written..read].as_ptr().cast(),
+                    read - written,
+                )
+            };
+            if result < 0 {
+                if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return false;
+            }
+            if result == 0 {
+                return false;
+            }
+            written += result as usize;
+        }
+        hasher.update(&buffer[..read]);
+        if block_after_first_write {
+            loop {
+                // SAFETY: pause waits for a signal; the parent uses SIGKILL at the hard deadline.
+                unsafe { libc::pause() };
+            }
+        }
+    }
+    let digest: [u8; 32] = hasher.finalize().into();
+    if copied != expected_size
+        || digest != expected_digest
+        || unsafe { libc::fsync(output) } != 0
+        || unsafe { libc::fchmod(output, 0o400) } != 0
+        || unsafe { libc::fsync(output) } != 0
+    {
+        return false;
+    }
+
+    let mut final_stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    if unsafe { libc::fstat(output, final_stat.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    // SAFETY: successful fstat initialized final_stat.
+    let final_stat = unsafe { final_stat.assume_init() };
+    if !raw_identity_matches(&final_stat, initial, 0o400, expected_size) {
+        return false;
+    }
+    // SAFETY: retained parent and validated NUL-terminated component are valid.
+    let rebound = unsafe {
+        libc::openat(
+            parent,
+            name,
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if rebound < 0 {
+        return false;
+    }
+    let verified = unsafe {
+        verify_settled_readback(
+            spool,
+            output,
+            rebound,
+            initial,
+            expected_size,
+            expected_digest,
+        )
+    };
+    // SAFETY: rebound is one helper-owned descriptor.
+    unsafe { libc::close(rebound) };
+    verified
+}
+
+unsafe fn verify_settled_readback(
+    spool: RawFd,
+    output: RawFd,
+    rebound: RawFd,
+    initial: Identity,
+    expected_size: u64,
+    expected_digest: [u8; 32],
+) -> bool {
+    let mut rebound_stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    if unsafe { libc::fstat(rebound, rebound_stat.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    // SAFETY: successful fstat initialized rebound_stat.
+    let rebound_stat = unsafe { rebound_stat.assume_init() };
+    if !raw_identity_matches(&rebound_stat, initial, 0o400, expected_size)
+        || unsafe { libc::lseek(spool, 0, libc::SEEK_SET) } != 0
+        || unsafe { libc::lseek(output, 0, libc::SEEK_SET) } != 0
+        || unsafe { libc::lseek(rebound, 0, libc::SEEK_SET) } != 0
+    {
+        return false;
+    }
+    let mut size = 0_u64;
+    let mut hasher = Sha256::new();
+    let mut source = [0_u8; IO_CHUNK_BYTES];
+    let mut first = [0_u8; IO_CHUNK_BYTES];
+    let mut second = [0_u8; IO_CHUNK_BYTES];
+    while size < expected_size {
+        let requested = usize::try_from(
+            expected_size
+                .saturating_sub(size)
+                .min(IO_CHUNK_BYTES as u64),
+        )
+        .unwrap_or(IO_CHUNK_BYTES);
+        let source_read = unsafe { read_raw_retry(spool, &mut source[..requested]) };
+        let first_read = unsafe { read_raw_retry(output, &mut first[..requested]) };
+        let second_read = unsafe { read_raw_retry(rebound, &mut second[..requested]) };
+        if source_read != requested as isize
+            || first_read != requested as isize
+            || second_read != requested as isize
+            || source[..requested] != first[..requested]
+            || source[..requested] != second[..requested]
+        {
+            return false;
+        }
+        size += requested as u64;
+        hasher.update(&first[..requested]);
+    }
+    let mut extra = [0_u8; 1];
+    if unsafe { read_raw_retry(spool, &mut extra) } != 0
+        || unsafe { read_raw_retry(output, &mut extra) } != 0
+        || unsafe { read_raw_retry(rebound, &mut extra) } != 0
+    {
+        return false;
+    }
+    let digest: [u8; 32] = hasher.finalize().into();
+    digest == expected_digest
+}
+
+unsafe fn read_raw_retry(descriptor: RawFd, buffer: &mut [u8]) -> isize {
+    loop {
+        // SAFETY: buffer is writable for its exact supplied length.
+        let result = unsafe { libc::read(descriptor, buffer.as_mut_ptr().cast(), buffer.len()) };
+        if result >= 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            return result;
+        }
+    }
+}
+
+fn raw_identity_matches(stat: &libc::stat, identity: Identity, mode: u32, size: u64) -> bool {
+    stat.st_dev == identity.device
+        && stat.st_ino == identity.inode
+        && stat.st_uid == identity.owner
+        && stat.st_nlink == 1
+        && stat.st_mode & 0o7777 == mode
+        && stat.st_size >= 0
+        && stat.st_size as u64 == size
+}
+
+fn raw_directory_identity_matches(stat: &libc::stat, identity: Identity) -> bool {
+    stat.st_dev == identity.device
+        && stat.st_ino == identity.inode
+        && stat.st_uid == identity.owner
+        && stat.st_mode & 0o7777 == identity.mode
+}
+
+fn supervise_download_cleanup(
+    capability: &DownloadCapability,
+    deadline: Instant,
+) -> Result<(), BrokerError> {
+    // SAFETY: the child performs only fixed descriptor-relative syscalls and exits without Rust
+    // destructors; the parent supervises it with waitpid(WNOHANG) and a hard deadline.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(rejected());
+    }
+    if pid == 0 {
+        let success = unsafe {
+            cleanup_download_raw(
+                capability.parent.as_raw_fd(),
+                capability.file.as_raw_fd(),
+                capability.name.as_ptr(),
+                capability.identity,
+            )
+        };
+        // SAFETY: the post-fork cleanup helper must not run inherited Rust destructors.
+        unsafe { libc::_exit(if success { 0 } else { 126 }) }
+    }
+    supervise_raw_helper(pid, deadline)
+}
+
+unsafe fn cleanup_download_raw(
+    parent: RawFd,
+    output: RawFd,
+    name: *const libc::c_char,
+    identity: Identity,
+) -> bool {
+    let mut output_stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    if unsafe { libc::fstat(output, output_stat.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    // SAFETY: successful fstat initialized output_stat.
+    let output_stat = unsafe { output_stat.assume_init() };
+    if output_stat.st_dev != identity.device || output_stat.st_ino != identity.inode {
+        return false;
+    }
+    // SAFETY: retained parent and validated component are valid.
+    let rebound = unsafe {
+        libc::openat(
+            parent,
+            name,
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if rebound < 0 {
+        return false;
+    }
+    let mut rebound_stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    let same = unsafe { libc::fstat(rebound, rebound_stat.as_mut_ptr()) } == 0 && {
+        // SAFETY: successful fstat in the left operand initialized rebound_stat.
+        let value = unsafe { rebound_stat.assume_init() };
+        value.st_dev == identity.device && value.st_ino == identity.inode
+    };
+    // SAFETY: rebound is one helper-owned descriptor.
+    unsafe { libc::close(rebound) };
+    same && unsafe { libc::unlinkat(parent, name, 0) } == 0
+}
+
+fn supervise_raw_helper(pid: libc::pid_t, deadline: Instant) -> Result<(), BrokerError> {
+    let kill_at = deadline
+        .checked_sub(CLEANUP_REAP_RESERVE)
+        .unwrap_or_else(Instant::now);
+    let mut killed = false;
+    loop {
+        let mut status = 0_i32;
+        // SAFETY: status is writable and WNOHANG never blocks.
+        let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if result == pid {
+            return if status & 0x7f == 0 && (status >> 8) & 0xff == 0 {
+                Ok(())
+            } else {
+                Err(rejected())
+            };
+        }
+        if result < 0 {
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(rejected());
+        }
+        let now = Instant::now();
+        if !killed && now >= kill_at {
+            // SAFETY: pid names only the exact supervised helper.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            killed = true;
+        }
+        if now >= deadline {
+            handoff_exceptional_raw_reap(pid);
+            return Err(rejected());
+        }
+        poll_without_descriptors(POLL_INTERVAL.min(deadline.saturating_duration_since(now)));
+    }
+}
+
+fn handoff_exceptional_raw_reap(pid: libc::pid_t) {
+    let _ = std::thread::Builder::new()
+        .name("catalog-download-exceptional-reaper".to_owned())
+        .spawn(move || {
+            let mut status = 0_i32;
+            loop {
+                // SAFETY: this detached exceptional reaper owns the wait for the exact helper.
+                let result = unsafe { libc::waitpid(pid, &mut status, 0) };
+                if result == pid
+                    || (result < 0
+                        && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR))
+                {
+                    return;
+                }
+            }
+        });
+}
+
 fn create_private_directory(
     fixed_template: &[u8],
 ) -> Result<(PathBuf, fs::File, Identity), BrokerError> {
@@ -1378,24 +1774,25 @@ struct DownloadAccumulator {
 }
 
 fn supervise_child(
-    child: &mut Child,
+    mut child: Child,
     stdin_bytes: &[u8],
-    download: Option<&mut DownloadCapability>,
+    download: Option<&mut DownloadSpool>,
     deadline: Instant,
 ) -> Result<SupervisedOutput, BrokerError> {
-    match supervise_io(child, stdin_bytes, download, deadline) {
-        Ok(output) => Ok(output),
-        Err(error) => {
-            terminate_and_reap(child, deadline);
-            Err(error)
-        }
+    let supervised = supervise_io(&mut child, stdin_bytes, download, deadline);
+    // Successful child output does not end lifecycle authority. Always kill the original process
+    // group, nonblockingly reap its leader, and prove the group is absent before returning bytes.
+    let contained = terminate_and_reap(child, deadline);
+    match (supervised, contained) {
+        (Ok(output), Ok(())) => Ok(output),
+        _ => Err(rejected()),
     }
 }
 
 fn supervise_io(
     child: &mut Child,
     stdin_bytes: &[u8],
-    mut download: Option<&mut DownloadCapability>,
+    mut download: Option<&mut DownloadSpool>,
     deadline: Instant,
 ) -> Result<SupervisedOutput, BrokerError> {
     let mut stdin = Some(child.stdin.take().ok_or_else(rejected)?);
@@ -1418,7 +1815,7 @@ fn supervise_io(
         size: 0,
         hasher: Sha256::new(),
     });
-    let mut leader_status: Option<ExitStatus> = None;
+    let mut leader_succeeded: Option<bool> = None;
 
     loop {
         let now = Instant::now();
@@ -1505,13 +1902,13 @@ fn supervise_io(
             }
         }
 
-        if leader_status.is_none() {
-            leader_status = child.try_wait().map_err(|_| rejected())?;
+        if leader_succeeded.is_none() {
+            leader_succeeded = observe_child_status_without_reaping(child.id() as i32)?;
         }
-        if leader_status.is_some_and(|status| !status.success()) {
+        if leader_succeeded == Some(false) {
             return Err(rejected());
         }
-        if leader_status.is_some() && !stdin_open && !stdout_open && !stderr_open {
+        if leader_succeeded == Some(true) && !stdin_open && !stdout_open && !stderr_open {
             let download = download_accumulator.map(|accumulator| DownloadStream {
                 size: accumulator.size,
                 sha256: format!("{:x}", accumulator.hasher.finalize()),
@@ -1522,6 +1919,117 @@ fn supervise_io(
             });
         }
     }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn process_containment_filter() -> Vec<libc::sock_filter> {
+    const BPF_LD_W_ABS: u16 = 0x20;
+    const BPF_JMP_JEQ_K: u16 = 0x15;
+    const BPF_JMP_JGE_K: u16 = 0x35;
+    const BPF_RET_K: u16 = 0x06;
+    const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
+    const X32_SYSCALL_BIT: u32 = 0x4000_0000;
+    const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
+    const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
+    const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+    // Go's Linux runtime creates only thread-group members with shared address space, files,
+    // handlers, and System V semaphore adjustments. No optional process-form flag is accepted.
+    const GO_RUNTIME_THREAD_CLONE_FLAGS: u32 = (libc::CLONE_VM
+        | libc::CLONE_FS
+        | libc::CLONE_FILES
+        | libc::CLONE_SIGHAND
+        | libc::CLONE_SYSVSEM
+        | libc::CLONE_THREAD) as u32;
+
+    let statement = |code, k| libc::sock_filter {
+        code,
+        jt: 0,
+        jf: 0,
+        k,
+    };
+    let jump = |code, k, jt, jf| libc::sock_filter { code, jt, jf, k };
+    let errno = SECCOMP_RET_ERRNO | libc::EPERM as u32;
+    let mut filters = vec![
+        statement(BPF_LD_W_ABS, 4),
+        jump(BPF_JMP_JEQ_K, AUDIT_ARCH_X86_64, 1, 0),
+        statement(BPF_RET_K, SECCOMP_RET_KILL_PROCESS),
+        statement(BPF_LD_W_ABS, 0),
+        jump(BPF_JMP_JGE_K, X32_SYSCALL_BIT, 0, 1),
+        statement(BPF_RET_K, SECCOMP_RET_KILL_PROCESS),
+        // clone is allowed only for the one exact Go thread-only flag set. The high flag word
+        // must be zero, so no hidden future flag can turn this into process creation.
+        jump(BPF_JMP_JEQ_K, libc::SYS_clone as u32, 0, 6),
+        statement(BPF_LD_W_ABS, 20),
+        jump(BPF_JMP_JEQ_K, 0, 0, 2),
+        statement(BPF_LD_W_ABS, 16),
+        jump(BPF_JMP_JEQ_K, GO_RUNTIME_THREAD_CLONE_FLAGS, 1, 0),
+        statement(BPF_RET_K, errno),
+        statement(BPF_RET_K, SECCOMP_RET_ALLOW),
+        statement(BPF_LD_W_ABS, 0),
+    ];
+    let denied = [
+        libc::SYS_fork,
+        libc::SYS_vfork,
+        libc::SYS_clone3,
+        libc::SYS_setsid,
+        libc::SYS_setpgid,
+        libc::SYS_unshare,
+        libc::SYS_setns,
+        libc::SYS_mount,
+        libc::SYS_umount2,
+        libc::SYS_pivot_root,
+        libc::SYS_move_mount,
+        libc::SYS_open_tree,
+        libc::SYS_fsopen,
+        libc::SYS_fsconfig,
+        libc::SYS_fsmount,
+        libc::SYS_mount_setattr,
+        libc::SYS_chroot,
+        libc::SYS_ptrace,
+        libc::SYS_process_vm_writev,
+        libc::SYS_pidfd_getfd,
+    ];
+    for syscall in denied {
+        filters.push(jump(BPF_JMP_JEQ_K, syscall as u32, 0, 1));
+        filters.push(statement(BPF_RET_K, errno));
+    }
+    filters.push(statement(BPF_RET_K, SECCOMP_RET_ALLOW));
+    filters
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+fn process_containment_filter() -> Vec<libc::sock_filter> {
+    Vec::new()
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn install_process_containment(filters: &mut [libc::sock_filter]) -> std::io::Result<()> {
+    let program = libc::sock_fprog {
+        len: u16::try_from(filters.len()).map_err(|_| std::io::Error::other("seccomp"))?,
+        filter: filters.as_mut_ptr(),
+    };
+    // SAFETY: scalar no-new-privileges arguments and the live initialized BPF program are valid.
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0
+        || unsafe {
+            libc::prctl(
+                libc::PR_SET_SECCOMP,
+                libc::SECCOMP_MODE_FILTER,
+                &raw const program,
+                0,
+                0,
+            )
+        } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+fn install_process_containment(_: &mut [libc::sock_filter]) -> std::io::Result<()> {
+    Err(std::io::Error::other(
+        "broker containment requires Linux x86-64",
+    ))
 }
 
 fn set_nonblocking(descriptor: &impl AsRawFd) -> Result<(), BrokerError> {
@@ -1584,7 +2092,7 @@ fn drain_bounded_pipe<R: Read>(
 
 fn drain_download_stdout(
     stdout: &mut ChildStdout,
-    capability: &mut DownloadCapability,
+    spool: &mut DownloadSpool,
     accumulator: &mut DownloadAccumulator,
     deadline: Instant,
 ) -> Result<bool, BrokerError> {
@@ -1603,7 +2111,7 @@ fn drain_download_stdout(
             Ok(0) => return Ok(true),
             Ok(_) if remaining == 0 => return Err(rejected()),
             Ok(read) => {
-                capability
+                spool
                     .file
                     .write_all(&buffer[..read])
                     .map_err(|_| rejected())?;
@@ -1623,27 +2131,73 @@ fn drain_download_stdout(
     }
 }
 
-fn terminate_and_reap(child: &mut Child, deadline: Instant) {
+fn observe_child_status_without_reaping(pid: i32) -> Result<Option<bool>, BrokerError> {
+    let mut information = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+    // WNOWAIT keeps the exited leader as a zombie, pinning its PID/process-group identity until
+    // terminate_and_reap has sent the final group SIGKILL and performs the one nonblocking reap.
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            information.as_mut_ptr(),
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result != 0 {
+        return Err(rejected());
+    }
+    // SAFETY: successful waitid initialized siginfo_t; si_pid/si_status select its SIGCHLD fields.
+    let information = unsafe { information.assume_init() };
+    if unsafe { information.si_pid() } == 0 {
+        return Ok(None);
+    }
+    Ok(Some(
+        information.si_code == libc::CLD_EXITED && unsafe { information.si_status() } == 0,
+    ))
+}
+
+fn terminate_and_reap(mut child: Child, deadline: Instant) -> Result<(), BrokerError> {
     let pid = child.id() as i32;
-    // SAFETY: the child created its own process group with PGID equal to its PID.
+    // SAFETY: the child created its own process group with PGID equal to its PID. Seccomp made all
+    // process-creation and session/group escape syscalls EPERM, so this group contains the leader
+    // and runtime threads only; WEXITED is observable only after the complete thread group exits.
     unsafe {
         libc::kill(-pid, libc::SIGKILL);
     }
     let _ = child.kill();
-    while Instant::now() < deadline {
+    loop {
         match child.try_wait() {
-            Ok(Some(_)) | Err(_) => return,
-            Ok(None) => {
-                let mut no_descriptors: [libc::pollfd; 0] = [];
-                // SAFETY: zero descriptors and a one-millisecond timeout are valid.
-                unsafe {
-                    libc::poll(no_descriptors.as_mut_ptr(), 0, 1);
-                }
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => {}
+            Err(error) if error.raw_os_error() == Some(libc::ECHILD) => return Ok(()),
+            Err(_) => {
+                handoff_exceptional_child_reap(child);
+                return Err(rejected());
             }
         }
+        if Instant::now() >= deadline {
+            handoff_exceptional_child_reap(child);
+            return Err(rejected());
+        }
+        poll_without_descriptors(Duration::from_millis(1));
     }
-    // SIGKILL has already been delivered; this final wait robustly reaps the leader.
-    let _ = child.wait();
+}
+
+fn handoff_exceptional_child_reap(mut child: Child) {
+    let _ = std::thread::Builder::new()
+        .name("catalog-gh-exceptional-reaper".to_owned())
+        .spawn(move || {
+            let _ = child.wait();
+        });
+}
+
+fn poll_without_descriptors(duration: Duration) {
+    let mut no_descriptors: [libc::pollfd; 0] = [];
+    let timeout = i32::try_from(duration.as_millis().max(1)).unwrap_or(i32::MAX);
+    // SAFETY: zero descriptors and a bounded timeout are valid.
+    unsafe {
+        libc::poll(no_descriptors.as_mut_ptr(), 0, timeout);
+    }
 }
 
 fn canonical_value(value: &Value) -> Result<Vec<u8>, BrokerError> {

@@ -1825,7 +1825,32 @@ policies = [
     ("one-byte overflow probe", "let requested = if remaining == 0 {", 2),
     ("descendant-held pipe deadline", "!stdin_open && !stdout_open && !stderr_open", 1),
     ("child process-group kill", "libc::kill(-pid, libc::SIGKILL)", 1),
-    ("child robust reap", "let _ = child.wait();", 1),
+    ("nonreaping child status observation", "libc::WEXITED | libc::WNOHANG | libc::WNOWAIT", 1),
+    ("nonblocking child reap", "child.try_wait()", 1),
+    ("successful-return containment", "let contained = terminate_and_reap(child, deadline);", 1),
+    ("exceptional detached child reap", 'name("catalog-gh-exceptional-reaper".to_owned())', 1),
+    ("pre-exec containment filter", "let mut containment_filter = process_containment_filter();", 1),
+    ("containment installation", "install_process_containment(&mut containment_filter)", 1),
+    ("containment no-new-privileges", "libc::PR_SET_NO_NEW_PRIVS", 1),
+    ("containment seccomp mode", "libc::PR_SET_SECCOMP", 1),
+    ("containment architecture constant", "AUDIT_ARCH_X86_64", 2),
+    ("containment architecture fail-closed", "jump(BPF_JMP_JEQ_K, AUDIT_ARCH_X86_64, 1, 0)", 1),
+    ("containment x32 constant", "X32_SYSCALL_BIT", 2),
+    ("containment x32 fail-closed", "jump(BPF_JMP_JGE_K, X32_SYSCALL_BIT, 0, 1)", 1),
+    ("strict Go thread clone flags", "const GO_RUNTIME_THREAD_CLONE_FLAGS: u32 = (libc::CLONE_VM\n        | libc::CLONE_FS\n        | libc::CLONE_FILES\n        | libc::CLONE_SIGHAND\n        | libc::CLONE_SYSVSEM\n        | libc::CLONE_THREAD) as u32;", 1),
+    ("strict Go thread clone predicate", "jump(BPF_JMP_JEQ_K, GO_RUNTIME_THREAD_CLONE_FLAGS, 1, 0)", 1),
+    ("deny fork", "libc::SYS_fork,", 1),
+    ("deny vfork", "libc::SYS_vfork,", 1),
+    ("deny clone3", "libc::SYS_clone3,", 1),
+    ("deny setsid", "libc::SYS_setsid,", 1),
+    ("deny setpgid", "libc::SYS_setpgid,", 1),
+    ("deny unshare", "libc::SYS_unshare,", 1),
+    ("deny setns", "libc::SYS_setns,", 1),
+    ("deny mount mutation", "libc::SYS_mount,", 1),
+    ("deny new mount mutation", "libc::SYS_mount_setattr,", 1),
+    ("deny ptrace escape", "libc::SYS_ptrace,", 1),
+    ("deny process-memory escape", "libc::SYS_process_vm_writev,", 1),
+    ("deny pidfd descriptor escape", "libc::SYS_pidfd_getfd,", 1),
     ("single exact launch call", "let mut command = Command::new(executable_path);", 1),
     ("retained executable proc capability", 'format!(\n        "/proc/self/fd/{}",\n        config.executable.file.as_raw_fd()', 1),
     ("child-only executable and config inheritance", "for descriptor in [executable_descriptor, config_directory_descriptor]", 1),
@@ -1835,12 +1860,25 @@ policies = [
     ("private upload source rebind", "rebind_upload_source(&source)?;", 3),
     ("private upload final rebind", "rebind_upload(&capability)?;", 1),
     ("upload descriptor and named hash readback", "hash_descriptor(&rebound, capability.size)? != capability.sha256", 1),
-    ("download streamed by broker", ".write_all(&buffer[..read])", 2),
+    ("download anonymous memfd spool", "libc::SYS_memfd_create", 1),
+    ("download spool is sealed", "seal_download_spool(spool)?;", 1),
+    ("download streamed only to spool", "spool\n                    .file\n                    .write_all(&buffer[..read])", 1),
     ("download incremental ceiling", "MAX_ASSET_BYTES.saturating_sub(accumulator.size)", 1),
     ("download incremental hash", "accumulator.hasher.update(&buffer[..read]);", 1),
-    ("download fsync before and after mode settlement", "self.file.sync_all().map_err(|_| rejected())?;", 2),
-    ("download descriptor/name hash readback", "hash_descriptor(&rebound, final_identity.size)? != digest", 1),
-    ("download exact-node failure cleanup", "if !same_file_node(Identity::from_metadata(&rebound_metadata), self.identity)", 1),
+    ("settlement helper process", "settlement_helper_main(", 2),
+    ("settlement separate deadline", "Instant::now() + DOWNLOAD_SETTLEMENT_TIMEOUT", 1),
+    ("settlement helper fsync", "libc::fsync(output)", 2),
+    ("settlement helper exact mode", "libc::fchmod(output, 0o400)", 1),
+    ("all incremental descriptor hashes", "hasher.update(&buffer[..read]);", 4),
+    ("settlement helper readback hash", "hasher.update(&first[..requested]);", 1),
+    ("settlement expected hash equality", "        || digest != expected_digest\n", 1),
+    ("settlement helper readback", "verify_settled_readback(", 2),
+    ("settlement nonblocking wait", "libc::waitpid(pid, &mut status, libc::WNOHANG)", 1),
+    ("settlement helper kill", "unsafe { libc::kill(pid, libc::SIGKILL) };", 1),
+    ("bounded exact-inode cleanup helper", "supervise_download_cleanup(self, Instant::now() + DOWNLOAD_CLEANUP_TIMEOUT)", 1),
+    ("cleanup descriptor/name identity", "value.st_dev == identity.device && value.st_ino == identity.inode", 1),
+    ("cleanup exact retained name", "libc::unlinkat(parent, name, 0)", 1),
+    ("upload tag-only request", "UploadAsset {\n        schema_version: u16,\n        repository: String,\n        tag: String,\n        name: String,\n        input_path: String,\n    }", 1),
     ("upload no-ID response", "BrokerResponseV1::AssetUploaded {", 1),
     ("fixed failure output", 'const FAILURE_LINE: &[u8] = b"github broker failed\\n";', 1),
     ("explicit child response projection", "project_child_response(request, &supervised.stdout, upload.as_ref())?", 1),
@@ -1854,11 +1892,26 @@ validator_calls = [
     ("target commit validation", "valid_sha1(target_commitish)?;", 2),
     ("title validation", "valid_title(title)?;", 1),
     ("notes validation", "valid_notes(notes)", 1),
-    ("release ID validation", "valid_decimal_id(release_id)?;", 2),
+    ("release ID validation", "valid_decimal_id(release_id)?;", 1),
     ("asset ID validation", "valid_decimal_id(asset_id)?;", 1),
     ("asset name validation", "valid_asset_name(name)?;", 3),
     ("upload path validation", "valid_path_text(input_path)", 1),
     ("download path validation", "valid_path_text(output_path)", 1),
+]
+
+test_policies = [
+    ("upload request release-ID mismatch", '"release_id":"7","repository":"owner/name","schema_version":1,"tag":"catalog-v1-sequence-1"', 1),
+    ("upload response release-ID mismatch", '"name":"support.bin","release_id":"7","schema_version":1', 1),
+    ("setsid fake probe", "SYS_setsid", 1),
+    ("setpgid fake probe", "SYS_setpgid", 1),
+    ("fork fake probe", "SYS_fork", 1),
+    ("vfork fake probe", "SYS_vfork", 1),
+    ("clone3 fake probe", "SYS_clone3", 1),
+    ("thread-only clone fake probe", "CLONE_THREAD", 1),
+    ("post-exec persistence fake probe", "--post-exec-containment-probe", 2),
+    ("config-retention survivor marker", "escaped-config-marker", 2),
+    ("blocked settlement writer fault", "block_download_settlement_after_first_write", 1),
+    ("stubborn post-deadline fake", "stubborn-closed-stdio", 1),
 ]
 
 validator_predicates = [
@@ -1882,6 +1935,10 @@ def broker_errors(source, binary_source=binary, lib_source=lib, local_source=loc
         actual = source.count(snippet)
         if actual != expected:
             errors.append(f"missing exact broker policy {label}: expected {expected}, got {actual}")
+    for label, snippet, expected in test_policies:
+        actual = test_source.count(snippet)
+        if actual != expected:
+            errors.append(f"missing exact broker fake probe {label}: expected {expected}, got {actual}")
 
     request_enum = source.split("pub enum BrokerRequestV1 {", 1)[-1].split("impl BrokerRequestV1", 1)[0]
     variants = re.findall(r"^    ([A-Z][A-Za-z]+) \{", request_enum, re.MULTILINE)
@@ -1896,6 +1953,22 @@ def broker_errors(source, binary_source=binary, lib_source=lib, local_source=loc
     ]:
         if forbidden in request_enum:
             errors.append(f"broker request gained arbitrary authority field: {forbidden}")
+    upload_decl = request_enum.split("UploadAsset {", 1)[-1].split("},", 1)[0]
+    upload_fields = re.findall(r"^        ([a-z0-9_]+):", upload_decl, re.MULTILINE)
+    if upload_fields != ["schema_version", "repository", "tag", "name", "input_path"]:
+        errors.append(f"upload authority is not exact tag-only schema: {upload_fields}")
+    response_enum = source.split("pub enum BrokerResponseV1 {", 1)[-1].split("impl BrokerResponseV1", 1)[0]
+    upload_response = response_enum.split("AssetUploaded {", 1)[-1].split("},", 1)[0]
+    response_fields = re.findall(r"^        ([a-z0-9_]+):", upload_response, re.MULTILINE)
+    if response_fields != ["schema_version", "status", "name", "size", "sha256"]:
+        errors.append(f"upload response gained remote-ID authority: {response_fields}")
+
+    terminate = source.split("fn terminate_and_reap(", 1)[-1].split("fn handoff_exceptional_child_reap", 1)[0]
+    if ".wait(" in terminate or "waitpid(" in terminate:
+        errors.append("terminate_and_reap gained a blocking post-deadline wait")
+    transport_drain = source.split("fn drain_download_stdout(", 1)[-1].split("fn terminate_and_reap(", 1)[0]
+    if "DownloadCapability" in transport_drain or "capability.file" in transport_drain:
+        errors.append("download transport can write the final output instead of its anonymous spool")
 
     config_decl = source.split("pub struct PublisherBrokerConfigV1", 1)[-1].split("}", 1)[0]
     config_fields = re.findall(r"pub ([a-z0-9_]+):", config_decl)
@@ -1950,9 +2023,17 @@ def broker_errors(source, binary_source=binary, lib_source=lib, local_source=loc
         "ambient-gh-token-canary", "ambient-github-token-canary", "ambient-proxy-canary",
         "ambient-agent-canary", "raw-token-canary", "CONFIG_CANARY", "FloodStdout",
         "FloodStderr", "Deadlock", "Timeout", "Signal", "InvalidUtf8", "download-no-clobber",
-        "delayed-stdin", "non-reading-stdin", "leader-exits-descendant-holds-stdout-stderr",
-        "descendant-flood", "download-overflow", "download-descendant", "script-rejected",
-        "after-final-rebind", "replace-before-spawn", "repeated_and_concurrent_requests",
+        "delayed-stdin", "non-reading-stdin", "stubborn-closed-stdio",
+        "leader-exits-after-denied-closed-stdio-fork", "denied-descendant-cannot-flood-retained-pipes",
+        "denied-descendant-cannot-retain-config", "containment-syscall-probe",
+        "containment-persists-across-later-exec", "--post-exec-containment-probe", "process_clone",
+        "thread_clone", "SYS_setsid", "SYS_setpgid", "SYS_fork", "SYS_vfork", "SYS_clone3",
+        "CLONE_THREAD", '"release_id":"7","repository":"owner/name","schema_version":1,"tag":"catalog-v1-sequence-1"',
+        '"name":"support.bin","release_id":"7","schema_version":1', "escaped-config-marker",
+        "block_download_settlement_after_first_write", "download-overflow", "download-descendant",
+        "download-blocked-settlement-writer",
+        "script-rejected", "after-final-rebind", "replace-before-spawn",
+        "repeated_and_concurrent_requests",
         "release_upload_materializes_private_exact_file_and_returns_no_fabricated_id",
     ]
     for required in required_tests:
@@ -1980,6 +2061,21 @@ for label, snippet, expected in policies + validator_calls + validator_predicate
             print(f"broker scanner accepted removed enforcement: {label} occurrence {occurrence}", file=sys.stderr)
             sys.exit(1)
 
+# Remove the adversarial fake probes one at a time too; production-policy tokens without the
+# compiled ELF behavior and exact protocol mismatch evidence are not an accepted boundary.
+for label, snippet, expected in test_policies:
+    for occurrence in range(expected):
+        start = -1
+        for _ in range(occurrence + 1):
+            start = tests.find(snippet, start + 1)
+        if start < 0:
+            print(f"broker fake mutation could not be applied: {label} occurrence {occurrence}", file=sys.stderr)
+            sys.exit(1)
+        mutation = tests[:start] + f"REMOVED_BROKER_TEST_{label}" + tests[start + len(snippet):]
+        if not broker_errors(broker, test_source=mutation):
+            print(f"broker scanner accepted removed fake probe: {label} occurrence {occurrence}", file=sys.stderr)
+            sys.exit(1)
+
 # Semantic one-at-a-time bypasses retain neighboring method/route/body tokens so the scanner
 # freezes enforcement rather than merely noticing that the operation name still exists.
 for label, old, new in [
@@ -2003,14 +2099,27 @@ for label, old, new in [
     ("publish method", '"PATCH",\n            format!("/repos/{repository}/releases/{release_id}")', '"POST",\n            format!("/repos/{repository}/releases/{release_id}")'),
     ("publish route", 'format!("/repos/{repository}/releases/{release_id}")', 'format!("/repos/{repository}/release/{release_id}")'),
     ("publish body", 'serde_json::json!({"draft": false})', 'serde_json::json!({"draft": true})'),
+    ("upload ignored release ID reintroduction", "repository: String,\n        tag: String,\n        name: String,", "repository: String,\n        release_id: String,\n        tag: String,\n        name: String,"),
+    ("upload response ID fabrication", "status: BrokerAssetUploadStatusV1,\n        name: String,", "status: BrokerAssetUploadStatusV1,\n        release_id: String,\n        name: String,"),
     ("executable hash bypass", "hash_descriptor(&executable.file, executable.identity.size)? != executable.sha256", "false /* hash_descriptor executable sha256 */"),
-    ("download hash bypass", "hash_descriptor(&rebound, final_identity.size)? != digest", "false /* hash_descriptor rebound digest */"),
+    ("settlement hash bypass", "digest != expected_digest", "false /* digest != expected_digest */"),
     ("request authority ordering", "request.validate()?;\n    let config = read_config", "let config = read_config /* request.validate moved after authority */"),
+    ("seccomp installation bypass", "install_process_containment(&mut containment_filter)", "Ok(()) /* install_process_containment bypass */"),
+    ("seccomp architecture bypass", "jump(BPF_JMP_JEQ_K, AUDIT_ARCH_X86_64, 1, 0)", "jump(BPF_JMP_JEQ_K, AUDIT_ARCH_X86_64, 0, 1)"),
+    ("seccomp x32 bypass", "jump(BPF_JMP_JGE_K, X32_SYSCALL_BIT, 0, 1)", "jump(BPF_JMP_JGE_K, X32_SYSCALL_BIT, 1, 0)"),
+    ("clone process flags bypass", "| libc::CLONE_THREAD) as u32;", "| libc::CLONE_PARENT) as u32; /* CLONE_THREAD */"),
+    ("successful-return containment bypass", "let contained = terminate_and_reap(child, deadline);", "let contained = Ok(()) /* terminate_and_reap only on error */;"),
+    ("status reaps before group kill", "libc::WEXITED | libc::WNOHANG | libc::WNOWAIT", "libc::WEXITED | libc::WNOHANG /* WNOWAIT */"),
+    ("blocking post-deadline wait", "match child.try_wait()", "match child.wait() /* try_wait */"),
     ("child environment clear", "command.env_clear();", "/* command env_clear removed */"),
     ("child pipe nonblocking", "flags | libc::O_NONBLOCK", "flags /* O_NONBLOCK retained token */"),
     ("stdin supervision", "write_nonblocking_stdin(", "bypassed_nonblocking_stdin("),
     ("descendant pipe completion", "!stdin_open && !stdout_open && !stderr_open", "leader_status.is_some()"),
     ("download streaming ceiling", "MAX_ASSET_BYTES.saturating_sub(accumulator.size)", "u64::MAX.saturating_sub(accumulator.size) /* MAX_ASSET_BYTES */"),
+    ("download spool/final separation", "spool\n                    .file\n                    .write_all(&buffer[..read])", "final_output /* spool */\n                    .file\n                    .write_all(&buffer[..read])"),
+    ("settlement deadline bypass", "Instant::now() + DOWNLOAD_SETTLEMENT_TIMEOUT", "Instant::now() + Duration::MAX /* DOWNLOAD_SETTLEMENT_TIMEOUT */"),
+    ("settlement kill bypass", "libc::kill(pid, libc::SIGKILL)", "0 /* libc::kill(pid, libc::SIGKILL) */"),
+    ("settlement cleanup bypass", "supervise_download_cleanup(self, Instant::now() + DOWNLOAD_CLEANUP_TIMEOUT)", "Ok(()) /* supervise_download_cleanup DOWNLOAD_CLEANUP_TIMEOUT */"),
     ("ELF-only admission", "validate_elf_executable(&executable_file, executable_identity.size)?;", "/* validate_elf_executable retained but bypassed */"),
     ("named execution fallback", "let executable_path = OsString::from(format!(", "let executable_path = config.executable.path.as_os_str().to_owned(); let _retained = OsString::from(format!("),
     ("fresh output no-clobber", "libc::O_EXCL", "0 /* O_EXCL */"),
