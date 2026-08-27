@@ -96,6 +96,12 @@ name = "catalog-publish"
 version = "0.1.0"
 dependencies = [
  "catalog-core",
+ "ed25519-dalek",
+ "libc",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

@@ -1,13 +1,6 @@
-pub fn summary() -> String {
-    format!("packages={}", catalog_core::PACKAGES.len())
-}
+mod local;
 
-#[cfg(test)]
-mod tests {
-    use super::summary;
-
-    #[test]
-    fn reports_bootstrap_summary() {
-        assert_eq!(summary(), "packages=4");
-    }
-}
+pub use local::{
+    FailureOutcome, PublishError, PublishOutcome, VerifiedTransferredSignedBundle, recover_local,
+    stage_local, verify_transferred_signed_bundle,
+};

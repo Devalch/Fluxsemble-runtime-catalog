@@ -27,7 +27,7 @@ expected_internal_deps = {
     "catalog-core": [],
     "catalog-acquire": [("catalog-core", "normal")],
     "catalog-sign": [("catalog-core", "normal")],
-    "catalog-publish": [("catalog-core", "normal")],
+    "catalog-publish": [("catalog-core", "dev"), ("catalog-core", "normal")],
 }
 expected_external_deps = {
     "catalog-core": [
@@ -63,7 +63,14 @@ expected_external_deps = {
         ("subtle", "normal"),
         ("zeroize", "normal"),
     ],
-    "catalog-publish": [],
+    "catalog-publish": [
+        ("ed25519-dalek", "dev"),
+        ("libc", "normal"),
+        ("serde", "normal"),
+        ("serde_jcs", "normal"),
+        ("serde_json", "normal"),
+        ("sha2", "normal"),
+    ],
 }
 
 def dependency_key(dependency):
@@ -1429,4 +1436,177 @@ for name, old, new, label in mutations:
     if not oracle_errors(mutated):
         print(f"oracle scanner accepted removed enforcement: {label}", file=sys.stderr)
         sys.exit(1)
+PY
+
+python3 - <<'PY'
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+subprocess.run(
+    ["cargo", "build", "--locked", "-p", "catalog-publish", "--bin", "catalog-publish"],
+    check=True,
+    stdout=subprocess.DEVNULL,
+)
+production_binary = Path("target/debug/catalog-publish").read_bytes()
+fixture_public_key = bytes([
+    0x1B, 0xD3, 0x6A, 0xFE, 0xE9, 0x32, 0x3F, 0x1E,
+    0x38, 0x13, 0xF6, 0x8C, 0x4D, 0x5F, 0x2F, 0x2B,
+    0x1B, 0xAE, 0x44, 0xC0, 0xEF, 0x69, 0x17, 0x62,
+    0x8E, 0xD6, 0xAF, 0xE1, 0x6A, 0xAE, 0x44, 0xA9,
+])
+for forbidden in [
+    b"catalog-test-key-v1",
+    b"verify_transferred_fixture_signed_bundle",
+    fixture_public_key,
+]:
+    if forbidden in production_binary:
+        print("fixture authority compiled into production catalog-publish", file=sys.stderr)
+        sys.exit(1)
+production_symbols = subprocess.check_output(
+    ["nm", "-C", "target/debug/catalog-publish"], stderr=subprocess.DEVNULL
+)
+if b"verify_transferred_fixture_signed_bundle" in production_symbols:
+    print("fixture verifier symbol compiled into production catalog-publish", file=sys.stderr)
+    sys.exit(1)
+
+local = Path("crates/catalog-publish/src/local.rs").read_text(encoding="utf-8")
+lib = Path("crates/catalog-publish/src/lib.rs").read_text(encoding="utf-8")
+main = Path("crates/catalog-publish/src/main.rs").read_text(encoding="utf-8")
+manifest = Path("crates/catalog-publish/Cargo.toml").read_text(encoding="utf-8")
+tests = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in sorted(Path("crates/catalog-publish/tests").rglob("*.rs"))
+)
+
+policies = [
+    ("reverse canonical bytes", "serde_jcs::to_vec(&manifest).map_err(|_| rejected())? != transfer_bytes", 1),
+    ("reverse exact kind", 'manifest.kind != "signer_output"', 1),
+    ("reverse input digest", "attestation.input_transfer_sha256 != input_transfer_sha256", 1),
+    ("reverse strict sorted paths", "pair[0].relative_path >= pair[1].relative_path", 1),
+    ("reverse exact file mode", 'entry.mode != "0400"', 1),
+    ("reverse exact entry count/no-extra", "expected_names != bundle_names || expected_names.len() != manifest.entries.len()", 1),
+    ("reverse individual size bound", "entry.size > MAX_ENTRY_BYTES", 1),
+    ("reverse total size bound", "if total > MAX_TRANSFER_BYTES", 1),
+    ("reverse SHA-256", "hash_descriptor(&file, entry.size)? != entry.sha256", 1),
+    ("current owner file", "metadata.uid() == current_euid()", 2),
+    ("single-link file", "metadata.nlink() == links", 1),
+    ("owner-only file mode", "metadata.permissions().mode() & 0o7777 == 0o400", 1),
+    ("owner-only directory mode", "metadata.permissions().mode() & 0o7777 == 0o700", 1),
+    ("component no-symlink resolution", "0x02 | 0x04 | 0x08,", 2),
+    ("retained root identity", "FileIdentity::from_metadata(&root_metadata) != self.root_identity", 1),
+    ("retained bundle identity", "FileIdentity::from_metadata(&bundle_metadata) != self.bundle_identity", 1),
+    ("retained named file identity", "FileIdentity::from_metadata(&rebound_metadata) != retained.identity", 1),
+    ("retained all-file revalidation", "bundle.reverify_all().map_err(|_| prior_preserved())?;", 2),
+    ("production catalog signature", "verify_signed_catalog(&catalog_bytes).map_err(|_| rejected())?", 1),
+    ("production release signature", "verify_signed_release_bundle_manifest(&release_bytes)", 1),
+    ("signed release inventory", "verify_signed_release_inventory(&inventory, &release_manifest)", 1),
+    ("exact release file set", "files.keys().cloned().collect::<BTreeSet<_>>() != expected_names", 1),
+    ("catalog envelope binding", "manifest.catalog_envelope().sha256().as_str() != catalog.sha256", 1),
+    ("support asset binding", "asset.sha256().as_str() != file.sha256", 1),
+    ("checksum inventory", "if checksums != expected_checksums", 1),
+    ("tag/sequence binding", 'release_manifest.tag().as_str() != format!("catalog-v1-sequence-{sequence}")', 1),
+    ("immutable unnamed object", "libc::O_TMPFILE | libc::O_RDWR | libc::O_CLOEXEC", 1),
+    ("immutable no-clobber link", "libc::AT_EMPTY_PATH,", 1),
+    ("immutable source descriptor copy", "let mut input = source.file.try_clone().map_err(|_| rejected())?;", 1),
+    ("immutable object readback", "hash_descriptor(&rebound, source.size)? != source.sha256", 1),
+    ("immutable object fsync", "objects.sync_all().map_err(|_| rejected())?;", 2),
+    ("record before latest", "let transaction = install_recovery_record(&state, &record_bytes)", 1),
+    ("exact gated prior", "if gated != prior_bytes", 1),
+    ("atomic latest rename", "libc::SYS_renameat2,", 1),
+    ("no-replace absent latest", "libc::RENAME_NOREPLACE", 1),
+    ("latest exact readback", "readback.as_deref() != Some(intended_bytes.as_slice())", 1),
+    ("latest parent fsync", "state.latest.sync_all().map_err(|_| uncertain())?;", 2),
+    ("recovery relation before cleanup", "verify_recovery_relation(&state, &record, &intended_bytes)", 1),
+    ("transaction lock", "libc::LOCK_EX | libc::LOCK_NB", 1),
+    ("exact recovery commit", "current.as_deref() == Some(intended_bytes.as_slice())", 1),
+    ("exact recovery abort", "current == prior_bytes", 1),
+    ("uncertain no guessing", "return Err(uncertain());", 15),
+    ("previsibility prior preserved", "return Err(prior_preserved());", 6),
+    ("record visibility recovery required", "return Err(recovery_required());", 10),
+    ("uncertainty record retention", "FaultPoint::AfterLatestDirectorySync", 1),
+]
+
+
+def publisher_errors(local_source, lib_source, main_source, manifest_source, test_source):
+    errors = []
+    for label, snippet, count in policies:
+        actual = local_source.count(snippet)
+        if actual != count:
+            errors.append(f"missing exact publisher policy {label}: expected {count}, got {actual}")
+    production_sources = lib_source + "\n" + main_source + "\n" + local_source
+    for forbidden in [
+        "SigningKey", "DecodePrivateKey", "from_pkcs8", "PRIVATE KEY",
+        "GH_TOKEN", "GITHUB_TOKEN", "gh auth", "std::process::Command", "Command::new(",
+        "std::net::", "reqwest::", "tokio::net", "TcpStream", "UdpSocket",
+    ]:
+        if forbidden in production_sources:
+            errors.append(f"publisher gained forbidden key/network/process authority: {forbidden}")
+    if re.search(r"std::env::(?:var|vars|var_os)\s*\(", production_sources):
+        errors.append("publisher gained ambient environment lookup")
+    if re.search(r"--(?:private-|signing-)?key(?:[= ]|\\b)", main_source, re.IGNORECASE):
+        errors.append("publisher gained a key CLI flag")
+    for forbidden in ["catalog-sign", "reqwest", "tokio", "hyper", "ureq", "curl", "openssh"]:
+        if forbidden in manifest_source:
+            errors.append(f"publisher gained forbidden dependency: {forbidden}")
+    if '#[allow(dead_code)]\n#[cfg(test)]\npub fn verify_transferred_fixture_signed_bundle(' not in local_source:
+        errors.append("fixture verifier is not compile-time test-only")
+    if '#[cfg(test)]\n        VerificationPolicy::Fixture => {' not in local_source:
+        errors.append("fixture verification match arm is not compile-time test-only")
+    if "fixture" in main_source.lower() or "fixture" in lib_source.lower():
+        errors.append("fixture authority reached production CLI/library exports")
+    if test_source.count('#[path = "../src/local.rs"]') != 2:
+        errors.append("filesystem fixture tests do not compile the exact production local implementation")
+    if 'command == "recover-local"' not in main_source or main_source.count('command == "recover-local"') != 1:
+        errors.append("recover-only command family changed")
+    recover_arm = main_source.split('if command == "recover-local"', 1)[-1].split("_ =>", 1)[0]
+    if "--bundle" in recover_arm or "verify_transferred_signed_bundle" in recover_arm or "stage_local" in recover_arm:
+        errors.append("recover-local accepts or stages a candidate")
+    for required in [
+        '[command, bundle_flag, bundle] if command == "verify-bundle"',
+        '[command, bundle_flag, bundle, state_flag, state] if command == "stage-local"',
+        '[command, state_flag, state] if command == "recover-local"',
+    ]:
+        if required not in main_source:
+            errors.append(f"publisher CLI lost exact ordered form: {required}")
+    return errors
+
+errors = publisher_errors(local, lib, main, manifest, tests)
+if errors:
+    print(errors[0], file=sys.stderr)
+    sys.exit(1)
+
+# Each mutation removes one actual enforcement expression while retaining its neighbors.
+for label, snippet, _count in policies:
+    mutation = local.replace(snippet, f"REMOVED_PUBLISHER_POLICY_{label}", 1)
+    if mutation == local:
+        print(f"publisher mutation could not be applied: {label}", file=sys.stderr)
+        sys.exit(1)
+    if not publisher_errors(mutation, lib, main, manifest, tests):
+        print(f"publisher scanner accepted removed enforcement: {label}", file=sys.stderr)
+        sys.exit(1)
+
+key_mutation = local + "\nfn forbidden_key_mutation(_: SigningKey) {}\n"
+if not publisher_errors(key_mutation, lib, main, manifest, tests):
+    print("publisher scanner accepted a signing-key mutation", file=sys.stderr)
+    sys.exit(1)
+
+fixture_mutation = local.replace(
+    '#[allow(dead_code)]\n#[cfg(test)]\npub fn verify_transferred_fixture_signed_bundle(',
+    '#[allow(dead_code)]\npub fn verify_transferred_fixture_signed_bundle(',
+    1,
+)
+if not publisher_errors(fixture_mutation, lib, main, manifest, tests):
+    print("publisher scanner accepted production fixture verification", file=sys.stderr)
+    sys.exit(1)
+
+recover_mutation = main.replace(
+    '[command, state_flag, state] if command == "recover-local"',
+    '[command, state_flag, state, bundle_flag, bundle] if command == "recover-local"',
+    1,
+)
+if not publisher_errors(local, lib, recover_mutation, manifest, tests):
+    print("publisher scanner accepted a recover candidate argument", file=sys.stderr)
+    sys.exit(1)
 PY
