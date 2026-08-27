@@ -61,6 +61,7 @@ impl IsolationMode {
 pub struct IsolationAttestationV1 {
     schema_version: u16,
     mode: IsolationMode,
+    original_operation_mode: IsolationMode,
     input_transfer_sha256: String,
     launcher_config_sha256: String,
     signer_sha256: String,
@@ -188,6 +189,11 @@ pub fn enter_signer_isolation() -> Result<SignerIsolation, SignError> {
         attestation: IsolationAttestationV1 {
             schema_version: 1,
             mode,
+            original_operation_mode: if mode == IsolationMode::RecoverSign {
+                IsolationMode::Sign
+            } else {
+                mode
+            },
             input_transfer_sha256,
             launcher_config_sha256: launcher_config_sha256.to_owned(),
             signer_sha256: signer_sha256.to_owned(),
@@ -1008,12 +1014,14 @@ fn settle_recovery_binding(attestation: &IsolationAttestationV1) -> Result<(), S
     retained.read_to_end(&mut bytes).map_err(|_| rejected())?;
     let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| rejected())?;
     if serde_jcs::to_vec(&value).map_err(|_| rejected())? != bytes
-        || value.as_object().is_none_or(|object| object.len() != 5)
+        || value.as_object().is_none_or(|object| object.len() != 7)
         || value["schema_version"] != 1
         || value["kind"] != "sign_recovery_binding"
+        || value["original_operation_mode"] != "sign"
         || value["input_transfer_sha256"] != attestation.input_transfer_sha256
         || value["launcher_config_sha256"] != attestation.launcher_config_sha256
         || value["signer_sha256"] != attestation.signer_sha256
+        || !valid_settled_staging_binding(&value["staging"])
     {
         return Err(rejected());
     }
@@ -1062,17 +1070,67 @@ fn verify_existing_reverse_manifest(
         .pointer("/isolation_attestation/mode")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(rejected)?;
-    let mode_matches = historical_mode
-        == match current.mode {
-            IsolationMode::AssembleIntent => "assemble-intent",
-            IsolationMode::Finalize => "finalize",
-            IsolationMode::Sign | IsolationMode::RecoverSign => "sign",
-            IsolationMode::IsolationProbe => "isolation-probe",
-        };
+    let historical_original = value
+        .pointer("/isolation_attestation/original_operation_mode")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(rejected)?;
+    let mode_matches = match current.mode {
+        IsolationMode::RecoverSign => {
+            authorized_recovery_mode_combination(historical_original, historical_mode)
+        }
+        IsolationMode::AssembleIntent => {
+            historical_original == "assemble-intent" && historical_mode == "assemble-intent"
+        }
+        IsolationMode::Finalize => {
+            historical_original == "finalize" && historical_mode == "finalize"
+        }
+        IsolationMode::Sign => historical_original == "sign" && historical_mode == "sign",
+        IsolationMode::IsolationProbe => {
+            historical_original == "isolation-probe" && historical_mode == "isolation-probe"
+        }
+    };
     if !mode_matches {
         return Err(rejected());
     }
     Ok(())
+}
+
+fn authorized_recovery_mode_combination(original: &str, completion: &str) -> bool {
+    original == "sign" && matches!(completion, "sign" | "recover-sign")
+}
+
+fn valid_settled_staging_binding(value: &serde_json::Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    object.len() == 6
+        && object
+            .get("relative_name")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(valid_staging_name)
+        && object
+            .get("device")
+            .and_then(serde_json::Value::as_u64)
+            .is_some()
+        && object
+            .get("inode")
+            .and_then(serde_json::Value::as_u64)
+            .is_some()
+        && object.get("uid").and_then(serde_json::Value::as_u64) == Some(u64::from(current_euid()))
+        && object.get("mode").and_then(serde_json::Value::as_u64) == Some(0o700)
+        && object
+            .get("cleanup_authorized")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+}
+
+fn valid_staging_name(name: &str) -> bool {
+    const PREFIX: &str = ".catalog-sign-stage-";
+    name.len() == PREFIX.len() + 32
+        && name.starts_with(PREFIX)
+        && name[PREFIX.len()..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 fn collect_output_paths(
@@ -1303,6 +1361,21 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn recovery_mode_combinations_are_exact() {
+        assert!(authorized_recovery_mode_combination("sign", "sign"));
+        assert!(authorized_recovery_mode_combination("sign", "recover-sign"));
+        for (original, completion) in [
+            ("recover-sign", "recover-sign"),
+            ("recover-sign", "sign"),
+            ("sign", "assemble-intent"),
+            ("sign", "finalize"),
+            ("finalize", "recover-sign"),
+        ] {
+            assert!(!authorized_recovery_mode_combination(original, completion));
+        }
+    }
 
     #[test]
     fn reverse_manifest_visibility_faults_are_atomic_and_idempotently_completable() {

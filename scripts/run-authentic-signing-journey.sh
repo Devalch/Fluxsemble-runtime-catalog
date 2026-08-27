@@ -48,9 +48,23 @@ launcher=target/debug/catalog-sign-launcher
 "$launcher" finalize --config "$root/launcher-config-v1.json" \
   --input "$root/export/final-input" --output "$root/finalize-output"
 
-python3 - "$root" <<'PY'
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/authentic-candidate-oracle.py \
+  "$root/export/intent-input" "$root/oracle-intent-candidate.json"
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/authentic-candidate-oracle.py \
+  "$root/export/final-input" "$root/oracle-final-candidate.json"
+cmp --silent "$root/oracle-intent-candidate.json" "$root/oracle-final-candidate.json" || {
+  echo "independent intent/final oracle projections differ" >&2; exit 1
+}
+expected_candidate_sha256=7dba62c8b44883cbd7b3615fd9fe3b1a08a3aa2c75c7729704c14804d1cc2a2b
+actual_oracle_sha256=$(sha256sum "$root/oracle-intent-candidate.json" | cut -d' ' -f1)
+[ "$actual_oracle_sha256" = "$expected_candidate_sha256" ] || {
+  echo "independent candidate digest drift: $actual_oracle_sha256" >&2; exit 1
+}
+
+python3 - "$root" "$expected_candidate_sha256" <<'PY'
 import hashlib, json, os, pathlib, stat, sys
 root = pathlib.Path(sys.argv[1])
+expected_candidate_sha256 = sys.argv[2]
 def digest_bytes(data): return hashlib.sha256(data).hexdigest()
 def canonical(value): return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
 def validate(label, input_root, output_root, mode):
@@ -92,7 +106,11 @@ def validate(label, input_root, output_root, mode):
     return candidate
 assemble = validate("assemble-intent", root / "export/intent-input", root / "assemble-output", "assemble-intent")
 finalized = validate("finalize", root / "export/final-input", root / "finalize-output", "finalize")
-assert assemble == finalized
+oracle = (root / "oracle-intent-candidate.json").read_bytes()
+assert assemble == oracle, "production assemble differs from independent oracle"
+assert finalized == oracle, "production finalize differs from independent oracle"
+assert digest_bytes(oracle) == expected_candidate_sha256
+print(json.dumps({"independent_candidate_sha256": digest_bytes(oracle), "size": len(oracle), "assemble_equal": True, "finalize_equal": True}, sort_keys=True))
 for name in ["assemble-output", "finalize-output"]:
     snapshot = {}
     for path in (root / name).rglob("*"):

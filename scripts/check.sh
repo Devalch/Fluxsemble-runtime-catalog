@@ -9,5 +9,6 @@ cargo fmt --all --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_generate_approved_release_evidence.py
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_authentic_candidate_oracle.py
 ./scripts/check-boundaries.sh
 git diff --check

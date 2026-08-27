@@ -33,6 +33,7 @@ const TRANSFER_MANIFEST_NAME: &str = "transfer-manifest-v1.json";
 const CATALOG_NAME: &str = "catalog-v1.json";
 const CHECKSUMS_NAME: &str = "checksums-sha256.txt";
 const RELEASE_MANIFEST_NAME: &str = "signed-release-bundle-manifest-v1.json";
+const RECOVERY_BINDING_NAME: &str = "sign-recovery-binding-v1.json";
 const MAX_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_ENTRY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024 * 1024;
@@ -1082,19 +1083,26 @@ fn write_signed_output(
     output.verify_files(&bytes.files)?;
     verify_signed_bytes(&bytes, verification_policy)?;
     let publication = output.publish();
+    let mut cleanup = Ok(PublicationDurability::Durable);
     if output.published {
         let reopened = reopen_signed_output(&output.final_path, &bytes.files)?;
         if reopened != bytes.files {
             return Err(verification_failed());
         }
         verify_signed_bytes(&bytes, verification_policy)?;
+        if publication.is_ok() {
+            cleanup = output.settle_verified_staging();
+        }
         #[cfg(test)]
         if take_publish_fault(PublishCheckpoint::FinalReopen).is_some() {
             return Err(SignError::OutputDurabilityUncertain);
         }
     }
     let durability = publication?;
-    if durability == PublicationDurability::Uncertain {
+    let cleanup_durability = cleanup?;
+    if durability == PublicationDurability::Uncertain
+        || cleanup_durability == PublicationDurability::Uncertain
+    {
         return Err(SignError::OutputDurabilityUncertain);
     }
     Ok(SignedReleaseBundleV1 {
@@ -1139,7 +1147,7 @@ fn recover_signed_output(
     candidate: &UnsignedReleaseCandidateV1,
     verification_policy: SignatureVerificationPolicy,
 ) -> Result<SignedReleaseBundleV1, SignError> {
-    settle_exact_empty_staging(path.parent().ok_or_else(verification_failed)?)?;
+    let parent_path = path.parent().ok_or_else(verification_failed)?;
     let root = open_absolute_directory(path).map_err(|_| verification_failed())?;
     let metadata = root.metadata().map_err(|_| verification_failed())?;
     if !secure_directory(&metadata) || metadata.nlink() != 2 {
@@ -1217,6 +1225,9 @@ fn recover_signed_output(
         manifest: manifest.clone(),
     };
     verify_signed_bytes(&signed, verification_policy)?;
+    // Destructive settlement is deliberately last: the complete visible candidate and both
+    // public signature domains have already been independently reconstructed and verified.
+    settle_bound_empty_staging(parent_path)?;
     Ok(SignedReleaseBundleV1 {
         output: path.to_owned(),
         inventory,
@@ -1224,30 +1235,39 @@ fn recover_signed_output(
     })
 }
 
-fn settle_exact_empty_staging(parent_path: &Path) -> Result<(), SignError> {
+#[derive(Clone)]
+struct RecoveryStageBinding {
+    relative_name: String,
+    identity: FileIdentity,
+    uid: u32,
+    mode: u32,
+    cleanup_authorized: bool,
+}
+
+fn settle_bound_empty_staging(parent_path: &Path) -> Result<(), SignError> {
     let parent = open_absolute_directory(parent_path).map_err(|_| verification_failed())?;
-    let mut staging = Vec::new();
-    for name in enumerate_names(&parent).map_err(|_| verification_failed())? {
-        if name.starts_with(".catalog-sign-stage-") {
-            staging.push(name);
-        }
-    }
-    if staging.len() > 1 {
-        return Err(verification_failed());
-    }
-    let Some(name) = staging.pop() else {
-        return Ok(());
+    let Some(mut binding) = read_recovery_stage_binding(&parent)? else {
+        // A completed retry has no temporary binding. It removes nothing; the outer reverse
+        // verifier authenticates the exact existing manifest and rejects every extra stage.
+        return name_exists_at(
+            &parent,
+            &CString::new(TRANSFER_MANIFEST_NAME).expect("fixed manifest name"),
+        )
+        .and_then(|exists| exists.then_some(()).ok_or_else(verification_failed));
     };
-    if name.len() != ".catalog-sign-stage-".len() + 32
-        || !name[".catalog-sign-stage-".len()..]
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-    {
+    let bound_name =
+        CString::new(binding.relative_name.as_str()).map_err(|_| verification_failed())?;
+    let stage_exists = name_exists_at(&parent, &bound_name).map_err(|_| verification_failed())?;
+    if !stage_exists {
         return Err(verification_failed());
     }
-    let directory = open_directory_at(&parent, &name).map_err(|_| verification_failed())?;
+    let directory =
+        open_directory_at(&parent, &binding.relative_name).map_err(|_| verification_failed())?;
     let metadata = directory.metadata().map_err(|_| verification_failed())?;
-    if !secure_directory(&metadata)
+    if FileIdentity::from_metadata(&metadata) != binding.identity
+        || metadata.uid() != binding.uid
+        || metadata.permissions().mode() & 0o7777 != binding.mode
+        || !secure_directory(&metadata)
         || metadata.nlink() != 2
         || !enumerate_names(&directory)
             .map_err(|_| verification_failed())?
@@ -1255,9 +1275,12 @@ fn settle_exact_empty_staging(parent_path: &Path) -> Result<(), SignError> {
     {
         return Err(verification_failed());
     }
-    let name = CString::new(name).map_err(|_| verification_failed())?;
-    // SAFETY: retained parent and exact validated empty directory name are valid.
-    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
+    if !binding.cleanup_authorized {
+        authorize_recovery_stage_cleanup(&parent, &binding)?;
+        binding.cleanup_authorized = true;
+    }
+    // SAFETY: retained parent and exact rebound, identity-matched empty directory are valid.
+    if unsafe { libc::unlinkat(parent.as_raw_fd(), bound_name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
         return Err(verification_failed());
     }
     parent.sync_all().map_err(|_| verification_failed())
@@ -2294,6 +2317,7 @@ impl StagedOutput {
             return Err(output_rejected());
         }
         container.sync_all().map_err(|_| output_rejected())?;
+        bind_recovery_stage(&preflight.parent, &container_name, &container)?;
         Ok(Self {
             parent: preflight.parent,
             final_name: preflight.final_name,
@@ -2423,9 +2447,12 @@ impl StagedOutput {
         if skip_first_fsync || self.parent.sync_all().is_err() {
             durability = PublicationDurability::Uncertain;
         }
+        Ok(durability)
+    }
 
-        // Settle only the exact retained container after independently proving that the payload
-        // rename left it empty. Unknown or nonempty evidence is retained and fails closed.
+    fn settle_verified_staging(&self) -> Result<PublicationDurability, SignError> {
+        // The caller reopens and publicly verifies the visible output before reaching this exact
+        // retained stage identity. Unknown or nonempty evidence is never removed.
         let container_metadata = self
             .container
             .metadata()
@@ -2438,6 +2465,8 @@ impl StagedOutput {
         {
             return Err(SignError::OutputDurabilityUncertain);
         }
+        authorize_bound_stage_cleanup(&self.parent, &self.container_name, &self.container)?;
+        let mut durability = PublicationDurability::Durable;
         #[cfg(test)]
         let unlink_fault = take_publish_fault(PublishCheckpoint::EmptyContainerUnlink);
         #[cfg(test)]
@@ -2451,6 +2480,7 @@ impl StagedOutput {
         if unlink_fault == Some(PublishFault::Once) {
             durability = PublicationDurability::Uncertain;
         }
+        // SAFETY: the retained parent, exact random name, and identity-checked empty stage are valid.
         if unsafe {
             libc::unlinkat(
                 self.parent.as_raw_fd(),
@@ -2470,6 +2500,247 @@ impl StagedOutput {
         }
         Ok(durability)
     }
+}
+
+fn bind_recovery_stage(
+    parent: &fs::File,
+    name: &CString,
+    directory: &fs::File,
+) -> Result<(), SignError> {
+    let Some(mut file) = open_recovery_binding(parent, true)? else {
+        return Ok(());
+    };
+    let metadata = file.metadata().map_err(|_| output_rejected())?;
+    if !secure_recovery_binding(&metadata, 0o600) {
+        return Err(output_rejected());
+    }
+    let (mut value, stage) = parse_recovery_binding(&file)?;
+    if stage.is_some() {
+        return Err(output_rejected());
+    }
+    let directory_metadata = directory.metadata().map_err(|_| output_rejected())?;
+    let name = name.to_str().map_err(|_| output_rejected())?;
+    if !valid_staging_name(name)
+        || !secure_directory(&directory_metadata)
+        || directory_metadata.nlink() != 3
+    {
+        return Err(output_rejected());
+    }
+    value["staging"] = json!({
+        "relative_name": name,
+        "device": directory_metadata.dev(),
+        "inode": directory_metadata.ino(),
+        "uid": directory_metadata.uid(),
+        "mode": directory_metadata.permissions().mode() & 0o7777,
+        "cleanup_authorized": false,
+    });
+    rewrite_recovery_binding(&mut file, parent, &value, 0o600)
+}
+
+fn authorize_bound_stage_cleanup(
+    parent: &fs::File,
+    name: &CString,
+    directory: &fs::File,
+) -> Result<(), SignError> {
+    let Some(file) = open_recovery_binding(parent, false)? else {
+        return Ok(());
+    };
+    let (_, binding) = parse_recovery_binding(&file)?;
+    let binding = binding.ok_or_else(output_rejected)?;
+    let metadata = directory.metadata().map_err(|_| output_rejected())?;
+    if name.to_str().ok() != Some(binding.relative_name.as_str())
+        || FileIdentity::from_metadata(&metadata) != binding.identity
+        || metadata.uid() != binding.uid
+        || metadata.permissions().mode() & 0o7777 != binding.mode
+    {
+        return Err(output_rejected());
+    }
+    if binding.cleanup_authorized {
+        return Ok(());
+    }
+    authorize_recovery_stage_cleanup(parent, &binding)
+}
+
+fn authorize_recovery_stage_cleanup(
+    parent: &fs::File,
+    expected: &RecoveryStageBinding,
+) -> Result<(), SignError> {
+    let mut file = open_recovery_binding(parent, true)?.ok_or_else(output_rejected)?;
+    let metadata = file.metadata().map_err(|_| output_rejected())?;
+    if !secure_recovery_binding(&metadata, 0o600) {
+        return Err(output_rejected());
+    }
+    let (mut value, actual) = parse_recovery_binding(&file)?;
+    let actual = actual.ok_or_else(output_rejected)?;
+    if actual.relative_name != expected.relative_name
+        || actual.identity != expected.identity
+        || actual.uid != expected.uid
+        || actual.mode != expected.mode
+        || actual.cleanup_authorized
+    {
+        return Err(output_rejected());
+    }
+    value["staging"]["cleanup_authorized"] = Value::Bool(true);
+    rewrite_recovery_binding(&mut file, parent, &value, 0o400)
+}
+
+fn read_recovery_stage_binding(
+    parent: &fs::File,
+) -> Result<Option<RecoveryStageBinding>, SignError> {
+    let Some(file) = open_recovery_binding(parent, false)? else {
+        return Ok(None);
+    };
+    let metadata = file.metadata().map_err(|_| verification_failed())?;
+    let mode = metadata.permissions().mode() & 0o7777;
+    if !matches!(mode, 0o400 | 0o600) || !secure_recovery_binding(&metadata, mode) {
+        return Err(verification_failed());
+    }
+    let (_, binding) = parse_recovery_binding(&file).map_err(|_| verification_failed())?;
+    let binding = binding.ok_or_else(verification_failed)?;
+    if (binding.cleanup_authorized && mode != 0o400)
+        || (!binding.cleanup_authorized && mode != 0o600)
+    {
+        return Err(verification_failed());
+    }
+    Ok(Some(binding))
+}
+
+fn open_recovery_binding(parent: &fs::File, writable: bool) -> Result<Option<fs::File>, SignError> {
+    let name = CString::new(RECOVERY_BINDING_NAME).expect("fixed recovery binding name");
+    let flags = if writable {
+        libc::O_RDWR
+    } else {
+        libc::O_RDONLY
+    };
+    // SAFETY: retained parent, fixed name, and no-follow flags are valid.
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            flags | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )
+    };
+    if descriptor < 0 {
+        if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) {
+            return Ok(None);
+        }
+        return Err(output_rejected());
+    }
+    // SAFETY: openat returned one owned descriptor.
+    Ok(Some(unsafe { fs::File::from_raw_fd(descriptor) }))
+}
+
+fn secure_recovery_binding(metadata: &fs::Metadata, mode: u32) -> bool {
+    metadata.is_file()
+        && !metadata.file_type().is_symlink()
+        && metadata.uid() == current_euid()
+        && metadata.nlink() == 1
+        && metadata.permissions().mode() & 0o7777 == mode
+        && metadata.len() > 0
+        && metadata.len() <= MAX_MANIFEST_BYTES
+}
+
+fn parse_recovery_binding(
+    file: &fs::File,
+) -> Result<(Value, Option<RecoveryStageBinding>), SignError> {
+    let metadata = file.metadata().map_err(|_| output_rejected())?;
+    let bytes = read_small_descriptor(file, metadata.len()).map_err(|_| output_rejected())?;
+    let value: Value = serde_json::from_slice(&bytes).map_err(|_| output_rejected())?;
+    if serde_jcs::to_vec(&value).map_err(|_| output_rejected())? != bytes
+        || value.as_object().is_none_or(|object| object.len() != 7)
+        || value["schema_version"] != 1
+        || value["kind"] != "sign_recovery_binding"
+        || value["original_operation_mode"] != "sign"
+        || ![
+            "input_transfer_sha256",
+            "launcher_config_sha256",
+            "signer_sha256",
+        ]
+        .iter()
+        .all(|name| value[*name].as_str().is_some_and(valid_sha256))
+    {
+        return Err(output_rejected());
+    }
+    if value["staging"].is_null() {
+        return Ok((value, None));
+    }
+    let object = value["staging"].as_object().ok_or_else(output_rejected)?;
+    if object.len() != 6 {
+        return Err(output_rejected());
+    }
+    let relative_name = object
+        .get("relative_name")
+        .and_then(Value::as_str)
+        .filter(|name| valid_staging_name(name))
+        .ok_or_else(output_rejected)?
+        .to_owned();
+    let device = object
+        .get("device")
+        .and_then(Value::as_u64)
+        .ok_or_else(output_rejected)?;
+    let inode = object
+        .get("inode")
+        .and_then(Value::as_u64)
+        .ok_or_else(output_rejected)?;
+    let uid = object
+        .get("uid")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value == current_euid())
+        .ok_or_else(output_rejected)?;
+    let mode = object
+        .get("mode")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value == 0o700)
+        .ok_or_else(output_rejected)?;
+    let cleanup_authorized = object
+        .get("cleanup_authorized")
+        .and_then(Value::as_bool)
+        .ok_or_else(output_rejected)?;
+    Ok((
+        value,
+        Some(RecoveryStageBinding {
+            relative_name,
+            identity: FileIdentity { device, inode },
+            uid,
+            mode,
+            cleanup_authorized,
+        }),
+    ))
+}
+
+fn rewrite_recovery_binding(
+    file: &mut fs::File,
+    parent: &fs::File,
+    value: &Value,
+    mode: u32,
+) -> Result<(), SignError> {
+    let bytes = serde_jcs::to_vec(value).map_err(|_| output_rejected())?;
+    file.set_len(0).map_err(|_| output_rejected())?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| output_rejected())?;
+    file.write_all(&bytes).map_err(|_| output_rejected())?;
+    file.flush().map_err(|_| output_rejected())?;
+    file.set_permissions(fs::Permissions::from_mode(mode))
+        .map_err(|_| output_rejected())?;
+    file.sync_all().map_err(|_| output_rejected())?;
+    let metadata = file.metadata().map_err(|_| output_rejected())?;
+    if !secure_recovery_binding(&metadata, mode)
+        || hash_file(file, metadata.len()).map_err(|_| output_rejected())? != sha256(&bytes)
+    {
+        return Err(output_rejected());
+    }
+    parent.sync_all().map_err(|_| output_rejected())
+}
+
+fn valid_staging_name(name: &str) -> bool {
+    const PREFIX: &str = ".catalog-sign-stage-";
+    name.len() == PREFIX.len() + 32
+        && name.starts_with(PREFIX)
+        && name[PREFIX.len()..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 fn create_staging_container(parent: &fs::File) -> Result<(CString, fs::File), SignError> {
@@ -3697,6 +3968,7 @@ mod tests {
                 .root
                 .path
                 .join(format!("fault-{checkpoint:?}-signed-output"));
+            write_test_recovery_binding(&fixture.root.path);
             set_publish_fault(
                 checkpoint,
                 if checkpoint == PublishCheckpoint::RenameVisibility {
@@ -3717,11 +3989,27 @@ mod tests {
             }
             assert_eq!(result.unwrap_err(), SignError::OutputDurabilityUncertain);
             let before = reopen_recovery_snapshot(&output);
-            recover_signed_output(&output, &candidate, SignatureVerificationPolicy::Fixture)
-                .unwrap();
-            assert_eq!(reopen_recovery_snapshot(&output), before);
-            recover_signed_output(&output, &candidate, SignatureVerificationPolicy::Fixture)
-                .unwrap();
+            if checkpoint == PublishCheckpoint::RenameVisibility {
+                recover_signed_output(&output, &candidate, SignatureVerificationPolicy::Fixture)
+                    .unwrap();
+                assert_eq!(reopen_recovery_snapshot(&output), before);
+                fs::remove_file(fixture.root.path.join(RECOVERY_BINDING_NAME)).unwrap();
+                let completed = fixture.root.path.join(TRANSFER_MANIFEST_NAME);
+                fs::write(&completed, b"completed-reverse").unwrap();
+                fs::set_permissions(&completed, fs::Permissions::from_mode(0o400)).unwrap();
+                recover_signed_output(&output, &candidate, SignatureVerificationPolicy::Fixture)
+                    .unwrap();
+            } else {
+                assert!(
+                    recover_signed_output(
+                        &output,
+                        &candidate,
+                        SignatureVerificationPolicy::Fixture
+                    )
+                    .is_err()
+                );
+                assert_eq!(reopen_recovery_snapshot(&output), before);
+            }
         }
 
         let fixture = CandidateFixture::new();
@@ -3736,6 +4024,7 @@ mod tests {
         let signed = sign_candidate(&candidate, key.as_dalek(), "catalog-test-key-v1").unwrap();
         drop(key);
         let output = fixture.root.path.join("persistent-cleanup-output");
+        write_test_recovery_binding(&fixture.root.path);
         set_publish_fault(
             PublishCheckpoint::EmptyContainerUnlink,
             PublishFault::Persistent,
@@ -3769,6 +4058,151 @@ mod tests {
             b"retain"
         );
         set_publish_fault(PublishCheckpoint::BeforeRename, PublishFault::Once);
+    }
+
+    fn write_test_recovery_binding(parent: &Path) {
+        let path = parent.join(RECOVERY_BINDING_NAME);
+        if path.exists() {
+            fs::remove_file(&path).unwrap();
+        }
+        fs::write(
+            &path,
+            serde_jcs::to_vec(&json!({
+                "schema_version": 1,
+                "kind": "sign_recovery_binding",
+                "original_operation_mode": "sign",
+                "input_transfer_sha256": "11".repeat(32),
+                "launcher_config_sha256": "22".repeat(32),
+                "signer_sha256": "33".repeat(32),
+                "staging": null,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    fn recovery_stage_name(parent: &Path) -> String {
+        let value: Value =
+            serde_json::from_slice(&fs::read(parent.join(RECOVERY_BINDING_NAME)).unwrap()).unwrap();
+        value["staging"]["relative_name"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    fn interrupted_signed_output(
+        label: &str,
+    ) -> (
+        CandidateFixture,
+        UnsignedReleaseCandidateV1,
+        PathBuf,
+        String,
+    ) {
+        let fixture = CandidateFixture::new();
+        let bundle = verify_transferred_bundle(&fixture.final_bundle).unwrap();
+        let candidate = finalize_candidate_after_admission_for_test(
+            &bundle,
+            &fixture.source,
+            &fixture.qualification,
+        )
+        .unwrap();
+        let key = fixture_signing_key_for_test();
+        let signed = sign_candidate(&candidate, key.as_dalek(), "catalog-test-key-v1").unwrap();
+        drop(key);
+        let output = fixture.root.path.join(format!("{label}-output"));
+        write_test_recovery_binding(&fixture.root.path);
+        set_publish_fault(PublishCheckpoint::RenameVisibility, PublishFault::Interrupt);
+        assert_eq!(
+            write_signed_output(
+                OutputPreflight::new(&output).unwrap(),
+                signed,
+                SignatureVerificationPolicy::Fixture,
+            )
+            .unwrap_err(),
+            SignError::OutputDurabilityUncertain
+        );
+        let stage = recovery_stage_name(&fixture.root.path);
+        (fixture, candidate, output, stage)
+    }
+
+    #[test]
+    fn recovery_settles_only_the_verified_exact_bound_stage() {
+        let (fixture, candidate, output, bound) = interrupted_signed_output("unrelated");
+        let unrelated = fixture
+            .root
+            .path
+            .join(".catalog-sign-stage-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&unrelated)
+            .unwrap();
+        recover_signed_output(&output, &candidate, SignatureVerificationPolicy::Fixture).unwrap();
+        assert!(!fixture.root.path.join(bound).exists());
+        assert!(unrelated.exists(), "unrelated stage was deleted");
+
+        let (fixture, candidate, output, bound) = interrupted_signed_output("replaced");
+        let bound_path = fixture.root.path.join(&bound);
+        let retained = fixture.root.path.join("retained-original-stage");
+        fs::rename(&bound_path, &retained).unwrap();
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&bound_path)
+            .unwrap();
+        assert!(
+            recover_signed_output(&output, &candidate, SignatureVerificationPolicy::Fixture)
+                .is_err()
+        );
+        assert!(bound_path.exists() && retained.exists());
+
+        let (fixture, candidate, output, bound) = interrupted_signed_output("missing-stage");
+        fs::remove_dir(fixture.root.path.join(&bound)).unwrap();
+        assert!(
+            recover_signed_output(&output, &candidate, SignatureVerificationPolicy::Fixture)
+                .is_err()
+        );
+        assert!(!fixture.root.path.join(bound).exists());
+
+        let (fixture, candidate, output, bound) = interrupted_signed_output("unbound");
+        fs::remove_file(fixture.root.path.join(RECOVERY_BINDING_NAME)).unwrap();
+        assert!(
+            recover_signed_output(&output, &candidate, SignatureVerificationPolicy::Fixture)
+                .is_err()
+        );
+        assert!(fixture.root.path.join(bound).exists());
+
+        let (fixture, candidate, output, bound) = interrupted_signed_output("invalid-output");
+        let catalog = output.join(CATALOG_NAME);
+        fs::set_permissions(&catalog, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            recover_signed_output(&output, &candidate, SignatureVerificationPolicy::Fixture)
+                .is_err()
+        );
+        assert!(fixture.root.path.join(bound).exists());
+
+        let (fixture, candidate, output, bound) = interrupted_signed_output("missing-output");
+        fs::rename(&output, fixture.root.path.join("preserved-visible-output")).unwrap();
+        assert!(
+            recover_signed_output(&output, &candidate, SignatureVerificationPolicy::Fixture)
+                .is_err()
+        );
+        assert!(fixture.root.path.join(bound).exists());
+
+        let (fixture, candidate, output, bound) = interrupted_signed_output("nonempty");
+        fs::write(fixture.root.path.join(&bound).join("unknown"), b"retain").unwrap();
+        assert!(
+            recover_signed_output(&output, &candidate, SignatureVerificationPolicy::Fixture)
+                .is_err()
+        );
+        assert!(fixture.root.path.join(bound).join("unknown").exists());
+
+        let (fixture, candidate, output, bound) = interrupted_signed_output("before-binding");
+        write_test_recovery_binding(&fixture.root.path);
+        assert!(
+            recover_signed_output(&output, &candidate, SignatureVerificationPolicy::Fixture)
+                .is_err()
+        );
+        assert!(fixture.root.path.join(bound).exists());
     }
 
     fn reopen_recovery_snapshot(path: &Path) -> BTreeMap<String, Vec<u8>> {

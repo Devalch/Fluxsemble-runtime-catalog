@@ -721,6 +721,11 @@ def isolation_boundary_errors(sources):
     inner_policy = section(inner, "fn inner_denied_syscalls()", "fn seccomp_filter(")
     launcher_policy = section(launcher, "fn create_launcher_seccomp()", "fn seccomp_filter(")
     prefilter = section(inner, "fn verify_launcher_prefilter()", "fn expect_prefilter_errno(")
+    environment_policy = section(inner, "fn exact_environment()", "fn value<'a>(")
+    mount_policy = section(inner, "fn verify_mounts(", "fn decode_mount_field(")
+    reverse_emitter = section(inner, "pub fn emit_reverse_transfer_manifest(", "fn settle_recovery_binding(")
+    reverse_existing = section(inner, "fn verify_existing_reverse_manifest(", "fn collect_output_paths(")
+    elf_policy = section(launcher, "fn is_static_x86_64_elf(", "fn u16_le(")
     inner_probe = section(inner, "pub(crate) fn run_isolation_probe", "#[derive(Debug, Serialize)]\nstruct ReverseTransferManifestV1")
     for syscall in [
         "socket", "connect", "fork", "vfork", "clone", "clone3", "ptrace", "execve",
@@ -770,6 +775,12 @@ def isolation_boundary_errors(sources):
         if required not in inner + launcher + isolation_test:
             errors.append(f"missing exact environment boundary evidence: {required}")
     for required in [
+        'collect::<BTreeSet<_>>()\n        != expected',
+        '.any(|name| sensitive_environment_name(name))',
+    ]:
+        if required not in environment_policy:
+            errors.append(f"missing actual exact/no-extra environment predicate: {required.splitlines()[0]}")
+    for required in [
         'root.root != "/newroot"', 'root.filesystem != "tmpfs"',
         'root.source != "tmpfs"', "root.options != expected_root_options",
         "!root.optional_fields.is_empty()", "!root.super_options.contains(&expected_uid)",
@@ -779,6 +790,18 @@ def isolation_boundary_errors(sources):
     ]:
         if required not in inner:
             errors.append(f"missing private root/topology enforcement: {required}")
+    for required in [
+        'mounts.keys().map(String::as_str).collect::<BTreeSet<_>>() != expected',
+        'if !mount_is_read_only(&mounts, path)',
+        'mount_is_read_only(&mounts, "/output")',
+        'mount.filesystem != "proc"',
+        'mount.filesystem != "tmpfs"',
+        'mount.filesystem != "devpts"',
+    ]:
+        if required not in mount_policy:
+            errors.append(f"missing actual complete mount predicate: {required}")
+    if mount_policy.count('mount.filesystem != "tmpfs"') != 2:
+        errors.append("both dev and tmp exact tmpfs predicates are not enforced")
     for required in [
         'verify_empty_directory(Path::new("/home/signer"))?;',
         'verify_empty_directory(Path::new("/tmp"))?;',
@@ -795,6 +818,15 @@ def isolation_boundary_errors(sources):
     ]:
         if required not in launcher:
             errors.append(f"missing descriptor/hash/static signer boundary: {required}")
+    for required in [
+        '&bytes[..4] != b"\\x7fELF"', 'bytes[4] != 2', 'bytes[5] != 1',
+        'u16_le(&bytes, 18)? != 62', '!matches!(u16_le(&bytes, 16)?, 2 | 3)',
+        'u16_le(&bytes, 54)? != 56', 'u64_le(&bytes, 32)?', 'count == 0',
+        'count > 128', '.checked_add(count * 56)', 'end > bytes.len()',
+        'matches!(kind, 2 | 3)', 'load |= kind == 1', 'Ok(load)',
+    ]:
+        if required not in elf_policy:
+            errors.append(f"missing actual static ELF predicate: {required}")
     if launcher.count("rebind_executable(&signer, FilePolicy::Signer)?;") != 4:
         errors.append("signer replacement checkpoints are not exact")
     if launcher.count("rebind_executable(&bwrap, FilePolicy::Bwrap)?;") != 3:
@@ -924,6 +956,22 @@ def isolation_boundary_errors(sources):
     ]:
         if required not in inner:
             errors.append(f"missing reverse authenticated transfer boundary: {required}")
+    for required in [
+        'names != expected_names', 'collect_output_paths(output, Path::new(expected_top), &mut paths)?',
+        'paths.is_empty() || paths.len() > MAX_OUTPUT_ENTRIES', '!metadata.is_file()',
+        'metadata.permissions().mode() & 0o7777 != 0o400', 'metadata.len() == 0',
+        'metadata.len() > MAX_OUTPUT_BYTES', 'sha256: hash_descriptor(&file, metadata.len())?',
+    ]:
+        if required not in reverse_emitter:
+            errors.append(f"missing actual reverse inventory predicate: {required}")
+    for required in [
+        'serde_jcs::to_vec(&value).map_err(|_| rejected())? != bytes',
+        'value["input_transfer_sha256"] != current.input_transfer_sha256()',
+        'value["entries"] != serde_json::to_value(expected_entries).map_err(|_| rejected())?',
+        'authorized_recovery_mode_combination(historical_original, historical_mode)',
+    ]:
+        if required not in reverse_existing:
+            errors.append(f"missing actual reverse manifest predicate: {required}")
     if "catalog-test-key-v1" in main + inner + launcher:
         errors.append("fixture authority crossed into signer isolation/launcher")
     return errors
@@ -941,8 +989,31 @@ mutations = [
     (0, "catalog_sign::emit_reverse_transfer_manifest(&isolation)", "catalog_sign::removed_reverse_transfer_manifest(&isolation)", "uncertain reverse transfer completion", 2),
     (1, 'verify_empty_directory(Path::new("/home/signer"))?;', "", "empty private home", 1),
     (1, "verify_open_descriptors()?;", "", "ambient descriptor rejection", 1),
+    # Exact environment set/no-extra predicates.
+    (1, 'collect::<BTreeSet<_>>()\n        != expected', 'collect::<BTreeSet<_>>()\n        == expected', "exact environment set equality", 1),
+    (1, '.any(|name| sensitive_environment_name(name))', '.all(|_| false)', "sensitive/no-extra environment rejection", 1),
+    # Complete mount names, options, writable-output polarity, and filesystem types.
+    (1, 'mounts.keys().map(String::as_str).collect::<BTreeSet<_>>() != expected', 'false', "complete mount point/no-extra equality", 1),
+    (1, 'if !mount_is_read_only(&mounts, path)', 'if false', "exact read-only mount options", 1),
+    (1, 'mount_is_read_only(&mounts, "/output")', 'false', "writable output mount option", 1),
+    (1, 'mount.filesystem != "proc"', 'false', "proc mount filesystem", 1),
+    (1, 'mount.filesystem != "tmpfs"', 'false', "dev/tmp mount filesystem", 1),
+    (1, 'mount.filesystem != "devpts"', 'false', "devpts mount filesystem", 1),
     (3, "hash_descriptor(&file, metadata.len())? != config.signer_sha256", "false", "signer descriptor hash", 1),
+    # Every actual static ELF admission predicate.
+    (3, '&bytes[..4] != b"\\x7fELF"', 'false', "static ELF magic", 1),
+    (3, 'bytes[4] != 2', 'false', "static ELF class", 1),
+    (3, 'bytes[5] != 1', 'false', "static ELF endian", 1),
+    (3, 'u16_le(&bytes, 18)? != 62', 'false', "static ELF machine", 1),
+    (3, '!matches!(u16_le(&bytes, 16)?, 2 | 3)', 'false', "static ELF type", 1),
+    (3, 'u16_le(&bytes, 54)? != 56', 'false', "static ELF program header entry size", 1),
+    (3, 'let offset = usize::try_from(u64_le(&bytes, 32)?).map_err(|_| rejected())?;', 'let offset = 0;', "static ELF program header offset", 1),
+    (3, 'count == 0', 'false', "static ELF nonzero program header count", 1),
+    (3, 'count > 128', 'false', "static ELF bounded program header count", 1),
+    (3, '.checked_add(count * 56)', '.checked_add(0)', "static ELF program header extent", 1),
+    (3, 'end > bytes.len()', 'false', "static ELF program header file bound", 1),
     (3, "matches!(kind, 2 | 3)", "false", "static ELF dynamic/interpreter rejection", 1),
+    (3, 'load |= kind == 1;', 'load |= false;', "static ELF PT_LOAD requirement", 1),
     (3, "rebind_executable(&signer, FilePolicy::Signer)?;", "", "first signer replacement checkpoint", 1),
     (3, "if (request.ceremony == Ceremony::Sign) != key.is_some()", "if false", "key ceremony matrix", 1),
     (3, "std::process::Command::new(&bwrap_exec)", 'std::process::Command::new("/bin/sh")', "retained exact bwrap execution", 1),
@@ -999,6 +1070,19 @@ mutations = [
     (1, "!root.super_options.contains(&expected_gid)", "false", "private root owner gid", 1),
     (1, "metadata.permissions().mode() & 0o7777 != 0o555", "false", "private root mode", 1),
     (1, "mount.parent_id != expected_parent", "false", "private mount topology", 1),
+    # Reverse inventory enumeration/type/mode/size/hash/canonical/input/mode predicates.
+    (1, 'names != expected_names', 'false', "reverse top-level complete enumeration/no-extra", 1),
+    (1, 'collect_output_paths(output, Path::new(expected_top), &mut paths)?;', '', "reverse recursive complete enumeration", 1),
+    (1, 'paths.is_empty() || paths.len() > MAX_OUTPUT_ENTRIES', 'false', "reverse output count bounds", 1),
+    (1, '!metadata.is_file()', 'false', "reverse regular file type", 1),
+    (1, 'metadata.permissions().mode() & 0o7777 != 0o400', 'false', "reverse exact file mode", 1),
+    (1, 'metadata.len() == 0', 'false', "reverse nonempty size", 1),
+    (1, 'metadata.len() > MAX_OUTPUT_BYTES', 'false', "reverse individual size bound", 1),
+    (1, 'sha256: hash_descriptor(&file, metadata.len())?', 'sha256: String::new()', "reverse SHA-256", 1),
+    (1, 'serde_jcs::to_vec(&value).map_err(|_| rejected())? != bytes', 'false', "reverse canonical bytes", 2),
+    (1, 'value["input_transfer_sha256"] != current.input_transfer_sha256()', 'false', "reverse input digest", 1),
+    (1, 'value["entries"] != serde_json::to_value(expected_entries).map_err(|_| rejected())?', 'false', "reverse exact entries", 1),
+    (1, 'authorized_recovery_mode_combination(historical_original, historical_mode)', 'true', "reverse attestation mode combination", 1),
     # Every exact inherited-prefilter result and unexpected-child cleanup.
     (1, 'expect_prefilter_errno("socket", socket, libc::EPERM', 'expect_prefilter_errno("socket", socket, libc::ENOENT', "prefilter socket result", 1),
     (1, 'expect_prefilter_errno("connect", connect, libc::EPERM', 'expect_prefilter_errno("connect", connect, libc::ENOENT', "prefilter connect result", 1),
@@ -1095,6 +1179,9 @@ def round2_errors(source):
             "open_existing_output(&request.output)?",
             '"CATALOG_SIGN_CONFIG_SHA256"',
             '"CATALOG_SIGN_SIGNER_SHA256"',
+            '"original_operation_mode": "sign"',
+            "authorized_recovery_mode_combination(",
+            "valid_bound_staging(&value[\"staging\"])",
             '"recover-sign",\n                "--input"',
         ],
         "signing": [
@@ -1103,7 +1190,11 @@ def round2_errors(source):
             "container_metadata.nlink() != 2",
             "SignError::OutputDurabilityUncertain",
             "fn recover_signed_output(",
-            "settle_exact_empty_staging(",
+            "settle_bound_empty_staging(parent_path)?;",
+            "read_recovery_stage_binding(&parent)?",
+            "FileIdentity::from_metadata(&metadata) != binding.identity",
+            "metadata.permissions().mode() & 0o7777 != binding.mode",
+            "!enumerate_names(&directory)",
             "verify_signed_bytes(&signed, verification_policy)?;",
             "PublishCheckpoint::RenameVisibility",
             "PublishCheckpoint::FirstParentFsync",
@@ -1114,6 +1205,8 @@ def round2_errors(source):
         "inner": [
             "verify_existing_reverse_manifest(attestation, &entries)?;",
             "settle_recovery_binding(attestation)?;",
+            "original_operation_mode: IsolationMode",
+            "authorized_recovery_mode_combination(historical_original, historical_mode)",
             "launcher_config_sha256: String",
             "signer_sha256: String",
             "current.launcher_config_sha256",
@@ -1142,6 +1235,9 @@ def round2_errors(source):
             "!key_witness.observed_open()",
             "launch_recover(&config, &input, &output)",
             "!recovery_key_witness.observed_open()",
+            'recovered_value["isolation_attestation"]["mode"],\n        "recover-sign"',
+            'recovered_value["isolation_attestation"]["original_operation_mode"]',
+            "completed recovered-manifest retry failed",
             "recovery admitted a different launcher config/signer identity",
         ],
     }
@@ -1163,8 +1259,19 @@ def round2_errors(source):
         errors.append("fresh sign does not invoke exactly one persisted recovery binding writer")
     if source["launcher"].count("verify_recovery_binding(") != 2:
         errors.append("recovery does not invoke exactly one config/signer binding verifier")
+    if source["launcher"].split("#[cfg(test)]\nmod tests", 1)[0].count("authorized_recovery_mode_combination(") != 2:
+        errors.append("launcher recovery mode predicate call/definition count changed")
+    if source["inner"].split("#[cfg(test)]\nmod tests", 1)[0].count("authorized_recovery_mode_combination(") != 2:
+        errors.append("inner recovery mode predicate call/definition count changed")
     if source["signing"].count("self.parent.sync_all().is_err()") != 2:
         errors.append("both signed-output parent fsync uncertainty checks are not enforced")
+    recover_region = source["signing"].split("fn recover_signed_output(", 1)[-1].split("fn catalog_payload_for_intent(", 1)[0]
+    if recover_region.find("verify_signed_bytes(&signed, verification_policy)?;") > recover_region.find("settle_bound_empty_staging(parent_path)?;"):
+        errors.append("recovery cleanup occurs before complete public output verification")
+    if source["signing"].count("FileIdentity::from_metadata(&metadata) != binding.identity") != 2:
+        errors.append("both recovery and in-process bound stage identity checks are not enforced")
+    if source["signing"].count("metadata.permissions().mode() & 0o7777 != binding.mode") != 2:
+        errors.append("both recovery and in-process bound stage mode checks are not enforced")
     publish_region = source["signing"].split("fn publish(&mut self)", 1)[-1].split("fn create_staging_container", 1)[0]
     if "enumerate_names(&self.container)" not in publish_region:
         errors.append("published staging cleanup no longer rejects nonempty retained evidence")
@@ -1198,6 +1305,14 @@ mutations = [
     ("signing", "if !secure_directory(&container_metadata)\n            || container_metadata.nlink() != 2\n            || !enumerate_names(&self.container)", "if !secure_directory(&container_metadata)\n            || container_metadata.nlink() != 2\n            || !removed_container_enumeration()", "nonempty cleanup rejection"),
     ("signing", "fn recover_signed_output(", "fn removed_public_recovery(", "exact public recovery"),
     ("signing", "verify_signed_bytes(&signed, verification_policy)?;", "", "recovery public verification"),
+    ("signing", "settle_bound_empty_staging(parent_path)?;", "", "output-before-bound-stage cleanup"),
+    ("signing", "read_recovery_stage_binding(&parent)?", "None", "persisted stage binding"),
+    ("signing", "FileIdentity::from_metadata(&metadata) != binding.identity", "false", "exact bound stage identity"),
+    ("signing", "metadata.permissions().mode() & 0o7777 != binding.mode", "false", "bound stage owner mode"),
+    ("signing", "!enumerate_names(&directory)", "!BTreeSet::new()", "bound stage nonempty rejection"),
+    ("launcher", "valid_bound_staging(&value[\"staging\"])", "true", "launcher exact stage binding"),
+    ("launcher", "authorized_recovery_mode_combination(", "removed_recovery_mode_combination(", "launcher recovery mode combination"),
+    ("inner", "authorized_recovery_mode_combination(historical_original, historical_mode)", "true", "inner recovery mode combination"),
     ("inner", "verify_existing_reverse_manifest(attestation, &entries)?;", "", "idempotent reverse completion"),
     ("inner", "settle_recovery_binding(attestation)?;", "", "recovery binding settlement"),
     ("inner", "current.launcher_config_sha256", "removed_config_identity", "historical config identity"),
@@ -1217,5 +1332,81 @@ for name, old, new, label in mutations:
         sys.exit(1)
     if not round2_errors(mutated):
         print(f"round-2 scanner accepted removed enforcement: {label}", file=sys.stderr)
+        sys.exit(1)
+PY
+
+python3 - <<'PY'
+from pathlib import Path
+import sys
+
+sources = {
+    "oracle": Path("scripts/authentic-candidate-oracle.py").read_text(encoding="utf-8"),
+    "test": Path("scripts/test_authentic_candidate_oracle.py").read_text(encoding="utf-8"),
+    "journey": Path("scripts/run-authentic-signing-journey.sh").read_text(encoding="utf-8"),
+}
+
+
+def oracle_errors(source):
+    errors = []
+    required = {
+        "oracle": [
+            'EXPECTED_CANDIDATE_SHA256 = "7dba62c8b44883cbd7b3615fd9fe3b1a08a3aa2c75c7729704c14804d1cc2a2b"',
+            '"compatibility_ranges": [intent["fluxsemble_requirement"]]',
+            '"provider_id": release["provider"]',
+            '"releases": [release["release"]]',
+            'for record in verify_transfer(root):',
+            'if digest != EXPECTED_CANDIDATE_SHA256:',
+            'object_pairs_hook=reject_duplicates',
+            'if actual != expected | {"transfer-manifest-v1.json"}:',
+        ],
+        "test": [
+            "test_projection_is_independently_fixed_byte_for_byte",
+            "self.assertEqual(candidate, expected)",
+            "test_wrong_projection_or_approved_tuple_cannot_fall_back_to_peer_comparison",
+            '"7dba62c8b44883cbd7b3615fd9fe3b1a08a3aa2c75c7729704c14804d1cc2a2b"',
+            "duplicate_members_floats_and_bounds_fail_closed",
+        ],
+        "journey": [
+            "scripts/authentic-candidate-oracle.py",
+            'cmp --silent "$root/oracle-intent-candidate.json" "$root/oracle-final-candidate.json"',
+            'assert assemble == oracle, "production assemble differs from independent oracle"',
+            'assert finalized == oracle, "production finalize differs from independent oracle"',
+            "expected_candidate_sha256=7dba62c8b44883cbd7b3615fd9fe3b1a08a3aa2c75c7729704c14804d1cc2a2b",
+            'assert digest_bytes(oracle) == expected_candidate_sha256',
+        ],
+    }
+    for name, tokens in required.items():
+        for token in tokens:
+            if token not in source[name]:
+                errors.append(f"missing independent candidate oracle enforcement in {name}: {token}")
+    if source["journey"].count("scripts/authentic-candidate-oracle.py") != 2:
+        errors.append("authentic journey does not independently project both inputs")
+    if "catalog_sign" in source["oracle"] or "subprocess" in source["oracle"]:
+        errors.append("independent oracle gained producer implementation/process dependency")
+    return errors
+
+
+errors = oracle_errors(sources)
+if errors:
+    print(errors[0], file=sys.stderr)
+    sys.exit(1)
+
+mutations = [
+    ("oracle", '"compatibility_ranges": [intent["fluxsemble_requirement"]]', '"compatibility_ranges": []', "independent expected projection"),
+    ("oracle", 'if digest != EXPECTED_CANDIDATE_SHA256:', 'if False:', "frozen independent digest"),
+    ("oracle", 'for record in verify_transfer(root):', 'for record in []:', "authenticated public transfer input"),
+    ("oracle", 'object_pairs_hook=reject_duplicates', 'object_pairs_hook=dict', "duplicate-free oracle JSON"),
+    ("journey", 'assert assemble == oracle, "production assemble differs from independent oracle"', 'assert assemble == finalized', "assemble-to-oracle comparison"),
+    ("journey", 'assert finalized == oracle, "production finalize differs from independent oracle"', 'assert finalized == assemble', "finalize-to-oracle comparison"),
+    ("journey", 'assert digest_bytes(oracle) == expected_candidate_sha256', 'assert assemble == finalized', "oracle digest assertion"),
+]
+for name, old, new, label in mutations:
+    mutated = dict(sources)
+    mutated[name] = mutated[name].replace(old, new, 1)
+    if mutated[name] == sources[name]:
+        print(f"oracle mutation could not be applied: {label}", file=sys.stderr)
+        sys.exit(1)
+    if not oracle_errors(mutated):
+        print(f"oracle scanner accepted removed enforcement: {label}", file=sys.stderr)
         sys.exit(1)
 PY

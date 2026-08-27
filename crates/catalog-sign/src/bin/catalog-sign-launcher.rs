@@ -663,9 +663,11 @@ fn write_recovery_binding(
     let bytes = serde_jcs::to_vec(&serde_json::json!({
         "schema_version": 1,
         "kind": "sign_recovery_binding",
+        "original_operation_mode": "sign",
         "input_transfer_sha256": input_transfer_sha256,
         "launcher_config_sha256": config_sha256,
         "signer_sha256": signer_sha256,
+        "staging": null,
     }))
     .map_err(|_| rejected())?;
     let name = CString::new(RECOVERY_BINDING_NAME).expect("fixed recovery binding name");
@@ -685,7 +687,9 @@ fn write_recovery_binding(
     let mut file = unsafe { fs::File::from_raw_fd(descriptor) };
     file.write_all(&bytes).map_err(|_| rejected())?;
     file.flush().map_err(|_| rejected())?;
-    file.set_permissions(fs::Permissions::from_mode(0o400))
+    // The isolated signer must durably add the exact stage identity before publication. It seals
+    // this temporary operation record to 0400 when cleanup becomes authorized.
+    file.set_permissions(fs::Permissions::from_mode(0o600))
         .map_err(|_| rejected())?;
     file.sync_all().map_err(|_| rejected())?;
     if hash_descriptor(&file, bytes.len() as u64)? != sha256(&bytes) {
@@ -734,7 +738,18 @@ fn verify_recovery_binding(
         )
     };
     let metadata = file.metadata().map_err(|_| rejected())?;
-    if !secure_regular(&metadata, current_euid(), 0o400, MAX_CONFIG_BYTES * 64) {
+    let accepted_mode = if historical {
+        0o400
+    } else {
+        metadata.permissions().mode() & 0o7777
+    };
+    if !secure_regular(
+        &metadata,
+        current_euid(),
+        accepted_mode,
+        MAX_CONFIG_BYTES * 64,
+    ) || (!historical && !matches!(accepted_mode, 0o400 | 0o600))
+    {
         return Err(rejected());
     }
     let bytes = read_bounded(&file, metadata.len())?;
@@ -756,15 +771,70 @@ fn verify_recovery_binding(
     if field("input_transfer_sha256")? != input_transfer_sha256
         || field("launcher_config_sha256")? != config_sha256
         || field("signer_sha256")? != signer_sha256
-        || (historical
-            && value
-                .pointer("/isolation_attestation/mode")
-                .and_then(serde_json::Value::as_str)
-                != Some("sign"))
+    {
+        return Err(rejected());
+    }
+    if historical {
+        if value.as_object().is_none_or(|object| object.len() != 5)
+            || value["schema_version"] != 1
+            || value["kind"] != "signer_output"
+            || !authorized_recovery_mode_combination(
+                field("original_operation_mode")?,
+                field("mode")?,
+            )
+        {
+            return Err(rejected());
+        }
+    } else if value.as_object().is_none_or(|object| object.len() != 7)
+        || value["schema_version"] != 1
+        || value["kind"] != "sign_recovery_binding"
+        || value["original_operation_mode"] != "sign"
+        || !valid_bound_staging(&value["staging"])
     {
         return Err(rejected());
     }
     Ok(())
+}
+
+fn authorized_recovery_mode_combination(original: &str, completion: &str) -> bool {
+    original == "sign" && matches!(completion, "sign" | "recover-sign")
+}
+
+fn valid_bound_staging(value: &serde_json::Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    let Some(name) = object
+        .get("relative_name")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return false;
+    };
+    object.len() == 6
+        && valid_staging_name(name)
+        && object
+            .get("device")
+            .and_then(serde_json::Value::as_u64)
+            .is_some()
+        && object
+            .get("inode")
+            .and_then(serde_json::Value::as_u64)
+            .is_some()
+        && object.get("uid").and_then(serde_json::Value::as_u64) == Some(u64::from(current_euid()))
+        && object.get("mode").and_then(serde_json::Value::as_u64) == Some(0o700)
+        && object
+            .get("cleanup_authorized")
+            .and_then(serde_json::Value::as_bool)
+            .is_some()
+}
+
+fn valid_staging_name(name: &str) -> bool {
+    const PREFIX: &str = ".catalog-sign-stage-";
+    name.len() == PREFIX.len() + 32
+        && name.starts_with(PREFIX)
+        && name[PREFIX.len()..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 fn open_optional_output_file(
@@ -1283,4 +1353,24 @@ fn current_egid() -> u32 {
 }
 const fn rejected() -> SignError {
     SignError::IsolationRejected
+}
+
+#[cfg(test)]
+mod tests {
+    use super::authorized_recovery_mode_combination;
+
+    #[test]
+    fn recovery_mode_combinations_are_exact() {
+        assert!(authorized_recovery_mode_combination("sign", "sign"));
+        assert!(authorized_recovery_mode_combination("sign", "recover-sign"));
+        for (original, completion) in [
+            ("recover-sign", "recover-sign"),
+            ("recover-sign", "sign"),
+            ("sign", "assemble-intent"),
+            ("sign", "finalize"),
+            ("finalize", "recover-sign"),
+        ] {
+            assert!(!authorized_recovery_mode_combination(original, completion));
+        }
+    }
 }

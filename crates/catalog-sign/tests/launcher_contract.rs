@@ -4,7 +4,7 @@ use std::{
     fs,
     os::{
         fd::RawFd,
-        unix::fs::{DirBuilderExt, PermissionsExt},
+        unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt},
     },
     path::{Path, PathBuf},
     process::Command,
@@ -273,6 +273,69 @@ fn fixture_authority_signs_through_real_launcher_and_reverse_transfer() {
         "recovery admitted a different launcher config/signer identity"
     );
     assert_eq!(snapshot_tree(&output), first_snapshot);
+
+    // Reproduce the exact durable state of an interrupted real fixture sign: authentic visible
+    // payload, its original sign binding and exact empty retained stage, but no reverse manifest.
+    fs::remove_file(output.join("transfer-manifest-v1.json")).unwrap();
+    let stage = output.join(".catalog-sign-stage-0123456789abcdef0123456789abcdef");
+    fs::DirBuilder::new().mode(0o700).create(&stage).unwrap();
+    write_interrupted_recovery_binding(&output, &stage, &config, &signer, &input);
+    let first_recovery = launch_recover(&config, &input, &output);
+    assert!(
+        first_recovery.status.success(),
+        "interrupted fixture recovery failed: {}",
+        String::from_utf8_lossy(&first_recovery.stderr)
+    );
+    assert!(!stage.exists());
+    assert!(!output.join("sign-recovery-binding-v1.json").exists());
+    let recovered_manifest = fs::read(output.join("transfer-manifest-v1.json")).unwrap();
+    let recovered_value: Value = serde_json::from_slice(&recovered_manifest).unwrap();
+    assert_eq!(
+        recovered_value["isolation_attestation"]["mode"],
+        "recover-sign"
+    );
+    assert_eq!(
+        recovered_value["isolation_attestation"]["original_operation_mode"],
+        "sign"
+    );
+    let recovered_snapshot = snapshot_tree(&output);
+    let second_recovery = launch_recover(&config, &input, &output);
+    assert!(
+        second_recovery.status.success(),
+        "completed recovered-manifest retry failed: {}",
+        String::from_utf8_lossy(&second_recovery.stderr)
+    );
+    assert_eq!(snapshot_tree(&output), recovered_snapshot);
+}
+
+fn write_interrupted_recovery_binding(
+    output: &Path,
+    stage: &Path,
+    config: &Path,
+    signer: &Path,
+    input: &Path,
+) {
+    let metadata = fs::symlink_metadata(stage).unwrap();
+    let bytes = serde_jcs::to_vec(&json!({
+        "schema_version": 1,
+        "kind": "sign_recovery_binding",
+        "original_operation_mode": "sign",
+        "input_transfer_sha256": sha256(&fs::read(input.join("transfer-manifest-v1.json")).unwrap()),
+        "launcher_config_sha256": sha256(&fs::read(config).unwrap()),
+        "signer_sha256": sha256(&fs::read(signer).unwrap()),
+        "staging": {
+            "relative_name": stage.file_name().unwrap().to_str().unwrap(),
+            "device": metadata.dev(),
+            "inode": metadata.ino(),
+            "uid": metadata.uid(),
+            "mode": metadata.permissions().mode() & 0o7777,
+            "cleanup_authorized": false,
+        },
+    }))
+    .unwrap();
+    let path = output.join("sign-recovery-binding-v1.json");
+    fs::write(&path, bytes).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
 }
 
 #[test]
@@ -540,6 +603,10 @@ fn verify_fixture_reverse_transfer(output: &Path, input: &Path, fixture_object: 
         sha256(&fs::read(input.join("transfer-manifest-v1.json")).unwrap())
     );
     assert_eq!(reverse["isolation_attestation"]["mode"], "sign");
+    assert_eq!(
+        reverse["isolation_attestation"]["original_operation_mode"],
+        "sign"
+    );
     let entries = reverse["entries"].as_array().unwrap();
     let expected_paths = entries
         .iter()
