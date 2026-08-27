@@ -1552,9 +1552,9 @@ policies = [
     ("exact recovery abort", "current == prior_bytes", 1),
     ("staged before-success revalidation", "revalidate_before_staged_success(&state)", 2),
     ("recovered before-success revalidation", "revalidate_before_recovered_success(&state)", 3),
-    ("uncertain no guessing", "return Err(uncertain());", 24),
+    ("uncertain no guessing", "return Err(uncertain());", 25),
     ("previsibility prior preserved", "return Err(prior_preserved());", 6),
-    ("record and remote-state visibility recovery required", "return Err(recovery_required());", 21),
+    ("record and remote-state visibility recovery required", "return Err(recovery_required());", 22),
     ("uncertainty record retention", "FaultPoint::AfterLatestDirectorySync", 1),
     ("latest temp unnamed preparation", "let latest_temporary = open_latest_temporary(&state)", 1),
     ("latest temp durable link and readback", "link_latest_temporary(&state, &latest_temporary, &intended_bytes)", 1),
@@ -2194,6 +2194,7 @@ sources = {
     "manifest": Path("conformance/transport/manifest-v1.json").read_text(encoding="utf-8"),
     "asset": Path("conformance/transport/github-release-asset-v1.txt").read_text(encoding="utf-8"),
     "runbook": Path("docs/release-runbook.md").read_text(encoding="utf-8"),
+    "security": Path("docs/security-boundaries.md").read_text(encoding="utf-8"),
     "github_tests": Path("crates/catalog-publish/tests/github_workflow.rs").read_text(encoding="utf-8"),
     "recovery_tests": Path("crates/catalog-publish/tests/remote_recovery.rs").read_text(encoding="utf-8"),
     "broker_tests": Path("crates/catalog-publish/tests/broker_boundary.rs").read_text(encoding="utf-8"),
@@ -2222,10 +2223,13 @@ policies = [
     ("workflow", "lock rebind before publish mutation", 'lock.revalidate().map_err(local_error)?;\n        let _publish_result = broker.publish_draft(', 2),
     ("workflow", "no duplicate publish after receipt", 'if existing_publication.is_none() && before.draft {', 1),
     ("workflow", "exact existing upload resume", 'let remote_asset = if before.assets.len() > index {', 1),
-    ("workflow", "transport operation durable before mutation", 'RemoteRecordKind::TransportOperation,', 1),
-    ("workflow", "transport exact receipt retry", '.read_record(RemoteRecordKind::TransportReceipt)', 1),
-    ("workflow", "transport receipt durable", '.write_record_no_clobber(RemoteRecordKind::TransportReceipt, &canonical(&receipt)?)', 1),
-    ("workflow", "transport state operation binding", 'local_operation_id: state.local_operation_id().to_owned()', 2),
+    ("workflow", "transport dedicated state open", 'let state = open_or_create_transport_workflow_state(state_path).map_err(local_error)?;', 2),
+    ("local", "transport state exact latest allowlist", 'let allowed = BTreeSet::from([\n            REMOTE_WORKFLOW_LOCK.to_owned(),\n            TRANSPORT_OPERATION.to_owned(),\n            TRANSPORT_RECEIPT.to_owned(),\n        ]);', 1),
+    ("local", "transport state empty objects", 'enumerate_names(&self.state.objects, EMPTY_STATE_OBJECTS_ENUMERATION_LIMITS)?.is_empty()', 1),
+    ("workflow", "transport operation durable before mutation", '.write_record_no_clobber(TransportRecordKind::Operation, &transport_operation_bytes)', 1),
+    ("workflow", "transport exact receipt retry", '.read_record(TransportRecordKind::Receipt)', 1),
+    ("workflow", "transport receipt durable", '.write_record_no_clobber(TransportRecordKind::Receipt, &canonical(&receipt)?)', 1),
+    ("workflow", "transport manifest digest operation binding", 'manifest_sha256: sha256(TRANSPORT_MANIFEST)', 1),
     ("workflow", "commit object tag", 'actual.object_type != crate::broker::BrokerTagObjectTypeV1::Commit', 1),
     ("workflow", "exact tag commit", 'actual.commit_sha != expected_commit', 1),
     ("workflow", "exact release target", 'release.target_commitish != operation.source_commit', 1),
@@ -2303,12 +2307,18 @@ policies = [
     ("runbook", "publication stop", 'Stop again before publication.', 1),
     ("runbook", "no delete replace", 'Do not delete, replace, clobber, retag, recreate, or administratively repair', 1),
     ("runbook", "failure escalation", 'Escalate and stop on any annotated/wrong tag', 1),
+    ("runbook", "transport no-key dedicated state", 'it does not use or require the signed Task 8 production state', 1),
+    ("security", "transport no-key dedicated state", 'it never opens or verifies the production or fixture catalog authority', 1),
+    ("security", "production signed state preserved", 'continue to open and verify the production-signed Task 8 state without weakening', 1),
 ]
 
 test_policies = [
     ("github_tests", "pre-post upload call order", 'assert_eq!(fake.calls[index - 1], "read_draft");', 1),
     ("github_tests", "catalog-last evidence", 'assert_eq!(uploads.last(), Some(&"catalog-v1.json"));', 1),
     ("github_tests", "scratch parent swap evidence", 'scratch_directory_swap_is_rejected_for_test', 1),
+    ("github_tests", "public CLI empty transport bootstrap evidence", 'public_cli_transport_path_bootstraps_empty_state_with_fake_protocol_only', 1),
+    ("github_tests", "transport unknown production record rejection", 'transport_state_rejects_unknown_and_production_records_without_remote_authority', 1),
+    ("github_tests", "transport wrong remote state rejection", 'transport_wrong_tag_release_and_asset_bytes_fail_without_replacement', 1),
     ("recovery_tests", "complete per-asset timing evidence", 'complete_per_asset_before_after_retry_matrix_resumes_only_exact_state', 1),
     ("recovery_tests", "every asset/release drift evidence", 'every_asset_and_release_identity_drift_is_rejected_without_new_mutation', 1),
     ("recovery_tests", "real remote SIGKILL evidence", 'real_sigkill_operation_and_all_local_receipt_checkpoints_settle_on_exact_retry', 1),
@@ -2413,6 +2423,22 @@ def task10_errors(current):
     latest_phase = production_publish.find("verify_latest_production_inner(&state).await?", broker_phase)
     if broker_phase < 0 or latest_phase < broker_phase:
         errors.append("durable broker publication no longer precedes async latest")
+
+    transport_public_region = workflow.split("pub fn publish_transport_fixture(", 1)[-1].split("fn publish_transport_fixture_inner(", 1)[0]
+    if "open_remote_workflow_state" in transport_public_region or "open_fixture_remote_workflow_state" in transport_public_region:
+        errors.append("transport workflow regained production or fixture signed-state dependency")
+    transport_schema = workflow.split("struct TransportOperationV1", 1)[-1].split("struct TransportReceiptV1", 1)[0]
+    expected_transport_fields = [
+        "schema_version", "transport_operation_id", "repository", "source_commit",
+        "manifest_sha256", "broker_client_config_sha256", "broker_executable_sha256",
+        "publisher_broker_config_sha256",
+    ]
+    if re.findall(r"^    ([a-z0-9_]+):", transport_schema, re.MULTILINE) != expected_transport_fields:
+        errors.append("transport operation schema regained production or arbitrary fields")
+    local = current["local"]
+    transport_state_region = local.split("impl TransportWorkflowState", 1)[-1].split("impl RemoteWorkflowState", 1)[0]
+    if ".is_subset(&allowed)" not in transport_state_region:
+        errors.append("transport state no longer rejects records outside its exact allowlist")
 
     transport_region = workflow.split("pub(crate) fn publish_transport_fixture_with(", 1)[-1].split("fn begin_operation", 1)[0]
     transport_order = [
@@ -2533,7 +2559,9 @@ semantic_mutations = [
     ("workflow", "visible promotion settlement bypass", ".settle_visible_operation(lock, main_bytes)", ".read_operation_candidates(lock) /* visible settlement bypass */"),
     ("workflow", "duplicate publish bypass", "existing_publication.is_none() && before.draft", "before.draft /* duplicate publication bypass */"),
     ("workflow", "duplicate upload bypass", "before.assets.len() > index", "false /* existing upload resume bypass */"),
-    ("workflow", "transport receipt retry bypass", ".read_record(RemoteRecordKind::TransportReceipt)", ".read_record(RemoteRecordKind::LatestReceipt) /* transport retry bypass */"),
+    ("workflow", "transport receipt retry bypass", ".read_record(TransportRecordKind::Receipt)", ".read_record(TransportRecordKind::Operation) /* transport retry bypass */"),
+    ("workflow", "transport production state dependency", "open_or_create_transport_workflow_state(state_path)", "open_remote_workflow_state(state_path) /* transport production state dependency */"),
+    ("local", "transport unknown-record allowlist bypass", "if !names.is_subset(&allowed)", "if false /* transport unknown record bypass */"),
     ("recovery_tests", "per-asset catalog-after case removal", '("upload:catalog-v1.json", Failure::After)', '("upload:catalog-v1.json", Failure::Before)'),
     ("workflow", "tag commit bypass", "actual.commit_sha != expected_commit", "false /* actual.commit_sha expected_commit */"),
     ("workflow", "release ID bypass", "release_id.is_some_and(|expected| release.release_id != expected)", "false /* release_id release.release_id expected */"),
@@ -3329,7 +3357,8 @@ def fixture_identity_errors(source, tags, virtual_files=()):
         EXPECTED_PUBLIC.hex(),
         "f9c107510a84f55282b1c83d63b370f5515127e9",
         "630dcd2966c4336691125448bbb25b4ff412a49c732db2c8abc1b8581bd710dd",
-        "It has not been created or published",
+        "d6a1ef91ce596e9d58f83dd01a5f90767baab744",
+        "no release or publication is claimed",
         EXPECTED_DIGESTS["initial_payload"],
         EXPECTED_DIGESTS["valid_payload"],
         EXPECTED_DIGESTS["rejected"],
@@ -3337,15 +3366,15 @@ def fixture_identity_errors(source, tags, virtual_files=()):
     ]
     if any(token not in text["correction_docs"] for token in correction_tokens):
         errors.append("conformance-v2 correction record lost required evidence")
-    if "It has been created" in text["correction_docs"] or "has been published" in text["correction_docs"]:
-        errors.append("documentation falsely claims conformance-v2 publication")
+    if "has been published" in text["correction_docs"] or "a release and publication are claimed" in text["correction_docs"]:
+        errors.append("documentation falsely claims conformance-v2 release publication")
     if EXPECTED_DIGESTS["initial_envelope"] not in text["first_release"] or EXPECTED_DIGESTS["manifest"] not in text["first_release"]:
         errors.append("first-release fixture digests are stale")
 
     if tags.get("catalog-v1-conformance-v1") != "c31d3e747ff5bcc14ed5b82e1f39f37c712591aa":
         errors.append("immutable conformance-v1 tag moved")
-    if "catalog-v1-conformance-v2" in tags:
-        errors.append("conformance-v2 tag exists before authorization")
+    if tags.get("catalog-v1-conformance-v2") != "d6a1ef91ce596e9d58f83dd01a5f90767baab744":
+        errors.append("immutable conformance-v2 tag moved, replaced, or missing")
     return errors
 
 
@@ -3380,7 +3409,7 @@ replace_mutation("cross_test", b"0x03, 0xa1, 0x07, 0xbf", b"0x04, 0xa1, 0x07, 0x
 replace_mutation("publish_support", b"let signing_key = fixture_signing_key();", b"let signing_key = unrelated_signing_key();")
 replace_mutation("cross_test", b"assert!(verify_signed_catalog(envelope).is_err());", b"assert!(true);")
 replace_mutation("generator", b"catalog_sign::generate_fixture_envelope(&payload)", b"stale_fixture_envelope(&payload)")
-replace_mutation("correction_docs", b"It has not been created or published", b"It has been created and published")
+replace_mutation("correction_docs", b"no release or publication is claimed", b"a release and publication are claimed")
 for name in ("initial_envelope", "valid_envelope", "manifest", "initial_payload", "valid_payload", "rejected", "pem"):
     changed = dict(source)
     changed[name] = source[name][:-1] + bytes([source[name][-1] ^ 1])
@@ -3391,7 +3420,8 @@ for index, changed in enumerate(mutations):
         sys.exit(1)
 for label, changed_tags in [
     ("v1 replacement", {**tags, "catalog-v1-conformance-v1": "0" * 40}),
-    ("premature v2", {**tags, "catalog-v1-conformance-v2": "0" * 40}),
+    ("v2 replacement", {**tags, "catalog-v1-conformance-v2": "0" * 40}),
+    ("v2 removal", {key: value for key, value in tags.items() if key != "catalog-v1-conformance-v2"}),
 ]:
     if not fixture_identity_errors(dict(source), changed_tags):
         print(f"conformance-v2 tag mutation was accepted: {label}", file=sys.stderr)

@@ -1,6 +1,6 @@
 # Conformance fixture identity correction
 
-This record documents a nonproduction fixture correction. It is not a release, production signature, publication receipt, or claim that a v2 tag exists.
+This record documents a nonproduction fixture correction and its immutable conformance tag. It is not a release, production signature, publication receipt, or release-publication claim.
 
 ## Immutable v1 evidence
 
@@ -10,7 +10,7 @@ The immutable tag `catalog-v1-conformance-v1` remains at commit `c31d3e747ff5bcc
 
 `catalog-test-key-v1` now uses exactly public key `03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8`. The committed nonproduction PKCS#8 fixture derives that public key. Its one-time public test-data source was Fluxsemble commit `f9c107510a84f55282b1c83d63b370f5515127e9`, path `crates/harness-runtime/tests/fixtures/catalog/test-private-key.seed`, with SHA-256 `630dcd2966c4336691125448bbb25b4ff412a49c732db2c8abc1b8581bd710dd`. The producer has no continuing source, build, package, test, or runtime dependency on Fluxsemble.
 
-The proposed no-replace correction tag is `catalog-v1-conformance-v2`. It has not been created or published and requires separate owner authorization after review.
+The authorized no-replace correction tag `catalog-v1-conformance-v2` was created and read back at exact commit `d6a1ef91ce596e9d58f83dd01a5f90767baab744`. It is immutable and must not be moved, deleted, or replaced. This tag is nonproduction conformance evidence only; no release or publication is claimed.
 
 ## Byte and digest evidence
 

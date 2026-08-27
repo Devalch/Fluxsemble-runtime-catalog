@@ -469,6 +469,12 @@ fn staged(label: &str) -> (TempTree, PathBuf) {
     (temp, state)
 }
 
+fn fresh_transport_state(label: &str) -> (TempTree, PathBuf) {
+    let temp = TempTree::new(label);
+    let state = temp.path("transport-state");
+    (temp, state)
+}
+
 fn catalog_bytes(state: &Path) -> Vec<u8> {
     let reference: serde_json::Value =
         serde_json::from_slice(&fs::read(state.join("latest/catalog-v1.ref")).unwrap()).unwrap();
@@ -789,7 +795,7 @@ fn publish_before_and_after_failure_settles_receipt_without_duplicate_publicatio
 #[test]
 fn transport_fixture_before_and_after_mutation_failures_resume_exact_prerelease() {
     for &(call, timing) in TRANSPORT_RETRY_CASES {
-        let (_temp, state) = staged(&format!(
+        let (_temp, state) = fresh_transport_state(&format!(
             "transport-{call}-{}",
             matches!(timing, Failure::After)
         ));
@@ -902,7 +908,7 @@ fn run_stage_contention() {
 }
 
 fn run_transport_contention() {
-    let (_temp, state) = staged("concurrent-transport-lock");
+    let (_temp, state) = fresh_transport_state("concurrent-transport-lock");
     let inner = Arc::new(Mutex::new(RecoveryBroker::default()));
     let gate = Arc::new(IdentityGate::new());
     let shared = SharedRecoveryBroker {
@@ -938,7 +944,7 @@ fn run_transport_contention() {
 
 #[test]
 fn transport_fixture_rejects_concurrent_release_id_drift_before_publication() {
-    let (_temp, state) = staged("transport-release-drift");
+    let (_temp, state) = fresh_transport_state("transport-release-drift");
     let mut broker = RecoveryBroker {
         drift_after_upload: true,
         ..Default::default()

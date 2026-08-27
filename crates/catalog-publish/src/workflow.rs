@@ -17,6 +17,7 @@ use crate::{
     },
     local::{
         FailureOutcome, PublishError, RemoteRecordKind, RemoteWorkflowLock, RemoteWorkflowState,
+        TransportRecordKind, TransportWorkflowState, open_or_create_transport_workflow_state,
         open_remote_workflow_state,
     },
 };
@@ -226,8 +227,6 @@ struct TransportOperationV1 {
     schema_version: u16,
     transport_operation_id: String,
     repository: String,
-    local_operation_id: String,
-    signed_transfer_sha256: String,
     source_commit: String,
     manifest_sha256: String,
     broker_client_config_sha256: String,
@@ -741,7 +740,7 @@ pub fn publish_transport_fixture(
     broker_config: &Path,
     source_commit: &str,
 ) -> Result<RemoteWorkflowOutcome, RemoteWorkflowError> {
-    let state = open_remote_workflow_state(state_path).map_err(local_error)?;
+    let state = open_or_create_transport_workflow_state(state_path).map_err(local_error)?;
     let mut broker = GitHubBroker::new(broker_config).map_err(|_| recovery_required())?;
     publish_transport_fixture_inner(&state, &mut broker, source_commit)
 }
@@ -753,33 +752,27 @@ pub(crate) fn publish_transport_fixture_with(
     broker: &mut dyn BrokerTransport,
     source_commit: &str,
 ) -> Result<RemoteWorkflowOutcome, RemoteWorkflowError> {
-    let state =
-        crate::local::open_fixture_remote_workflow_state(state_path).map_err(local_error)?;
+    let state = open_or_create_transport_workflow_state(state_path).map_err(local_error)?;
     publish_transport_fixture_inner(&state, broker, source_commit)
 }
 
 fn publish_transport_fixture_inner(
-    state: &RemoteWorkflowState,
+    state: &TransportWorkflowState,
     broker: &mut dyn BrokerTransport,
     source_commit: &str,
 ) -> Result<RemoteWorkflowOutcome, RemoteWorkflowError> {
     let lock = state.acquire_workflow_lock().map_err(local_error)?;
-    settle_pending_operation(state, &lock, None)?;
     lock.revalidate().map_err(local_error)?;
     require_commit(source_commit)?;
     let manifest: TransportManifestV1 = parse_canonical(TRANSPORT_MANIFEST)?;
     validate_transport_manifest(&manifest)?;
     let broker_identity = broker.identity_digests().map_err(|_| recovery_required())?;
-    let transport_operation = transport_operation(state, source_commit, broker_identity)?;
+    let transport_operation = transport_operation(source_commit, broker_identity)?;
     let transport_operation_bytes = canonical(&transport_operation)?;
-    state
-        .write_record_no_clobber(
-            RemoteRecordKind::TransportOperation,
-            &transport_operation_bytes,
-        )
+    lock.write_record_no_clobber(TransportRecordKind::Operation, &transport_operation_bytes)
         .map_err(local_error)?;
-    if let Some(receipt_bytes) = state
-        .read_record(RemoteRecordKind::TransportReceipt)
+    if let Some(receipt_bytes) = lock
+        .read_record(TransportRecordKind::Receipt)
         .map_err(local_error)?
     {
         let receipt: TransportReceiptV1 = parse_canonical(&receipt_bytes)?;
@@ -907,15 +900,13 @@ fn publish_transport_fixture_inner(
         phase: "published_verified".to_owned(),
     };
     validate_transport_receipt(&receipt, &transport_operation, &manifest)?;
-    state
-        .write_record_no_clobber(RemoteRecordKind::TransportReceipt, &canonical(&receipt)?)
+    lock.write_record_no_clobber(TransportRecordKind::Receipt, &canonical(&receipt)?)
         .map_err(local_error)?;
     lock.revalidate().map_err(local_error)?;
     Ok(RemoteWorkflowOutcome::TransportFixturePublished)
 }
 
 fn transport_operation(
-    state: &RemoteWorkflowState,
     source_commit: &str,
     broker_identity: crate::broker_client::BrokerIdentityDigests,
 ) -> Result<TransportOperationV1, RemoteWorkflowError> {
@@ -924,8 +915,6 @@ fn transport_operation(
     require_sha256(&broker_identity.publisher_broker_config_sha256)?;
     let body = (
         REPOSITORY,
-        state.local_operation_id(),
-        state.signed_transfer_sha256(),
         source_commit,
         sha256(TRANSPORT_MANIFEST),
         &broker_identity.broker_client_config_sha256,
@@ -936,8 +925,6 @@ fn transport_operation(
         schema_version: 1,
         transport_operation_id: domain_digest(TRANSPORT_OPERATION_DOMAIN, &body)?,
         repository: REPOSITORY.to_owned(),
-        local_operation_id: state.local_operation_id().to_owned(),
-        signed_transfer_sha256: state.signed_transfer_sha256().to_owned(),
         source_commit: source_commit.to_owned(),
         manifest_sha256: sha256(TRANSPORT_MANIFEST),
         broker_client_config_sha256: broker_identity.broker_client_config_sha256,

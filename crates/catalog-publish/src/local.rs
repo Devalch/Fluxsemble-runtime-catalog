@@ -862,6 +862,18 @@ const STATE_LATEST_ENUMERATION_LIMITS: EnumerationLimits = EnumerationLimits {
     maximum_cumulative_name_bytes: 640,
     maximum_work: 12,
 };
+const EMPTY_STATE_OBJECTS_ENUMERATION_LIMITS: EnumerationLimits = EnumerationLimits {
+    maximum_entries: 0,
+    maximum_name_bytes: 64,
+    maximum_cumulative_name_bytes: 0,
+    maximum_work: 2,
+};
+const TRANSPORT_STATE_LATEST_ENUMERATION_LIMITS: EnumerationLimits = EnumerationLimits {
+    maximum_entries: 3,
+    maximum_name_bytes: 64,
+    maximum_cumulative_name_bytes: 192,
+    maximum_work: 5,
+};
 
 #[derive(Clone, Copy)]
 struct PersistentStateLimits {
@@ -1059,8 +1071,6 @@ pub(crate) struct RemoteWorkflowState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RemoteRecordKind {
     Operation,
-    TransportOperation,
-    TransportReceipt,
     DraftReceipt,
     Approval,
     PublicationReceipt,
@@ -1071,8 +1081,6 @@ impl RemoteRecordKind {
     const fn name(self) -> &'static str {
         match self {
             Self::Operation => REMOTE_OPERATION,
-            Self::TransportOperation => TRANSPORT_OPERATION,
-            Self::TransportReceipt => TRANSPORT_RECEIPT,
             Self::DraftReceipt => DRAFT_RECEIPT,
             Self::Approval => RELEASE_APPROVAL,
             Self::PublicationReceipt => PUBLICATION_RECEIPT,
@@ -1087,11 +1095,147 @@ pub(crate) struct RemoteWorkflowLock<'a> {
     identity: FileIdentity,
 }
 
+/// Owner-private capability for only the fixed support transport workflow. It deliberately has no
+/// catalog reference, signed transfer, production operation, latest receipt, or retained object.
+pub(crate) struct TransportWorkflowState {
+    state: StateCapabilities,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TransportRecordKind {
+    Operation,
+    Receipt,
+}
+
+impl TransportRecordKind {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Operation => TRANSPORT_OPERATION,
+            Self::Receipt => TRANSPORT_RECEIPT,
+        }
+    }
+}
+
+pub(crate) struct TransportWorkflowLock<'a> {
+    state: &'a TransportWorkflowState,
+    file: fs::File,
+    identity: FileIdentity,
+}
+
 impl RemoteWorkflowLock<'_> {
     /// Rebinds both the canonical state capability and the retained fixed lock before authority.
     pub(crate) fn revalidate(&self) -> Result<(), PublishError> {
         self.state.revalidate_allow_operation_temp()?;
         validate_workflow_lock(&self.state.state.latest, &self.file, self.identity)
+    }
+}
+
+impl TransportWorkflowState {
+    fn revalidate(&self) -> Result<(), PublishError> {
+        self.state.revalidate()?;
+        if !enumerate_names(&self.state.objects, EMPTY_STATE_OBJECTS_ENUMERATION_LIMITS)?.is_empty()
+        {
+            return Err(rejected());
+        }
+        let names = enumerate_names(
+            &self.state.latest,
+            TRANSPORT_STATE_LATEST_ENUMERATION_LIMITS,
+        )?;
+        let allowed = BTreeSet::from([
+            REMOTE_WORKFLOW_LOCK.to_owned(),
+            TRANSPORT_OPERATION.to_owned(),
+            TRANSPORT_RECEIPT.to_owned(),
+        ]);
+        if !names.is_subset(&allowed) {
+            return Err(rejected());
+        }
+        for name in [TRANSPORT_OPERATION, TRANSPORT_RECEIPT] {
+            let _ =
+                read_optional_state_file(&self.state.latest, name, MAX_STATE_RECORD_BYTES, false)?;
+        }
+        if names.contains(REMOTE_WORKFLOW_LOCK) {
+            let lock = open_workflow_lock(&self.state.latest)?;
+            let identity = FileIdentity::from_metadata(&lock.metadata().map_err(|_| rejected())?);
+            validate_workflow_lock(&self.state.latest, &lock, identity)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn acquire_workflow_lock(&self) -> Result<TransportWorkflowLock<'_>, PublishError> {
+        self.revalidate()?;
+        let file = create_or_open_workflow_lock(&self.state.latest)?;
+        let metadata = file.metadata().map_err(|_| rejected())?;
+        let identity = FileIdentity::from_metadata(&metadata);
+        validate_workflow_lock(&self.state.latest, &file, identity)?;
+        acquire_lock(&file)?;
+        validate_workflow_lock(&self.state.latest, &file, identity)?;
+        let lock = TransportWorkflowLock {
+            state: self,
+            file,
+            identity,
+        };
+        lock.revalidate()?;
+        Ok(lock)
+    }
+}
+
+impl TransportWorkflowLock<'_> {
+    /// Rebinds the dedicated state and retained fixed lock before every transport authority use.
+    pub(crate) fn revalidate(&self) -> Result<(), PublishError> {
+        self.state.revalidate()?;
+        validate_workflow_lock(&self.state.state.latest, &self.file, self.identity)
+    }
+
+    pub(crate) fn read_record(
+        &self,
+        kind: TransportRecordKind,
+    ) -> Result<Option<Vec<u8>>, PublishError> {
+        self.revalidate()?;
+        let bytes = read_optional_state_file(
+            &self.state.state.latest,
+            kind.name(),
+            MAX_STATE_RECORD_BYTES,
+            false,
+        )?;
+        self.revalidate()?;
+        Ok(bytes)
+    }
+
+    pub(crate) fn write_record_no_clobber(
+        &self,
+        kind: TransportRecordKind,
+        bytes: &[u8],
+    ) -> Result<(), PublishError> {
+        self.revalidate()?;
+        if let Some(existing) = read_optional_state_file(
+            &self.state.state.latest,
+            kind.name(),
+            MAX_STATE_RECORD_BYTES,
+            false,
+        )? {
+            if existing != bytes {
+                return Err(recovery_required());
+            }
+            return self.revalidate();
+        }
+        write_unnamed_and_link(&self.state.state.latest, kind.name(), bytes, 0o400)?;
+        remote_record_checkpoint(kind.name())?;
+        self.state
+            .state
+            .latest
+            .sync_all()
+            .map_err(|_| uncertain())?;
+        let readback = read_optional_state_file(
+            &self.state.state.latest,
+            kind.name(),
+            MAX_STATE_RECORD_BYTES,
+            false,
+        )?
+        .ok_or_else(uncertain)?;
+        if readback != bytes {
+            return Err(uncertain());
+        }
+        self.revalidate()
     }
 }
 
@@ -1409,6 +1553,18 @@ pub(crate) fn open_remote_workflow_state(
     state_path: &Path,
 ) -> Result<RemoteWorkflowState, PublishError> {
     open_remote_workflow_state_with(state_path, VerificationPolicy::Production)
+}
+
+pub(crate) fn open_or_create_transport_workflow_state(
+    state_path: &Path,
+) -> Result<TransportWorkflowState, PublishError> {
+    #[cfg(test)]
+    let state = prepare_state(state_path, PERSISTENT_STATE_LIMITS, &TestPlan::default())?;
+    #[cfg(not(test))]
+    let state = prepare_state(state_path, PERSISTENT_STATE_LIMITS, &())?;
+    let transport = TransportWorkflowState { state };
+    transport.revalidate()?;
+    Ok(transport)
 }
 
 #[allow(dead_code)]

@@ -3,8 +3,9 @@
 use std::{
     collections::BTreeMap,
     fs,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{DirBuilderExt, PermissionsExt},
     path::{Path, PathBuf},
+    process::Command,
 };
 
 #[allow(dead_code)]
@@ -35,6 +36,94 @@ use support::{TempTree, fixture_transfer};
 
 const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 const CONFIG_SHA256: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+const TRANSPORT_PROTOCOL_FAKE_C: &str = r#"
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+static const char *commit = "0123456789abcdef0123456789abcdef01234567";
+static const char *asset = "Fluxsemble runtime catalog GitHub release asset transport fixture v1.\n";
+static const char *digest = "12238677d13a13b3e9a47a952b8a96d45e06f4cb38fcb51cd5ddc04e2c624d95";
+
+static int marker(const char *root, const char *name, int create) {
+    char path[PATH_MAX];
+    if (snprintf(path, sizeof(path), "%s/%s", root, name) >= (int)sizeof(path)) return -1;
+    if (create) {
+        int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+        if (fd >= 0) { close(fd); return 1; }
+        if (errno != EEXIST) return -1;
+    }
+    return access(path, F_OK) == 0;
+}
+
+static int output_path(const char *request, char *path, size_t capacity) {
+    const char *start = strstr(request, "\"output_path\":\"");
+    if (start == NULL) return -1;
+    start += strlen("\"output_path\":\"");
+    const char *end = strchr(start, '\"');
+    if (end == NULL || (size_t)(end - start) >= capacity) return -1;
+    memcpy(path, start, (size_t)(end - start));
+    path[end - start] = 0;
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    if (argc != 5 || strcmp(argv[1], "--config") != 0 ||
+        strcmp(argv[3], "--expected-config-sha256") != 0) return 80;
+    char root[PATH_MAX], request[65537];
+    int config = open(argv[2], O_RDONLY);
+    if (config < 0) return 81;
+    ssize_t root_size = read(config, root, sizeof(root) - 1);
+    close(config);
+    if (root_size <= 0) return 82;
+    root[root_size] = 0;
+    size_t request_size = fread(request, 1, sizeof(request) - 1, stdin);
+    if (ferror(stdin) || request_size == sizeof(request) - 1) return 83;
+    request[request_size] = 0;
+
+    if (strstr(request, "\"kind\":\"create_tag\"") != NULL) {
+        if (marker(root, "tag", 1) < 0) return 84;
+        printf("{\"commit_sha\":\"%s\",\"kind\":\"tag\",\"object_type\":\"commit\",\"schema_version\":1,\"tag\":\"transport-v1\"}", commit);
+    } else if (strstr(request, "\"kind\":\"read_tag\"") != NULL) {
+        if (marker(root, "tag", 0) != 1) return 85;
+        printf("{\"commit_sha\":\"%s\",\"kind\":\"tag\",\"object_type\":\"commit\",\"schema_version\":1,\"tag\":\"transport-v1\"}", commit);
+    } else if (strstr(request, "\"kind\":\"read_draft\"") != NULL) {
+        int draft = marker(root, "draft", 0);
+        int uploaded = marker(root, "asset", 0);
+        int published = marker(root, "published", 0);
+        if (draft < 0 || uploaded < 0 || published < 0) return 86;
+        if (!draft) {
+            fputs("{\"kind\":\"draft_missing\",\"schema_version\":1,\"tag\":\"transport-v1\"}", stdout);
+        } else {
+            printf("{\"assets\":%s,\"draft\":%s,\"kind\":\"draft\",\"notes\":\"Permanent credential-free GitHub release asset transport fixture.\",\"prerelease\":true,\"release_id\":\"7\",\"schema_version\":1,\"tag\":\"transport-v1\",\"target_commitish\":\"%s\",\"title\":\"Fluxsemble runtime catalog transport fixture v1\"}", uploaded ? "[{\"asset_id\":\"11\",\"name\":\"github-release-asset-v1.txt\",\"size\":70}]" : "[]", published ? "false" : "true", commit);
+        }
+    } else if (strstr(request, "\"kind\":\"create_draft\"") != NULL) {
+        if (marker(root, "draft", 1) < 0) return 87;
+        printf("{\"assets\":[],\"draft\":true,\"kind\":\"draft\",\"notes\":\"Permanent credential-free GitHub release asset transport fixture.\",\"prerelease\":true,\"release_id\":\"7\",\"schema_version\":1,\"tag\":\"transport-v1\",\"target_commitish\":\"%s\",\"title\":\"Fluxsemble runtime catalog transport fixture v1\"}", commit);
+    } else if (strstr(request, "\"kind\":\"upload_asset\"") != NULL) {
+        if (marker(root, "asset", 1) < 0) return 88;
+        printf("{\"kind\":\"asset_uploaded\",\"name\":\"github-release-asset-v1.txt\",\"schema_version\":1,\"sha256\":\"%s\",\"size\":70,\"status\":\"asset_uploaded\"}", digest);
+    } else if (strstr(request, "\"kind\":\"download_asset\"") != NULL) {
+        char path[PATH_MAX];
+        if (output_path(request, path, sizeof(path)) != 0) return 89;
+        int output = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+        if (output < 0 || write(output, asset, 70) != 70 || fsync(output) != 0 || fchmod(output, 0400) != 0 || fsync(output) != 0 || close(output) != 0) return 90;
+        printf("{\"asset\":{\"asset_id\":\"11\",\"name\":\"github-release-asset-v1.txt\",\"sha256\":\"%s\",\"size\":70},\"kind\":\"asset\",\"schema_version\":1}", digest);
+    } else if (strstr(request, "\"kind\":\"publish_draft\"") != NULL) {
+        if (marker(root, "published", 1) < 0) return 91;
+        fputs("{\"kind\":\"published\",\"release_id\":\"7\",\"schema_version\":1,\"status\":\"published\"}", stdout);
+    } else {
+        return 92;
+    }
+    return fflush(stdout) == 0 ? 0 : 93;
+}
+"#;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FaultTiming {
@@ -304,6 +393,52 @@ fn staged_fixture(label: &str) -> (TempTree, PathBuf) {
     (temp, state)
 }
 
+fn fresh_transport_state(label: &str) -> (TempTree, PathBuf) {
+    let temp = TempTree::new(label);
+    let state = temp.path("transport-state");
+    (temp, state)
+}
+
+fn transport_protocol_fake_config(temp: &TempTree) -> PathBuf {
+    let source = temp.path("transport-protocol-fake.c");
+    let executable = temp.path("transport-protocol-fake");
+    fs::write(&source, TRANSPORT_PROTOCOL_FAKE_C).unwrap();
+    let output = Command::new("cc")
+        .args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&executable)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "fake broker compile failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o500)).unwrap();
+
+    let remote = temp.path("fake-remote");
+    fs::DirBuilder::new().mode(0o700).create(&remote).unwrap();
+    let publisher_config = temp.path("publisher-config");
+    fs::write(&publisher_config, remote.as_os_str().as_encoded_bytes()).unwrap();
+    fs::set_permissions(&publisher_config, fs::Permissions::from_mode(0o600)).unwrap();
+    let client_config = temp.path("broker-client-config.json");
+    fs::write(
+        &client_config,
+        serde_jcs::to_vec(&broker_client::PublisherBrokerClientConfigV1 {
+            schema_version: 1,
+            catalog_gh_broker_path: executable.to_str().unwrap().to_owned(),
+            catalog_gh_broker_sha256: sha256(&fs::read(&executable).unwrap()),
+            publisher_broker_config_path: publisher_config.to_str().unwrap().to_owned(),
+            publisher_broker_config_sha256: sha256(&fs::read(&publisher_config).unwrap()),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(&client_config, fs::Permissions::from_mode(0o600)).unwrap();
+    client_config
+}
+
 fn production_catalog_bytes(state: &Path) -> Vec<u8> {
     let reference: serde_json::Value =
         serde_json::from_slice(&fs::read(state.join("latest/catalog-v1.ref")).unwrap()).unwrap();
@@ -537,13 +672,85 @@ fn approval_publish_and_latest_are_separate_exact_durable_transitions() {
 }
 
 #[test]
-fn fixed_transport_fixture_is_support_only_prerelease_and_uses_same_verification_flow() {
-    let (_temp, state) = staged_fixture("transport-fixture");
-    let mut fake = FakeBroker::default();
+fn public_cli_transport_path_bootstraps_empty_state_with_fake_protocol_only() {
+    let (temp, state) = fresh_transport_state("transport-public-cli");
+    let config = transport_protocol_fake_config(&temp);
+    let output = Command::new(env!("CARGO_BIN_EXE_catalog-publish"))
+        .args([
+            "publish-transport-fixture",
+            "--state",
+            state.to_str().unwrap(),
+            "--source-commit",
+            COMMIT,
+            "--broker-config",
+            config.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"transport fixture prerelease published\n");
+    assert!(output.stderr.is_empty());
+    assert!(state.join("latest/transport-operation-v1.json").is_file());
+    assert!(state.join("latest/transport-receipt-v1.json").is_file());
+    assert!(!state.join("latest/catalog-v1.ref").exists());
+    assert_eq!(fs::read_dir(state.join("objects")).unwrap().count(), 0);
+}
+
+#[test]
+fn dedicated_transport_state_is_no_catalog_and_publishes_exact_prerelease() {
+    let (_temp, state) = fresh_transport_state("transport-fixture");
+    let mut fake = FakeBroker {
+        operation_record: Some(state.join("latest/transport-operation-v1.json")),
+        ..Default::default()
+    };
     assert_eq!(
         workflow::publish_transport_fixture_with(&state, &mut fake, COMMIT).unwrap(),
         workflow::RemoteWorkflowOutcome::TransportFixturePublished
     );
+    assert_eq!(
+        fs::metadata(&state).unwrap().permissions().mode() & 0o7777,
+        0o700
+    );
+    assert_eq!(fs::read_dir(state.join("objects")).unwrap().count(), 0);
+    let latest_names = fs::read_dir(state.join("latest"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        latest_names,
+        std::collections::BTreeSet::from([
+            ".remote-workflow-v1.lock".to_owned(),
+            "transport-operation-v1.json".to_owned(),
+            "transport-receipt-v1.json".to_owned(),
+        ])
+    );
+    let operation = fs::read_to_string(state.join("latest/transport-operation-v1.json")).unwrap();
+    for binding in [
+        "repository",
+        "source_commit",
+        "manifest_sha256",
+        "broker_client_config_sha256",
+        "broker_executable_sha256",
+        "publisher_broker_config_sha256",
+    ] {
+        assert!(operation.contains(binding), "missing {binding}");
+    }
+    for production_only in [
+        "local_operation_id",
+        "signed_transfer_sha256",
+        "catalog-v1.ref",
+        "signature",
+    ] {
+        assert!(
+            !operation.contains(production_only),
+            "found {production_only}"
+        );
+    }
+
     let release = fake.release("transport-v1").unwrap();
     assert!(!release.draft);
     assert!(release.prerelease);
@@ -566,6 +773,105 @@ fn fixed_transport_fixture_is_support_only_prerelease_and_uses_same_verification
         .unwrap();
     assert_eq!(fake.calls[upload - 1], "read_draft");
     assert_eq!(fake.calls[upload + 1], "read_draft");
+}
+
+#[test]
+fn transport_wrong_tag_release_and_asset_bytes_fail_without_replacement() {
+    let exact_tag = || RemoteTag {
+        tag: "transport-v1".to_owned(),
+        commit_sha: COMMIT.to_owned(),
+        object_type: broker::BrokerTagObjectTypeV1::Commit,
+    };
+    let exact_release = || RemoteRelease {
+        release_id: "7".to_owned(),
+        tag: "transport-v1".to_owned(),
+        target_commitish: COMMIT.to_owned(),
+        title: "Fluxsemble runtime catalog transport fixture v1".to_owned(),
+        notes: "Permanent credential-free GitHub release asset transport fixture.".to_owned(),
+        draft: true,
+        prerelease: true,
+        assets: Vec::new(),
+    };
+
+    let (_temp, state) = fresh_transport_state("transport-wrong-tag");
+    let mut wrong_tag = FakeBroker::default();
+    wrong_tag.tags.insert(
+        "transport-v1".to_owned(),
+        RemoteTag {
+            commit_sha: "1111111111111111111111111111111111111111".to_owned(),
+            ..exact_tag()
+        },
+    );
+    assert!(workflow::publish_transport_fixture_with(&state, &mut wrong_tag, COMMIT).is_err());
+    assert!(wrong_tag.releases.is_empty());
+
+    let (_temp, state) = fresh_transport_state("transport-wrong-release");
+    let mut wrong_release = FakeBroker::default();
+    wrong_release
+        .tags
+        .insert("transport-v1".to_owned(), exact_tag());
+    wrong_release.releases.push(RemoteRelease {
+        title: "wrong title".to_owned(),
+        ..exact_release()
+    });
+    assert!(workflow::publish_transport_fixture_with(&state, &mut wrong_release, COMMIT).is_err());
+    assert!(
+        !wrong_release
+            .calls
+            .iter()
+            .any(|call| call.starts_with("upload:"))
+    );
+
+    let (_temp, state) = fresh_transport_state("transport-wrong-asset");
+    let mut wrong_asset = FakeBroker::default();
+    wrong_asset
+        .tags
+        .insert("transport-v1".to_owned(), exact_tag());
+    wrong_asset.releases.push(RemoteRelease {
+        assets: vec![RemoteReleaseAsset {
+            asset_id: "11".to_owned(),
+            name: "github-release-asset-v1.txt".to_owned(),
+            size: 70,
+        }],
+        ..exact_release()
+    });
+    wrong_asset.bytes.insert("11".to_owned(), vec![b'x'; 70]);
+    assert!(workflow::publish_transport_fixture_with(&state, &mut wrong_asset, COMMIT).is_err());
+    assert!(!wrong_asset.calls.iter().any(|call| call == "publish_draft"));
+}
+
+#[test]
+fn transport_state_rejects_unknown_and_production_records_without_remote_authority() {
+    for name in [
+        "unknown-v1.json",
+        "catalog-v1.ref",
+        "remote-operation-v1.json",
+        ".remote-operation-v1.tmp",
+        "latest-receipt-v1.json",
+    ] {
+        let (_temp, state) = fresh_transport_state(&format!("transport-reject-{name}"));
+        fs::DirBuilder::new().mode(0o700).create(&state).unwrap();
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(state.join("objects"))
+            .unwrap();
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(state.join("latest"))
+            .unwrap();
+        fs::write(state.join("latest").join(name), b"production-or-unknown").unwrap();
+        fs::set_permissions(
+            state.join("latest").join(name),
+            fs::Permissions::from_mode(0o400),
+        )
+        .unwrap();
+        let mut fake = FakeBroker::default();
+        assert!(
+            workflow::publish_transport_fixture_with(&state, &mut fake, COMMIT).is_err(),
+            "{name}"
+        );
+        assert!(fake.calls.is_empty(), "remote authority reached for {name}");
+    }
 }
 
 fn sha256(bytes: &[u8]) -> String {
