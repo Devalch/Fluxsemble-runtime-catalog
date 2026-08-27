@@ -701,6 +701,84 @@ fn public_cli_transport_path_bootstraps_empty_state_with_fake_protocol_only() {
 }
 
 #[test]
+fn unsupported_unnamed_files_use_no_clobber_fallback_and_retry_exact_transport_record() {
+    let (_temp, state) = fresh_transport_state("transport-unnamed-fallback");
+    let mut fake = FakeBroker {
+        operation_record: Some(state.join("latest/transport-operation-v1.json")),
+        ..Default::default()
+    };
+
+    local::configure_unnamed_open_error(Some(libc::EOPNOTSUPP));
+    let first = workflow::publish_transport_fixture_with(&state, &mut fake, COMMIT);
+    local::configure_unnamed_open_error(None);
+    assert_eq!(
+        first.unwrap(),
+        workflow::RemoteWorkflowOutcome::TransportFixturePublished
+    );
+
+    let operation_path = state.join("latest/transport-operation-v1.json");
+    let operation = fs::read(&operation_path).unwrap();
+    assert!(!operation.is_empty());
+    assert_eq!(
+        fs::metadata(&operation_path).unwrap().permissions().mode() & 0o7777,
+        0o400
+    );
+    let retry = workflow::publish_transport_fixture_with(&state, &mut fake, COMMIT).unwrap();
+    assert_eq!(
+        retry,
+        workflow::RemoteWorkflowOutcome::TransportFixturePublished
+    );
+    assert_eq!(fs::read(operation_path).unwrap(), operation);
+}
+
+#[test]
+fn unnamed_fallback_preserves_existing_names_and_unexpected_errors_do_not_fallback() {
+    let temp = TempTree::new("state-record-fallback-rejections");
+    for kind in ["regular", "partial", "symlink", "hardlink"] {
+        let parent = temp.path(&format!("latest-{kind}"));
+        fs::DirBuilder::new().mode(0o700).create(&parent).unwrap();
+        let target = parent.join("record.json");
+        match kind {
+            "regular" => fs::write(&target, b"existing exact name").unwrap(),
+            "partial" => fs::write(&target, b"{").unwrap(),
+            "symlink" => {
+                std::os::unix::fs::symlink(temp.path("absent-target"), &target).unwrap();
+            }
+            "hardlink" => {
+                let source = temp.path("hardlink-source");
+                fs::write(&source, b"linked bytes").unwrap();
+                fs::hard_link(source, &target).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let before = fs::symlink_metadata(&target).unwrap();
+        let before_bytes = (kind != "symlink").then(|| fs::read(&target).unwrap());
+        local::configure_unnamed_open_error(Some(libc::EOPNOTSUPP));
+        let result = local::write_test_state_record(&parent, "record.json", b"replacement");
+        local::configure_unnamed_open_error(None);
+        assert!(result.is_err(), "{kind}");
+        let after = fs::symlink_metadata(&target).unwrap();
+        assert_eq!(
+            after.file_type().is_symlink(),
+            before.file_type().is_symlink(),
+            "{kind}"
+        );
+        assert_eq!(after.len(), before.len(), "{kind}");
+        if let Some(before_bytes) = before_bytes {
+            assert_eq!(fs::read(&target).unwrap(), before_bytes, "{kind}");
+        }
+    }
+
+    let parent = temp.path("unexpected-error");
+    fs::DirBuilder::new().mode(0o700).create(&parent).unwrap();
+    local::configure_unnamed_open_error(Some(libc::EACCES));
+    let result = local::write_test_state_record(&parent, "record.json", b"canonical");
+    local::configure_unnamed_open_error(None);
+    assert!(result.is_err());
+    assert!(!parent.join("record.json").exists());
+}
+
+#[test]
 fn dedicated_transport_state_is_no_catalog_and_publishes_exact_prerelease() {
     let (_temp, state) = fresh_transport_state("transport-fixture");
     let mut fake = FakeBroker {

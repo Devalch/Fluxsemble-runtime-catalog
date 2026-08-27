@@ -3439,25 +3439,32 @@ fn write_unnamed_and_link(
     if bytes.is_empty() || bytes.len() as u64 > MAX_STATE_RECORD_BYTES {
         return Err(rejected());
     }
-    let mut file = open_unnamed(parent, 0o600)?;
+    let (mut file, visible) = match open_unnamed_result(parent, 0o600)? {
+        UnnamedOpen::File(file) => (file, false),
+        UnnamedOpen::Unsupported => (open_exclusive_state_file(parent, name, 0o600)?, true),
+    };
     file.write_all(bytes).map_err(|_| rejected())?;
     file.flush().map_err(|_| rejected())?;
     file.set_permissions(fs::Permissions::from_mode(mode))
         .map_err(|_| rejected())?;
     file.sync_all().map_err(|_| rejected())?;
     let metadata = file.metadata().map_err(|_| rejected())?;
-    if !secure_file_allow_links(&metadata, 0)
+    let expected_links = u64::from(visible);
+    if !secure_file_allow_links(&metadata, expected_links)
         || metadata.len() != bytes.len() as u64
         || read_descriptor(&file, metadata.len())? != bytes
     {
         return Err(rejected());
     }
-    link_unnamed(&file, parent, name)?;
+    if !visible {
+        link_unnamed(&file, parent, name)?;
+    }
     parent.sync_all().map_err(|_| rejected())?;
     let rebound = open_regular_at(parent, name)?;
     let rebound_metadata = rebound.metadata().map_err(|_| rejected())?;
     if FileIdentity::from_metadata(&rebound_metadata) != FileIdentity::from_metadata(&metadata)
         || !secure_file(&rebound_metadata)
+        || rebound_metadata.len() != bytes.len() as u64
         || read_descriptor(&rebound, rebound_metadata.len())? != bytes
     {
         return Err(rejected());
@@ -3465,7 +3472,23 @@ fn write_unnamed_and_link(
     Ok(file)
 }
 
+enum UnnamedOpen {
+    File(fs::File),
+    Unsupported,
+}
+
 fn open_unnamed(parent: &fs::File, mode: u32) -> Result<fs::File, PublishError> {
+    match open_unnamed_result(parent, mode)? {
+        UnnamedOpen::File(file) => Ok(file),
+        UnnamedOpen::Unsupported => Err(rejected()),
+    }
+}
+
+fn open_unnamed_result(parent: &fs::File, mode: u32) -> Result<UnnamedOpen, PublishError> {
+    #[cfg(test)]
+    if let Some(errno) = TEST_UNNAMED_OPEN_ERRNO.with(std::cell::Cell::get) {
+        return classify_unnamed_open_error(errno);
+    }
     // SAFETY: retained directory, fixed dot path, and mode are valid for O_TMPFILE.
     let descriptor = unsafe {
         libc::openat(
@@ -3476,10 +3499,76 @@ fn open_unnamed(parent: &fs::File, mode: u32) -> Result<fs::File, PublishError> 
         )
     };
     if descriptor < 0 {
+        let errno = std::io::Error::last_os_error()
+            .raw_os_error()
+            .ok_or_else(rejected)?;
+        return classify_unnamed_open_error(errno);
+    }
+    // SAFETY: openat returned one owned descriptor.
+    Ok(UnnamedOpen::File(unsafe {
+        fs::File::from_raw_fd(descriptor)
+    }))
+}
+
+fn classify_unnamed_open_error(errno: i32) -> Result<UnnamedOpen, PublishError> {
+    if errno == libc::EOPNOTSUPP || errno == libc::ENOTSUP || errno == libc::EINVAL {
+        Ok(UnnamedOpen::Unsupported)
+    } else {
+        Err(rejected())
+    }
+}
+
+fn open_exclusive_state_file(
+    parent: &fs::File,
+    name: &str,
+    mode: u32,
+) -> Result<fs::File, PublishError> {
+    if !safe_component(name) {
+        return Err(rejected());
+    }
+    let name = CString::new(name).map_err(|_| rejected())?;
+    // SAFETY: the retained owner-controlled parent, validated final component, flags, and mode
+    // are valid. O_EXCL gives this unsupported-O_TMPFILE fallback no-clobber semantics.
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDWR
+                | libc::O_CREAT
+                | libc::O_EXCL
+                | libc::O_NOFOLLOW
+                | libc::O_CLOEXEC
+                | libc::O_NONBLOCK,
+            mode,
+        )
+    };
+    if descriptor < 0 {
         return Err(rejected());
     }
     // SAFETY: openat returned one owned descriptor.
     Ok(unsafe { fs::File::from_raw_fd(descriptor) })
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_UNNAMED_OPEN_ERRNO: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+}
+
+#[allow(dead_code)]
+#[cfg(test)]
+pub(crate) fn configure_unnamed_open_error(errno: Option<i32>) {
+    TEST_UNNAMED_OPEN_ERRNO.with(|configured| configured.set(errno));
+}
+
+#[allow(dead_code)]
+#[cfg(test)]
+pub(crate) fn write_test_state_record(
+    parent: &Path,
+    name: &str,
+    bytes: &[u8],
+) -> Result<(), PublishError> {
+    let parent = fs::File::open(parent).map_err(|_| rejected())?;
+    write_unnamed_and_link(&parent, name, bytes, 0o400).map(drop)
 }
 
 fn link_unnamed(file: &fs::File, parent: &fs::File, name: &str) -> Result<(), PublishError> {

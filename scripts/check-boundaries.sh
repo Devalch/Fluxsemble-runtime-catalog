@@ -1862,7 +1862,9 @@ policies = [
     ("ELF x86-64 machine", 'u16::from_le_bytes([header[18], header[19]]) != 62', 1),
     ("ELF program-header bound", "program_count > MAX_ELF_PROGRAM_HEADERS", 1),
     ("ELF load segment required", "if !has_load || !has_executable_load", 1),
-    ("config directory exact mode", "metadata.permissions().mode() & 0o7777 == 0o700", 1),
+    ("config directory exact modes", "matches!(metadata.permissions().mode() & 0o7777, 0o700 | 0o755)", 1),
+    ("user-owned ancestor exact modes", "metadata.uid() == current_euid() && matches!(mode, 0o700 | 0o755)", 1),
+    ("fresh broker-private directory exact mode", "metadata.permissions().mode() & 0o7777 == 0o700", 1),
     ("portable broker-private directory links", "fn directory_nlink_matches(observed: u64, conventional: u64) -> bool {\n    observed == 1 || observed == conventional\n}", 1),
     ("portable fresh broker directory check", "!directory_nlink_matches(metadata.nlink(), 2)", 1),
     ("broker regular metadata exact one link", "metadata.nlink() == 1", 4),
@@ -1983,6 +1985,7 @@ test_policies = [
     ("real broker process client", "real_broker_client_process_returns_only_canonical_typed_public_response", 1),
     ("phase config swap matrix", "real_broker_process_rejects_task9_config_swaps_before_every_workflow_mutation", 1),
     ("broker expected digest boundary", "broker_expected_task9_digest_is_checked_before_gh_or_config_directory_authority", 1),
+    ("exact owner directory modes", "broker_and_client_ancestors_accept_only_owner_0700_or_0755_and_config_accepts_0755", 1),
 ]
 
 validator_predicates = [
@@ -2259,6 +2262,12 @@ policies = [
     ("workflow", "transport dedicated state open", 'let state = open_or_create_transport_workflow_state(state_path).map_err(local_error)?;', 2),
     ("local", "transport state exact latest allowlist", 'let allowed = BTreeSet::from([\n            REMOTE_WORKFLOW_LOCK.to_owned(),\n            TRANSPORT_OPERATION.to_owned(),\n            TRANSPORT_RECEIPT.to_owned(),\n        ]);', 1),
     ("local", "transport state empty objects", 'enumerate_names(&self.state.objects, EMPTY_STATE_OBJECTS_ENUMERATION_LIMITS)?.is_empty()', 1),
+    ("local", "unsupported unnamed fallback allowlist", 'errno == libc::EOPNOTSUPP || errno == libc::ENOTSUP || errno == libc::EINVAL', 1),
+    ("local", "fallback direct final-name creation", 'libc::O_CREAT\n                | libc::O_EXCL\n                | libc::O_NOFOLLOW\n                | libc::O_CLOEXEC\n                | libc::O_NONBLOCK', 1),
+    ("local", "fallback exact final readback", 'if FileIdentity::from_metadata(&rebound_metadata) != FileIdentity::from_metadata(&metadata)\n        || !secure_file(&rebound_metadata)\n        || rebound_metadata.len() != bytes.len() as u64', 1),
+    ("broker", "broker owner ancestor exact modes", 'metadata.uid() == current_euid() && matches!(mode, 0o700 | 0o755)', 1),
+    ("broker", "GitHub config exact modes", 'matches!(metadata.permissions().mode() & 0o7777, 0o700 | 0o755)', 1),
+    ("broker_client", "client owner ancestor exact modes", 'metadata.uid() == current_euid() && matches!(mode, 0o700 | 0o755)', 1),
     ("workflow", "transport operation durable before mutation", '.write_record_no_clobber(TransportRecordKind::Operation, &transport_operation_bytes)', 1),
     ("workflow", "transport exact receipt retry", '.read_record(TransportRecordKind::Receipt)', 1),
     ("workflow", "transport receipt durable", '.write_record_no_clobber(TransportRecordKind::Receipt, &canonical(&receipt)?)', 1),
@@ -2343,6 +2352,9 @@ policies = [
     ("runbook", "transport no-key dedicated state", 'it does not use or require the signed Task 8 production state', 1),
     ("security", "transport no-key dedicated state", 'it never opens or verifies the production or fixture catalog authority', 1),
     ("security", "production signed state preserved", 'continue to open and verify the production-signed Task 8 state without weakening', 1),
+    ("security", "unsupported unnamed fallback boundary", 'Only `EOPNOTSUPP`/`ENOTSUP` or `EINVAL` indicating unsupported `O_TMPFILE`', 1),
+    ("runbook", "owner directory mode policy", 'a user-owned ancestor must be exact mode `0700` or `0755`', 1),
+    ("runbook", "partial fallback recovery", 'transport operation identity is state-path-independent', 1),
 ]
 
 test_policies = [
@@ -2352,6 +2364,9 @@ test_policies = [
     ("github_tests", "public CLI empty transport bootstrap evidence", 'public_cli_transport_path_bootstraps_empty_state_with_fake_protocol_only', 1),
     ("github_tests", "transport unknown production record rejection", 'transport_state_rejects_unknown_and_production_records_without_remote_authority', 1),
     ("github_tests", "transport wrong remote state rejection", 'transport_wrong_tag_release_and_asset_bytes_fail_without_replacement', 1),
+    ("github_tests", "unsupported unnamed fallback evidence", 'unsupported_unnamed_files_use_no_clobber_fallback_and_retry_exact_transport_record', 1),
+    ("github_tests", "fallback rejection evidence", 'unnamed_fallback_preserves_existing_names_and_unexpected_errors_do_not_fallback', 1),
+    ("broker_tests", "owner mode evidence", 'broker_and_client_ancestors_accept_only_owner_0700_or_0755_and_config_accepts_0755', 1),
     ("recovery_tests", "complete per-asset timing evidence", 'complete_per_asset_before_after_retry_matrix_resumes_only_exact_state', 1),
     ("recovery_tests", "every asset/release drift evidence", 'every_asset_and_release_identity_drift_is_rejected_without_new_mutation', 1),
     ("recovery_tests", "real remote SIGKILL evidence", 'real_sigkill_operation_and_all_local_receipt_checkpoints_settle_on_exact_retry', 1),

@@ -1119,7 +1119,7 @@ fn read_config(
         libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
     )?;
     let directory_metadata = config_directory_file.metadata().map_err(|_| rejected())?;
-    if !secure_private_directory(&directory_metadata) {
+    if !secure_config_directory(&directory_metadata) {
         return Err(rejected());
     }
     let config_directory = VerifiedDirectory {
@@ -2652,7 +2652,7 @@ fn safe_ancestor(metadata: &fs::Metadata) -> bool {
     }
     let mode = metadata.permissions().mode() & 0o7777;
     (metadata.uid() == 0 && matches!(mode, 0o555 | 0o755 | 0o1777))
-        || (metadata.uid() == current_euid() && mode == 0o700)
+        || (metadata.uid() == current_euid() && matches!(mode, 0o700 | 0o755))
 }
 
 fn secure_config_file(metadata: &fs::Metadata) -> bool {
@@ -2679,6 +2679,13 @@ fn secure_executable(metadata: &fs::Metadata) -> bool {
 
 fn directory_nlink_matches(observed: u64, conventional: u64) -> bool {
     observed == 1 || observed == conventional
+}
+
+fn secure_config_directory(metadata: &fs::Metadata) -> bool {
+    metadata.is_dir()
+        && !metadata.file_type().is_symlink()
+        && metadata.uid() == current_euid()
+        && matches!(metadata.permissions().mode() & 0o7777, 0o700 | 0o755)
 }
 
 fn secure_private_directory(metadata: &fs::Metadata) -> bool {
@@ -2748,8 +2755,8 @@ fn verify_directory_rebind(
     let rebound_metadata = rebound.metadata().map_err(|_| rejected())?;
     if !same_directory_identity(Identity::from_metadata(&retained_metadata), identity)
         || !same_directory_identity(Identity::from_metadata(&rebound_metadata), identity)
-        || !secure_private_directory(&retained_metadata)
-        || !secure_private_directory(&rebound_metadata)
+        || !secure_config_directory(&retained_metadata)
+        || !secure_config_directory(&rebound_metadata)
     {
         return Err(rejected());
     }

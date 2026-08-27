@@ -1501,6 +1501,28 @@ fn executable_is_supported_elf_only_and_retained_after_final_rebind() {
 }
 
 #[test]
+fn broker_and_client_ancestors_accept_only_owner_0700_or_0755_and_config_accepts_0755() {
+    let accepted = Fixture::new("owner-0755-accepted", FakeBehavior::Success, &tag_json());
+    let (client_config, _) = broker_client_fixture(&accepted);
+    fs::set_permissions(&accepted.root.0, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&accepted.config_dir, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(execute(&accepted, &read_tag_request()).is_ok());
+    assert!(BrokerClient::open(&client_config).is_ok());
+
+    for mode in [0o750, 0o751, 0o711, 0o775] {
+        let fixture = Fixture::new(
+            &format!("owner-ancestor-{mode:o}-rejected"),
+            FakeBehavior::Success,
+            &tag_json(),
+        );
+        let (client_config, _) = broker_client_fixture(&fixture);
+        fs::set_permissions(&fixture.root.0, fs::Permissions::from_mode(mode)).unwrap();
+        assert!(execute(&fixture, &read_tag_request()).is_err(), "{mode:o}");
+        assert!(BrokerClient::open(&client_config).is_err(), "{mode:o}");
+    }
+}
+
+#[test]
 fn config_executable_and_directory_identity_hash_mode_and_links_fail_closed() {
     let wrong_hash = Fixture::new("wrong-hash", FakeBehavior::Success, &tag_json());
     let mut config: PublisherBrokerConfigV1 =
@@ -1517,9 +1539,15 @@ fn config_executable_and_directory_identity_hash_mode_and_links_fail_closed() {
     fs::set_permissions(&exec_mode.executable, fs::Permissions::from_mode(0o520)).unwrap();
     assert!(execute(&exec_mode, &read_tag_request()).is_err());
 
-    let dir_mode = Fixture::new("dir-mode", FakeBehavior::Success, &tag_json());
-    fs::set_permissions(&dir_mode.config_dir, fs::Permissions::from_mode(0o750)).unwrap();
-    assert!(execute(&dir_mode, &read_tag_request()).is_err());
+    for mode in [0o750, 0o751, 0o775] {
+        let dir_mode = Fixture::new(
+            &format!("config-dir-{mode:o}"),
+            FakeBehavior::Success,
+            &tag_json(),
+        );
+        fs::set_permissions(&dir_mode.config_dir, fs::Permissions::from_mode(mode)).unwrap();
+        assert!(execute(&dir_mode, &read_tag_request()).is_err(), "{mode:o}");
+    }
 
     let linked_exec = Fixture::new("exec-hardlink", FakeBehavior::Success, &tag_json());
     fs::hard_link(&linked_exec.executable, linked_exec.root.path("other-link")).unwrap();
