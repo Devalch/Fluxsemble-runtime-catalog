@@ -31,6 +31,12 @@ const RECOVERY_RECORD: &str = "recovery-v1.json";
 const RECOVERY_TEMP: &str = ".recovery-v1.tmp";
 const LATEST_REFERENCE: &str = "catalog-v1.ref";
 const LATEST_TEMP: &str = ".catalog-v1.ref.tmp";
+const REMOTE_OPERATION: &str = "remote-operation-v1.json";
+const REMOTE_OPERATION_TEMP: &str = ".remote-operation-v1.tmp";
+const DRAFT_RECEIPT: &str = "draft-receipt-v1.json";
+const RELEASE_APPROVAL: &str = "release-approval-v1.json";
+const PUBLICATION_RECEIPT: &str = "publication-receipt-v1.json";
+const LATEST_RECEIPT: &str = "latest-receipt-v1.json";
 const MAX_PATH_BYTES: usize = 4_096;
 const MAX_TRANSFER_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_ENTRY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
@@ -848,10 +854,10 @@ const STATE_ROOT_ENUMERATION_LIMITS: EnumerationLimits = EnumerationLimits {
     maximum_work: 4,
 };
 const STATE_LATEST_ENUMERATION_LIMITS: EnumerationLimits = EnumerationLimits {
-    maximum_entries: 4,
+    maximum_entries: 10,
     maximum_name_bytes: 64,
-    maximum_cumulative_name_bytes: 256,
-    maximum_work: 6,
+    maximum_cumulative_name_bytes: 640,
+    maximum_work: 12,
 };
 
 #[derive(Clone, Copy)]
@@ -992,12 +998,349 @@ impl StateCapabilities {
             LATEST_TEMP.to_owned(),
             RECOVERY_RECORD.to_owned(),
             RECOVERY_TEMP.to_owned(),
+            REMOTE_OPERATION.to_owned(),
+            REMOTE_OPERATION_TEMP.to_owned(),
+            DRAFT_RECEIPT.to_owned(),
+            RELEASE_APPROVAL.to_owned(),
+            PUBLICATION_RECEIPT.to_owned(),
+            LATEST_RECEIPT.to_owned(),
         ]);
         if !enumerate_names(&self.latest, STATE_LATEST_ENUMERATION_LIMITS)?.is_subset(&allowed) {
             return Err(rejected());
         }
         Ok(())
     }
+}
+
+pub(crate) struct RemoteLocalAsset {
+    name: String,
+    file: fs::File,
+    identity: FileIdentity,
+    size: u64,
+    sha256: String,
+}
+
+impl RemoteLocalAsset {
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(crate) const fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub(crate) fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    pub(crate) fn file(&self) -> &fs::File {
+        &self.file
+    }
+}
+
+pub(crate) struct RemoteWorkflowState {
+    state: StateCapabilities,
+    policy: VerificationPolicy,
+    reference: LocalCatalogReferenceV1,
+    reference_bytes: Vec<u8>,
+    title: String,
+    notes: String,
+    assets: Vec<RemoteLocalAsset>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteRecordKind {
+    Operation,
+    DraftReceipt,
+    Approval,
+    PublicationReceipt,
+    LatestReceipt,
+}
+
+impl RemoteRecordKind {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Operation => REMOTE_OPERATION,
+            Self::DraftReceipt => DRAFT_RECEIPT,
+            Self::Approval => RELEASE_APPROVAL,
+            Self::PublicationReceipt => PUBLICATION_RECEIPT,
+            Self::LatestReceipt => LATEST_RECEIPT,
+        }
+    }
+}
+
+impl RemoteWorkflowState {
+    pub(crate) fn local_operation_id(&self) -> &str {
+        &self.reference.operation_id
+    }
+
+    pub(crate) fn signed_transfer_sha256(&self) -> &str {
+        &self.reference.operation.reverse_transfer_manifest.sha256
+    }
+
+    pub(crate) const fn sequence(&self) -> u64 {
+        self.reference.operation.catalog_sequence
+    }
+
+    pub(crate) fn tag(&self) -> &str {
+        &self.reference.operation.release_tag
+    }
+
+    pub(crate) fn source_commit(&self) -> &str {
+        &self.reference.operation.source_commit
+    }
+
+    pub(crate) fn source_tree_sha256(&self) -> &str {
+        &self.reference.operation.source_tree_sha256
+    }
+
+    pub(crate) fn title(&self) -> &str {
+        &self.title
+    }
+
+    pub(crate) fn notes(&self) -> &str {
+        &self.notes
+    }
+
+    pub(crate) fn assets(&self) -> &[RemoteLocalAsset] {
+        &self.assets
+    }
+
+    pub(crate) fn catalog_asset(&self) -> Result<&RemoteLocalAsset, PublishError> {
+        self.assets
+            .last()
+            .filter(|asset| asset.name == CATALOG)
+            .ok_or_else(rejected)
+    }
+
+    pub(crate) fn revalidate(&self) -> Result<(), PublishError> {
+        self.state.revalidate()?;
+        let names = enumerate_names(&self.state.latest, STATE_LATEST_ENUMERATION_LIMITS)?;
+        if names.contains(RECOVERY_RECORD)
+            || names.contains(RECOVERY_TEMP)
+            || names.contains(LATEST_TEMP)
+            || names.contains(REMOTE_OPERATION_TEMP)
+        {
+            return Err(recovery_required());
+        }
+        let current = read_optional_state_file(
+            &self.state.latest,
+            LATEST_REFERENCE,
+            MAX_REFERENCE_BYTES,
+            false,
+        )?
+        .ok_or_else(rejected)?;
+        if current != self.reference_bytes {
+            return Err(recovery_required());
+        }
+        verify_local_reference(&self.state, &self.reference, self.policy)?;
+        for asset in &self.assets {
+            let metadata = asset.file.metadata().map_err(|_| rejected())?;
+            let rebound = open_regular_at(&self.state.objects, &asset.sha256)?;
+            let rebound_metadata = rebound.metadata().map_err(|_| rejected())?;
+            if !secure_file(&metadata)
+                || !secure_file(&rebound_metadata)
+                || FileIdentity::from_metadata(&metadata) != asset.identity
+                || FileIdentity::from_metadata(&rebound_metadata) != asset.identity
+                || metadata.len() != asset.size
+                || hash_descriptor(&asset.file, asset.size)? != asset.sha256
+                || hash_descriptor(&rebound, asset.size)? != asset.sha256
+            {
+                return Err(recovery_required());
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn read_record(
+        &self,
+        kind: RemoteRecordKind,
+    ) -> Result<Option<Vec<u8>>, PublishError> {
+        self.revalidate()?;
+        read_optional_state_file(
+            &self.state.latest,
+            kind.name(),
+            MAX_STATE_RECORD_BYTES,
+            false,
+        )
+    }
+
+    pub(crate) fn write_record_no_clobber(
+        &self,
+        kind: RemoteRecordKind,
+        bytes: &[u8],
+    ) -> Result<(), PublishError> {
+        self.revalidate()?;
+        if let Some(existing) = read_optional_state_file(
+            &self.state.latest,
+            kind.name(),
+            MAX_STATE_RECORD_BYTES,
+            false,
+        )? {
+            return (existing == bytes)
+                .then_some(())
+                .ok_or_else(recovery_required);
+        }
+        write_unnamed_and_link(&self.state.latest, kind.name(), bytes, 0o400)?;
+        self.state.latest.sync_all().map_err(|_| uncertain())?;
+        let readback = read_optional_state_file(
+            &self.state.latest,
+            kind.name(),
+            MAX_STATE_RECORD_BYTES,
+            false,
+        )?
+        .ok_or_else(uncertain)?;
+        if readback != bytes {
+            return Err(uncertain());
+        }
+        self.revalidate()
+    }
+
+    pub(crate) fn replace_operation_record(
+        &self,
+        expected: &[u8],
+        replacement: &[u8],
+    ) -> Result<(), PublishError> {
+        self.revalidate()?;
+        if replacement.is_empty() || replacement.len() as u64 > MAX_STATE_RECORD_BYTES {
+            return Err(rejected());
+        }
+        let current = read_optional_state_file(
+            &self.state.latest,
+            REMOTE_OPERATION,
+            MAX_STATE_RECORD_BYTES,
+            false,
+        )?
+        .ok_or_else(recovery_required)?;
+        if current != expected || name_exists(&self.state.latest, REMOTE_OPERATION_TEMP)? {
+            return Err(recovery_required());
+        }
+        write_unnamed_and_link(
+            &self.state.latest,
+            REMOTE_OPERATION_TEMP,
+            replacement,
+            0o400,
+        )?;
+        let gated = read_optional_state_file(
+            &self.state.latest,
+            REMOTE_OPERATION,
+            MAX_STATE_RECORD_BYTES,
+            false,
+        )?
+        .ok_or_else(uncertain)?;
+        if gated != expected {
+            return Err(uncertain());
+        }
+        let old = CString::new(REMOTE_OPERATION_TEMP).expect("fixed remote operation temporary");
+        let new = CString::new(REMOTE_OPERATION).expect("fixed remote operation record");
+        // SAFETY: both fixed names are within the retained owner-private latest directory.
+        if unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                self.state.latest.as_raw_fd(),
+                old.as_ptr(),
+                self.state.latest.as_raw_fd(),
+                new.as_ptr(),
+                0,
+            )
+        } != 0
+        {
+            return Err(uncertain());
+        }
+        self.state.latest.sync_all().map_err(|_| uncertain())?;
+        let readback = read_optional_state_file(
+            &self.state.latest,
+            REMOTE_OPERATION,
+            MAX_STATE_RECORD_BYTES,
+            false,
+        )?
+        .ok_or_else(uncertain)?;
+        if readback != replacement {
+            return Err(uncertain());
+        }
+        self.revalidate()
+    }
+}
+
+pub(crate) fn open_remote_workflow_state(
+    state_path: &Path,
+) -> Result<RemoteWorkflowState, PublishError> {
+    open_remote_workflow_state_with(state_path, VerificationPolicy::Production)
+}
+
+#[allow(dead_code)]
+#[cfg(test)]
+pub(crate) fn open_fixture_remote_workflow_state(
+    state_path: &Path,
+) -> Result<RemoteWorkflowState, PublishError> {
+    open_remote_workflow_state_with(state_path, VerificationPolicy::Fixture)
+}
+
+fn open_remote_workflow_state_with(
+    state_path: &Path,
+    policy: VerificationPolicy,
+) -> Result<RemoteWorkflowState, PublishError> {
+    let state = open_existing_state(state_path)?;
+    state.revalidate()?;
+    let names = enumerate_names(&state.latest, STATE_LATEST_ENUMERATION_LIMITS)?;
+    if names.contains(RECOVERY_RECORD)
+        || names.contains(RECOVERY_TEMP)
+        || names.contains(LATEST_TEMP)
+        || names.contains(REMOTE_OPERATION_TEMP)
+    {
+        return Err(recovery_required());
+    }
+    let reference_bytes =
+        read_optional_state_file(&state.latest, LATEST_REFERENCE, MAX_REFERENCE_BYTES, false)?
+            .ok_or_else(rejected)?;
+    let reference = parse_reference(&reference_bytes)?;
+    verify_local_reference(&state, &reference, policy)?;
+    let retained = verify_record_objects(&state, &reference.operation)?;
+    let catalog = retained.get(CATALOG).ok_or_else(rejected)?;
+    let catalog_bytes = read_descriptor(&catalog.file, catalog.size)?;
+    let verified_catalog = verify_catalog_with_policy(&catalog_bytes, policy)?;
+    let releases = verified_catalog
+        .payload()
+        .providers()
+        .iter()
+        .flat_map(|provider| provider.releases())
+        .collect::<Vec<_>>();
+    let [release] = releases.as_slice() else {
+        return Err(rejected());
+    };
+    let title = release.release_metadata().title().as_str().to_owned();
+    let notes = release.release_metadata().notes().as_str().to_owned();
+
+    let mut ordered = retained
+        .into_values()
+        .filter(|asset| asset.name != TRANSFER_MANIFEST && asset.name != CATALOG)
+        .collect::<Vec<_>>();
+    ordered.sort_by(|left, right| left.name.cmp(&right.name));
+    let catalog = verify_record_objects(&state, &reference.operation)?
+        .remove(CATALOG)
+        .ok_or_else(rejected)?;
+    ordered.push(catalog);
+    let assets = ordered
+        .into_iter()
+        .map(|asset| RemoteLocalAsset {
+            name: asset.name,
+            file: asset.file,
+            identity: asset.identity,
+            size: asset.size,
+            sha256: asset.sha256,
+        })
+        .collect();
+    let remote = RemoteWorkflowState {
+        state,
+        policy,
+        reference,
+        reference_bytes,
+        title,
+        notes,
+        assets,
+    };
+    remote.revalidate()?;
+    Ok(remote)
 }
 
 fn same_directory_policy_facts(retained: &fs::Metadata, rebound: &fs::Metadata) -> bool {

@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+catalog-acquire = { path = "../catalog-acquire" }
 catalog-core = { path = "../catalog-core" }
 libc.workspace = true
 serde.workspace = true

@@ -609,7 +609,12 @@ fn tag_json() -> Vec<u8> {
 }
 
 fn draft_json() -> Vec<u8> {
-    format!("{{\"assets\":[{{\"id\":8,\"name\":\"existing.bin\",\"secret\":\"child-token-canary\",\"size\":3}}],\"draft\":true,\"id\":7,\"prerelease\":false,\"tag_name\":\"{TAG}\",\"target_commitish\":\"{COMMIT}\",\"unexpected\":\"child-path-canary\"}}").into_bytes()
+    format!("{{\"assets\":[{{\"id\":8,\"name\":\"existing.bin\",\"secret\":\"child-token-canary\",\"size\":3}}],\"body\":\"Reviewed release notes\",\"draft\":true,\"id\":7,\"name\":\"Runtime catalog sequence 1\",\"prerelease\":false,\"tag_name\":\"{TAG}\",\"target_commitish\":\"{COMMIT}\",\"unexpected\":\"child-path-canary\"}}").into_bytes()
+}
+
+fn draft_list_json() -> Vec<u8> {
+    let draft = String::from_utf8(draft_json()).unwrap();
+    format!("[{draft}]").into_bytes()
 }
 
 fn read_tag_request() -> BrokerRequestV1 {
@@ -677,6 +682,52 @@ fn broker_requests_are_a_closed_command_family_and_protocol_is_strict() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn read_draft_list_distinguishes_exact_missing_duplicate_and_truncated_state() {
+    let request = BrokerRequestV1::ReadDraft {
+        schema_version: 1,
+        repository: REPOSITORY.to_owned(),
+        tag: TAG.to_owned(),
+    };
+    let missing = Fixture::new("draft-missing", FakeBehavior::Success, b"[]");
+    assert_eq!(
+        execute(&missing, &request).unwrap(),
+        BrokerResponseV1::DraftMissing {
+            schema_version: 1,
+            tag: TAG.to_owned()
+        }
+    );
+
+    let draft = String::from_utf8(draft_json()).unwrap();
+    let duplicate = draft.replace("\"id\":7", "\"id\":9");
+    let ambiguous = Fixture::new(
+        "draft-duplicate",
+        FakeBehavior::Success,
+        format!("[{draft},{duplicate}]").as_bytes(),
+    );
+    assert!(execute(&ambiguous, &request).is_err());
+
+    let full_page = serde_json::to_vec(
+        &(1..=100)
+            .map(|sequence| serde_json::json!({"tag_name": format!("catalog-v1-sequence-{sequence}")}))
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let truncated = Fixture::new("draft-full-page", FakeBehavior::Success, &full_page);
+    assert!(execute(&truncated, &request).is_err());
+
+    let exact = Fixture::new(
+        "draft-exact-list",
+        FakeBehavior::Success,
+        format!("[{draft}]").as_bytes(),
+    );
+    assert!(matches!(
+        execute(&exact, &request).unwrap(),
+        BrokerResponseV1::Draft { title, notes, .. }
+            if title == "Runtime catalog sequence 1" && notes == "Reviewed release notes"
+    ));
 }
 
 #[test]
@@ -752,12 +803,12 @@ fn exact_seven_command_families_have_fixed_argv_body_environment_and_projection(
                 repository: REPOSITORY.to_owned(),
                 tag: TAG.to_owned(),
             },
-            draft_json(),
+            draft_list_json(),
             vec![
                 "api",
                 "--method",
                 "GET",
-                "/repos/owner/name/releases/tags/catalog-v1-sequence-1",
+                "/repos/owner/name/releases?per_page=100",
                 "--header",
                 "Accept: application/vnd.github+json",
                 "--header",

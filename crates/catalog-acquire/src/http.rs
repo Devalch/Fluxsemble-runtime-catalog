@@ -35,6 +35,8 @@ const MAX_URL_BYTES: usize = 16 * 1024;
 const STREAM_BUFFER_BYTES: usize = 64 * 1024;
 const GITHUB_HOST: &str = "github.com";
 const GITHUB_ASSET_HOST: &str = "release-assets.githubusercontent.com";
+const RUNTIME_CATALOG_LATEST_URL: &str = "https://github.com/Devalch/Fluxsemble-runtime-catalog/releases/latest/download/catalog-v1.json";
+const MAX_RUNTIME_CATALOG_BYTES: u64 = 8 * 1024 * 1024;
 
 #[cfg(test)]
 use std::path::PathBuf;
@@ -353,6 +355,54 @@ enum TransportMode {
     Production,
     #[cfg(test)]
     Loopback(std::net::SocketAddr),
+}
+
+/// Fetches only the compiled runtime-catalog latest endpoint with the existing credential-free,
+/// no-proxy, bounded GitHub release-asset redirect policy. Callers supply content authority only.
+pub fn fetch_runtime_catalog_latest_exact(
+    cache_root: impl AsRef<Path>,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> Result<FetchedObject, AcquireError> {
+    let request = runtime_catalog_latest_request(expected_size, expected_sha256)?;
+    let fetcher = CredentialFreeFetcher::for_github_release_assets(cache_root)?;
+    let cancellation = AcquisitionCancellation::new();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| AcquireError::Transport)?
+        .block_on(fetcher.fetch_exact(request, &cancellation))
+}
+
+fn runtime_catalog_latest_request(
+    expected_size: u64,
+    expected_sha256: &str,
+) -> Result<FetchRequest, AcquireError> {
+    if expected_size == 0
+        || expected_size > MAX_RUNTIME_CATALOG_BYTES
+        || !is_lower_sha256(expected_sha256)
+    {
+        return Err(AcquireError::InvalidPolicy);
+    }
+    Ok(FetchRequest {
+        url: HttpsUrl(RUNTIME_CATALOG_LATEST_URL.to_owned()),
+        allowed_origins: BTreeSet::from([
+            HttpsOrigin("https://github.com".to_owned()),
+            HttpsOrigin("https://release-assets.githubusercontent.com".to_owned()),
+        ]),
+        expected_size: Some(expected_size),
+        maximum_size: NonZeroU64::new(expected_size).ok_or(AcquireError::InvalidPolicy)?,
+        sha256: Sha256Hex(expected_sha256.to_owned()),
+        sri: None,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn runtime_catalog_latest_request_for_test(
+    expected_size: u64,
+    expected_sha256: &str,
+) -> Result<FetchRequest, AcquireError> {
+    runtime_catalog_latest_request(expected_size, expected_sha256)
 }
 
 impl CredentialFreeFetcher {

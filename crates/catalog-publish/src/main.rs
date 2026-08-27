@@ -2,7 +2,7 @@ use std::path::Path;
 
 use catalog_publish::{FailureOutcome, PublishOutcome};
 
-const MAX_ARGUMENTS: usize = 5;
+const MAX_ARGUMENTS: usize = 7;
 const MAX_ARGUMENT_BYTES: usize = 16 * 1024;
 
 fn main() {
@@ -63,6 +63,80 @@ fn run() -> Result<String, FailureOutcome> {
                 PublishOutcome::RecoveryCommitted => Ok("recovery committed".to_owned()),
                 PublishOutcome::RecoveryAborted => Ok("recovery aborted".to_owned()),
                 PublishOutcome::Staged => Err(FailureOutcome::Normal),
+            }
+        }
+        [command, state_flag, state, config_flag, config] if command == "stage-remote" => {
+            require_flag(state_flag, "--state")?;
+            require_flag(config_flag, "--broker-config")?;
+            match catalog_publish::stage_remote(Path::new(state), Path::new(config))
+                .map_err(|error| error.outcome())?
+            {
+                catalog_publish::RemoteWorkflowOutcome::DraftStaged => {
+                    Ok("remote draft staged; explicit approval required".to_owned())
+                }
+                _ => Err(FailureOutcome::Normal),
+            }
+        }
+        [command, state_flag, state, digest_flag, digest] if command == "approve" => {
+            require_flag(state_flag, "--state")?;
+            require_flag(digest_flag, "--draft-receipt-sha256")?;
+            match catalog_publish::approve_remote(Path::new(state), digest)
+                .map_err(|error| error.outcome())?
+            {
+                catalog_publish::RemoteWorkflowOutcome::Approved => {
+                    Ok("release approval recorded".to_owned())
+                }
+                _ => Err(FailureOutcome::Normal),
+            }
+        }
+        [
+            command,
+            state_flag,
+            state,
+            approval_flag,
+            approval,
+            config_flag,
+            config,
+        ] if command == "publish" => {
+            require_flag(state_flag, "--state")?;
+            require_flag(approval_flag, "--approval")?;
+            require_flag(config_flag, "--broker-config")?;
+            match catalog_publish::publish_remote(
+                Path::new(state),
+                Path::new(approval),
+                Path::new(config),
+            )
+            .map_err(|error| error.outcome())?
+            {
+                catalog_publish::RemoteWorkflowOutcome::PublishedAndLatestVerified => {
+                    Ok("release published and latest verified".to_owned())
+                }
+                _ => Err(FailureOutcome::Normal),
+            }
+        }
+        [command, state_flag, state] if command == "verify-latest" => {
+            require_flag(state_flag, "--state")?;
+            match catalog_publish::verify_latest_remote(Path::new(state))
+                .map_err(|error| error.outcome())?
+            {
+                catalog_publish::RemoteWorkflowOutcome::LatestVerified => {
+                    Ok("public latest verified".to_owned())
+                }
+                _ => Err(FailureOutcome::Normal),
+            }
+        }
+        [command, commit_flag, commit, config_flag, config]
+            if command == "publish-transport-fixture" =>
+        {
+            require_flag(commit_flag, "--source-commit")?;
+            require_flag(config_flag, "--broker-config")?;
+            match catalog_publish::publish_transport_fixture(Path::new(config), commit)
+                .map_err(|error| error.outcome())?
+            {
+                catalog_publish::RemoteWorkflowOutcome::TransportFixturePublished => {
+                    Ok("transport fixture prerelease published".to_owned())
+                }
+                _ => Err(FailureOutcome::Normal),
             }
         }
         _ => Err(FailureOutcome::Normal),

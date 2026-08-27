@@ -275,9 +275,15 @@ pub enum BrokerResponseV1 {
         release_id: String,
         tag: String,
         target_commitish: String,
+        title: String,
+        notes: String,
         draft: bool,
         prerelease: bool,
         assets: Vec<BrokerReleaseAssetV1>,
+    },
+    DraftMissing {
+        schema_version: u16,
+        tag: String,
     },
     AssetUploaded {
         schema_version: u16,
@@ -327,6 +333,8 @@ impl BrokerResponseV1 {
                 release_id,
                 tag,
                 target_commitish,
+                title,
+                notes,
                 draft: _,
                 prerelease: _,
                 assets,
@@ -335,7 +343,16 @@ impl BrokerResponseV1 {
                 valid_decimal_id(release_id)?;
                 valid_tag(tag)?;
                 valid_sha1(target_commitish)?;
+                valid_title(title)?;
+                valid_notes(notes)?;
                 valid_release_assets(assets)
+            }
+            Self::DraftMissing {
+                schema_version,
+                tag,
+            } => {
+                valid_schema(*schema_version)?;
+                valid_tag(tag)
             }
             Self::AssetUploaded {
                 schema_version,
@@ -600,13 +617,28 @@ struct NoopTestCheckpoints;
 impl BrokerTestCheckpoints for NoopTestCheckpoints {}
 
 #[cfg(not(test))]
-fn execute(config_path: &Path, request: &BrokerRequestV1) -> Result<BrokerResponseV1, BrokerError> {
+pub(crate) fn execute(
+    config_path: &Path,
+    request: &BrokerRequestV1,
+) -> Result<BrokerResponseV1, BrokerError> {
     execute_impl(config_path, request)
 }
 
 #[cfg(test)]
-fn execute(config_path: &Path, request: &BrokerRequestV1) -> Result<BrokerResponseV1, BrokerError> {
+pub(crate) fn execute(
+    config_path: &Path,
+    request: &BrokerRequestV1,
+) -> Result<BrokerResponseV1, BrokerError> {
     execute_impl(config_path, request, &mut NoopTestCheckpoints)
+}
+
+pub(crate) fn config_sha256(config_path: &Path) -> Result<String, BrokerError> {
+    #[cfg(test)]
+    let config = read_config(config_path, &mut NoopTestCheckpoints)?;
+    #[cfg(not(test))]
+    let config = read_config(config_path)?;
+    rebind_config(&config)?;
+    Ok(config.sha256.clone())
 }
 
 #[cfg(test)]
@@ -804,11 +836,9 @@ fn command_plan(
                 "target_commitish": target_commitish,
             }))?),
         )),
-        BrokerRequestV1::ReadDraft {
-            repository, tag, ..
-        } => Ok(api_command_plan(
+        BrokerRequestV1::ReadDraft { repository, .. } => Ok(api_command_plan(
             "GET",
-            format!("/repos/{repository}/releases/tags/{tag}"),
+            format!("/repos/{repository}/releases?per_page=100"),
             "Accept: application/vnd.github+json",
             None,
         )),
@@ -900,9 +930,13 @@ fn project_child_response(
                 object_type,
             })
         }
-        BrokerRequestV1::CreateDraft { .. } | BrokerRequestV1::ReadDraft { .. } => {
+        BrokerRequestV1::CreateDraft { .. } => {
             let value = parse_json_value(bytes, MAX_RESPONSE_BYTES as u64, false)?;
             project_draft(&value)
+        }
+        BrokerRequestV1::ReadDraft { tag, .. } => {
+            let value = parse_json_value(bytes, MAX_RESPONSE_BYTES as u64, false)?;
+            project_read_draft(&value, tag)
         }
         BrokerRequestV1::UploadAsset { name, .. } => {
             let upload = upload.ok_or_else(rejected)?;
@@ -930,15 +964,45 @@ fn project_child_response(
     }
 }
 
+fn project_read_draft(value: &Value, tag: &str) -> Result<BrokerResponseV1, BrokerError> {
+    let releases = value.as_array().ok_or_else(rejected)?;
+    // A full page cannot prove absence or uniqueness beyond the bounded response.
+    if releases.len() >= 100 {
+        return Err(rejected());
+    }
+    let matches = releases
+        .iter()
+        .filter(|release| {
+            release
+                .as_object()
+                .and_then(|object| object.get("tag_name"))
+                .and_then(Value::as_str)
+                == Some(tag)
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => Ok(BrokerResponseV1::DraftMissing {
+            schema_version: 1,
+            tag: tag.to_owned(),
+        }),
+        [release] => project_draft(release),
+        _ => Err(rejected()),
+    }
+}
+
 fn project_draft(value: &Value) -> Result<BrokerResponseV1, BrokerError> {
     let child = object(value)?;
     let release_id = decimal_json_field(child, "id")?;
     let tag = string_field(child, "tag_name")?.to_owned();
     let target_commitish = string_field(child, "target_commitish")?.to_owned();
+    let title = string_field(child, "name")?.to_owned();
+    let notes = string_field(child, "body")?.to_owned();
     let draft = bool_field(child, "draft")?;
     let prerelease = bool_field(child, "prerelease")?;
     valid_tag(&tag)?;
     valid_sha1(&target_commitish)?;
+    valid_title(&title)?;
+    valid_notes(&notes)?;
     let values = child
         .get("assets")
         .and_then(Value::as_array)
@@ -967,6 +1031,8 @@ fn project_draft(value: &Value) -> Result<BrokerResponseV1, BrokerError> {
         release_id,
         tag,
         target_commitish,
+        title,
+        notes,
         draft,
         prerelease,
         assets,

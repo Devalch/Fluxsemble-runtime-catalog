@@ -27,7 +27,11 @@ expected_internal_deps = {
     "catalog-core": [],
     "catalog-acquire": [("catalog-core", "normal")],
     "catalog-sign": [("catalog-core", "normal")],
-    "catalog-publish": [("catalog-core", "dev"), ("catalog-core", "normal")],
+    "catalog-publish": [
+        ("catalog-acquire", "normal"),
+        ("catalog-core", "dev"),
+        ("catalog-core", "normal"),
+    ],
 }
 expected_external_deps = {
     "catalog-core": [
@@ -1528,19 +1532,19 @@ policies = [
     ("existing root validation before children", "let existing_names = validate_existing_state_layout(&root)?;", 1),
     ("record before latest", "let transaction = install_recovery_record(&state, &record_bytes)", 1),
     ("exact gated prior", "if gated != prior_bytes", 1),
-    ("atomic latest rename", "libc::SYS_renameat2,", 1),
+    ("atomic latest and remote-operation rename", "libc::SYS_renameat2,", 2),
     ("no-replace absent latest", "libc::RENAME_NOREPLACE", 1),
     ("latest exact readback", "readback.as_deref() != Some(intended_bytes.as_slice())", 1),
-    ("latest parent fsync", "state.latest.sync_all().map_err(|_| uncertain())?;", 3),
+    ("latest and remote-record parent fsync", "state.latest.sync_all().map_err(|_| uncertain())?;", 5),
     ("recovery relation before cleanup", "verify_recovery_relation(&state, &record, &intended_bytes, bundle.policy)", 1),
     ("transaction lock", "libc::LOCK_EX | libc::LOCK_NB", 1),
     ("exact recovery commit", "current.as_deref() == Some(intended_bytes.as_slice())", 2),
     ("exact recovery abort", "current == prior_bytes", 1),
     ("staged before-success revalidation", "revalidate_before_staged_success(&state)", 2),
     ("recovered before-success revalidation", "revalidate_before_recovered_success(&state)", 3),
-    ("uncertain no guessing", "return Err(uncertain());", 14),
+    ("uncertain no guessing", "return Err(uncertain());", 18),
     ("previsibility prior preserved", "return Err(prior_preserved());", 6),
-    ("record visibility recovery required", "return Err(recovery_required());", 14),
+    ("record and remote-state visibility recovery required", "return Err(recovery_required());", 19),
     ("uncertainty record retention", "FaultPoint::AfterLatestDirectorySync", 1),
     ("latest temp unnamed preparation", "let latest_temporary = open_latest_temporary(&state)", 1),
     ("latest temp durable link and readback", "link_latest_temporary(&state, &latest_temporary, &intended_bytes)", 1),
@@ -1675,9 +1679,14 @@ def publisher_errors(local_source, lib_source, main_source, manifest_source, tes
         errors.append("fixture verifier is not compile-time test-only")
     if '#[cfg(test)]\n        VerificationPolicy::Fixture => {' not in local_source:
         errors.append("fixture verification match arm is not compile-time test-only")
-    if "fixture" in main_source.lower() or "fixture" in lib_source.lower():
-        errors.append("fixture authority reached production CLI/library exports")
-    if test_source.count('#[path = "../src/local.rs"]') != 2:
+    for fixture_authority in [
+        "verify_transferred_fixture_signed_bundle",
+        "catalog-test-key-v1",
+        "fixture-tools",
+    ]:
+        if fixture_authority in main_source or fixture_authority in lib_source:
+            errors.append("fixture signing authority reached production CLI/library exports")
+    if test_source.count('#[path = "../src/local.rs"]') != 4:
         errors.append("filesystem fixture tests do not compile the exact production local implementation")
     if 'command == "recover-local"' not in main_source or main_source.count('command == "recover-local"') != 1:
         errors.append("recover-only command family changed")
@@ -1894,13 +1903,13 @@ policies = [
 ]
 
 validator_calls = [
-    ("schema-version validation", "valid_schema(*schema_version)?;", 11),
+    ("schema-version validation", "valid_schema(*schema_version)?;", 12),
     ("repository validation", "valid_repository(repository)?;", 6),
     ("tag validation", "valid_tag(tag)?;", 5),
     ("commit validation", "valid_sha1(commit_sha)", 2),
     ("target commit validation", "valid_sha1(target_commitish)?;", 2),
-    ("title validation", "valid_title(title)?;", 1),
-    ("notes validation", "valid_notes(notes)", 1),
+    ("title validation", "valid_title(title)?;", 2),
+    ("notes validation", "valid_notes(notes)", 2),
     ("release ID validation", "valid_decimal_id(release_id)?;", 1),
     ("asset ID validation", "valid_decimal_id(asset_id)?;", 1),
     ("asset name validation", "valid_asset_name(name)?;", 3),
@@ -2021,7 +2030,7 @@ def broker_errors(source, binary_source=binary, lib_source=lib, local_source=loc
         ("read_tag method/route", '"GET",\n            format!("/repos/{repository}/git/ref/tags/{tag}")'),
         ("create_draft method/route", '"POST",\n            format!("/repos/{repository}/releases")'),
         ("create_draft body", '"draft": true,\n                "name": title,\n                "prerelease": prerelease,\n                "tag_name": tag,\n                "target_commitish": target_commitish'),
-        ("read_draft method/route", '"GET",\n            format!("/repos/{repository}/releases/tags/{tag}")'),
+        ("read_draft bounded-list method/route", '"GET",\n            format!("/repos/{repository}/releases?per_page=100")'),
         ("upload fixed release family", 'OsString::from("release"),\n                    OsString::from("upload"),\n                    OsString::from(tag),\n                    capability.path.as_os_str().to_owned(),\n                    OsString::from("--repo"),\n                    OsString::from(repository)'),
         ("download method/route/accept", '"GET",\n            format!("/repos/{repository}/releases/assets/{asset_id}"),\n            "Accept: application/octet-stream"'),
         ("publish method/route/body", '"PATCH",\n            format!("/repos/{repository}/releases/{release_id}"),\n            "Accept: application/vnd.github+json",\n            Some(canonical_value(&serde_json::json!({"draft": false}))?)'),
@@ -2099,8 +2108,8 @@ for label, old, new in [
     ("create_draft method", '"POST",\n            format!("/repos/{repository}/releases")', '"GET",\n            format!("/repos/{repository}/releases")'),
     ("create_draft route", 'format!("/repos/{repository}/releases")', 'format!("/repos/{repository}/release")'),
     ("create_draft body", '"draft": true', '"draft": false'),
-    ("read_draft method", '"GET",\n            format!("/repos/{repository}/releases/tags/{tag}")', '"POST",\n            format!("/repos/{repository}/releases/tags/{tag}")'),
-    ("read_draft route", 'format!("/repos/{repository}/releases/tags/{tag}")', 'format!("/repos/{repository}/releases/tag/{tag}")'),
+    ("read_draft method", '"GET",\n            format!("/repos/{repository}/releases?per_page=100")', '"POST",\n            format!("/repos/{repository}/releases?per_page=100")'),
+    ("read_draft fixed bounded-list route", 'format!("/repos/{repository}/releases?per_page=100")', 'format!("/repos/{repository}/releases?per_page=99")'),
     ("upload family", 'OsString::from("release"),\n                    OsString::from("upload")', 'OsString::from("api"),\n                    OsString::from("upload")'),
     ("upload exact tag", 'OsString::from(tag),\n                    capability.path.as_os_str().to_owned()', 'OsString::from(repository),\n                    capability.path.as_os_str().to_owned()'),
     ("upload repository binding", 'OsString::from("--repo"),\n                    OsString::from(repository)', 'OsString::from("--repo"),\n                    OsString::from(tag)'),
@@ -2142,5 +2151,252 @@ for label, old, new in [
     mutation = broker.replace(old, new, 1)
     if mutation == broker or not broker_errors(mutation):
         print(f"broker scanner accepted semantic bypass: {label}", file=sys.stderr)
+        sys.exit(1)
+PY
+
+python3 - <<'PY'
+from pathlib import Path
+import re
+import sys
+
+sources = {
+    "workflow": Path("crates/catalog-publish/src/workflow.rs").read_text(encoding="utf-8"),
+    "github": Path("crates/catalog-publish/src/github.rs").read_text(encoding="utf-8"),
+    "local": Path("crates/catalog-publish/src/local.rs").read_text(encoding="utf-8"),
+    "broker": Path("crates/catalog-publish/src/broker.rs").read_text(encoding="utf-8"),
+    "acquire_http": Path("crates/catalog-acquire/src/http.rs").read_text(encoding="utf-8"),
+    "main": Path("crates/catalog-publish/src/main.rs").read_text(encoding="utf-8"),
+    "lib": Path("crates/catalog-publish/src/lib.rs").read_text(encoding="utf-8"),
+    "manifest": Path("conformance/transport/manifest-v1.json").read_text(encoding="utf-8"),
+    "asset": Path("conformance/transport/github-release-asset-v1.txt").read_text(encoding="utf-8"),
+    "runbook": Path("docs/release-runbook.md").read_text(encoding="utf-8"),
+    "github_tests": Path("crates/catalog-publish/tests/github_workflow.rs").read_text(encoding="utf-8"),
+    "recovery_tests": Path("crates/catalog-publish/tests/remote_recovery.rs").read_text(encoding="utf-8"),
+    "broker_tests": Path("crates/catalog-publish/tests/broker_boundary.rs").read_text(encoding="utf-8"),
+    "http_tests": Path("crates/catalog-acquire/tests/http_transport.rs").read_text(encoding="utf-8"),
+}
+
+policies = [
+    ("workflow", "fixed repository", 'const REPOSITORY: &str = "Devalch/Fluxsemble-runtime-catalog";', 1),
+    ("workflow", "remote operation before first mutation", '.write_record_no_clobber(RemoteRecordKind::Operation, &initial_bytes)', 1),
+    ("workflow", "atomic remote operation phase replacement", '.replace_operation_record(&handle.bytes, &bytes)', 1),
+    ("workflow", "commit object tag", 'actual.object_type != crate::broker::BrokerTagObjectTypeV1::Commit', 1),
+    ("workflow", "exact tag commit", 'actual.commit_sha != expected_commit', 1),
+    ("workflow", "exact release target", 'release.target_commitish != operation.source_commit', 1),
+    ("workflow", "exact release title", 'release.title != operation.title', 1),
+    ("workflow", "exact release notes", 'release.notes != operation.notes', 1),
+    ("workflow", "exact release draft state", '|| release.draft != draft\n        || release.prerelease != prerelease', 1),
+    ("workflow", "exact release prerelease state", 'release.prerelease != prerelease', 1),
+    ("workflow", "pre-post same release ID", 'release_id.is_some_and(|expected| release.release_id != expected)', 1),
+    ("workflow", "pre-post exact prior asset set", 'after[..before.len()] != *before', 1),
+    ("workflow", "exactly one upload result", 'after.len() != before.len() + 1', 1),
+    ("workflow", "download asset ID", 'asset_id != remote.asset_id', 1),
+    ("workflow", "download asset bytes size", 'bytes.len() as u64 != expected.size', 2),
+    ("workflow", "download asset SHA-256", 'sha256(&bytes) != expected.sha256', 2),
+    ("workflow", "catalog-last production inventory", '.is_none_or(|asset| asset.name != "catalog-v1.json")', 1),
+    ("workflow", "support inventory excludes early catalog", '.any(|asset| asset.name == "catalog-v1.json")', 2),
+    ("workflow", "draft receipt remote operation binding", 'receipt.body.remote_operation_id != operation.remote_operation_id', 1),
+    ("workflow", "draft receipt config binding", 'receipt.body.broker_config_sha256 != operation.operation.broker_config_sha256', 1),
+    ("workflow", "draft receipt release binding", 'operation.release_id.as_deref() != Some(receipt.body.release_id.as_str())', 1),
+    ("workflow", "draft receipt complete phase", 'operation.phase != RemoteOperationPhaseV1::AssetsVerified', 1),
+    ("workflow", "approval explicit status", 'approval.status != "approved"', 1),
+    ("workflow", "approval exact receipt digest", 'approval.draft_receipt_sha256 != sha256(&canonical(receipt)?)', 1),
+    ("workflow", "publication exact approval digest", 'publication.approval_sha256 != sha256(&canonical(approval)?)', 1),
+    ("workflow", "publication exact draft receipt digest", 'publication.draft_receipt_sha256 != sha256(&canonical(receipt)?)', 1),
+    ("workflow", "publication durable before latest", '.write_record_no_clobber(RemoteRecordKind::PublicationReceipt, &publication_bytes)', 1),
+    ("workflow", "fixed latest content fetch", '.fetch_catalog(&expected)', 1),
+    ("workflow", "latest receipt durable", '.write_record_no_clobber(RemoteRecordKind::LatestReceipt, &canonical(&receipt)?)', 1),
+    ("workflow", "fixed transport manifest include", 'include_bytes!("../../../conformance/transport/manifest-v1.json")', 1),
+    ("workflow", "fixed transport asset include", 'include_bytes!("../../../conformance/transport/github-release-asset-v1.txt")', 1),
+    ("workflow", "transport exact tag", 'manifest.tag != "transport-v1"', 1),
+    ("workflow", "transport exact title", 'manifest.title != "Fluxsemble runtime catalog transport fixture v1"', 1),
+    ("workflow", "transport draft", '!manifest.draft', 1),
+    ("workflow", "transport prerelease", '!manifest.prerelease', 1),
+    ("workflow", "transport pre-post release ID", 'after.release_id != before.release_id', 1),
+    ("workflow", "transport publish release ID", 'published.release_id != release.release_id', 1),
+    ("workflow", "transport no catalog asset", '.any(|asset| asset.name == "catalog-v1.json")', 2),
+    ("github", "fixed latest API only", 'catalog_acquire::fetch_runtime_catalog_latest_exact(', 1),
+    ("github", "latest exact catalog name", 'expected.name != "catalog-v1.json"', 1),
+    ("github", "latest catalog size ceiling", 'expected.size > MAX_CATALOG_BYTES', 1),
+    ("github", "scratch retained/canonical directory identity", 'ScratchIdentity::from_metadata(&canonical_metadata) != self.identity', 1),
+    ("github", "download canonical directory identity", 'ScratchIdentity::from_metadata(&canonical_directory_metadata) != self.identity', 1),
+    ("github", "download canonical leaf identity", 'ScratchIdentity::from_metadata(&retained_metadata)\n                != ScratchIdentity::from_metadata(&canonical_metadata)', 1),
+    ("github", "download canonical bytes", 'read_scratch_file(&canonical, expected_size)? != bytes', 1),
+    ("github", "scratch current owner", 'metadata.uid() == current_euid()', 2),
+    ("acquire_http", "single well-known latest URL", '"https://github.com/Devalch/Fluxsemble-runtime-catalog/releases/latest/download/catalog-v1.json"', 1),
+    ("acquire_http", "latest fixed GitHub origin", 'HttpsOrigin("https://github.com".to_owned())', 1),
+    ("acquire_http", "latest fixed asset origin", 'HttpsOrigin("https://release-assets.githubusercontent.com".to_owned())', 1),
+    ("acquire_http", "latest bounded size", 'expected_size > MAX_RUNTIME_CATALOG_BYTES', 1),
+    ("acquire_http", "latest lowercase digest", '!is_lower_sha256(expected_sha256)', 1),
+    ("acquire_http", "latest GitHub redirect profile", 'CredentialFreeFetcher::for_github_release_assets(cache_root)?', 1),
+    ("broker", "bounded release-list completeness", 'if releases.len() >= 100', 1),
+    ("broker", "exact missing release projection", '[] => Ok(BrokerResponseV1::DraftMissing {', 1),
+    ("broker", "unique release projection", '[release] => project_draft(release)', 1),
+    ("main", "stage-remote exact CLI", '[command, state_flag, state, config_flag, config] if command == "stage-remote"', 1),
+    ("main", "approve exact CLI", '[command, state_flag, state, digest_flag, digest] if command == "approve"', 1),
+    ("main", "publish exact CLI", 'if command == "publish"', 1),
+    ("main", "verify-latest exact CLI", '[command, state_flag, state] if command == "verify-latest"', 1),
+    ("main", "transport exact CLI", 'if command == "publish-transport-fixture"', 1),
+    ("runbook", "no existence claim", 'does **not** claim that the transport fixture, a production draft, or a production release exists', 1),
+    ("runbook", "agent key stop", 'Agents stop before key use.', 1),
+    ("runbook", "transport mutation stops", 'Then stop separately before tag, draft, upload, and publication.', 1),
+    ("runbook", "production tag/draft/upload stops", 'exact production tag mutation, then draft mutation, then each ordered upload', 1),
+    ("runbook", "approval stop", 'explicitly authorizes the local approval transition', 1),
+    ("runbook", "publication stop", 'Stop again before publication.', 1),
+    ("runbook", "no delete replace", 'Do not delete, replace, clobber, retag, recreate, or administratively repair', 1),
+    ("runbook", "failure escalation", 'Escalate and stop on any annotated/wrong tag', 1),
+]
+
+test_policies = [
+    ("github_tests", "pre-post upload call order", 'assert_eq!(fake.calls[index - 1], "read_draft");', 1),
+    ("github_tests", "catalog-last evidence", 'assert_eq!(uploads.last(), Some(&"catalog-v1.json"));', 1),
+    ("github_tests", "scratch parent swap evidence", 'scratch_directory_swap_is_rejected_for_test', 1),
+    ("recovery_tests", "all mutation timing evidence", 'failures_before_and_after_each_remote_mutation_resume_only_exact_state', 1),
+    ("recovery_tests", "transport recovery evidence", 'transport_fixture_before_and_after_mutation_failures_resume_exact_prerelease', 1),
+    ("recovery_tests", "transport concurrent ID evidence", 'transport_fixture_rejects_concurrent_release_id_drift_before_publication', 1),
+    ("recovery_tests", "latest retry without broker", 'latest_mismatch_keeps_publication_receipt_and_credential_free_retry_needs_no_broker', 1),
+    ("broker_tests", "draft missing duplicate truncation evidence", 'read_draft_list_distinguishes_exact_missing_duplicate_and_truncated_state', 1),
+    ("http_tests", "fixed latest no URL input evidence", 'fixed_runtime_catalog_latest_request_has_no_url_or_origin_input', 1),
+]
+
+def task10_errors(current):
+    errors = []
+    for source, label, snippet, expected in policies + test_policies:
+        actual = current[source].count(snippet)
+        if actual != expected:
+            errors.append(f"missing exact Task 10 policy {label}: expected {expected}, got {actual}")
+
+    workflow = current["workflow"]
+    operation_region = workflow.split("fn stage_remote_inner(", 1)[-1].split("pub fn approve_remote", 1)[0]
+    operation_order = [
+        "begin_operation(state, initial)?",
+        "broker.create_tag(",
+        ".read_tag(REPOSITORY, &operation.record.operation.tag)",
+        "ensure_exact_draft(state, broker, &mut operation, false)?",
+        "verify_and_upload_all(state, broker, &mut operation, &release_id)?",
+        "RemoteRecordKind::DraftReceipt",
+    ]
+    positions = [operation_region.find(item) for item in operation_order]
+    if any(position < 0 for position in positions) or positions != sorted(positions):
+        errors.append("remote operation/tag/draft/upload/receipt order changed")
+
+    upload_region = workflow.split("fn verify_and_upload_all(", 1)[-1].split("fn require_exact_tag", 1)[0]
+    before = upload_region.find("let before = broker")
+    upload = upload_region.find("broker.upload_asset(")
+    after = upload_region.find("let after = broker", upload)
+    single = upload_region.find("require_single_new_asset", after)
+    download = upload_region.find("verify_download(", single)
+    if min(before, upload, after, single, download) < 0 or not (before < upload < after < single < download):
+        errors.append("pre/upload/post/single-new/download order changed")
+
+    publish_region = workflow.split("fn publish_inner(", 1)[-1].split("pub fn verify_latest_remote", 1)[0]
+    publish = publish_region.find("broker.publish_draft(")
+    postread = publish_region.find("let after = broker", publish)
+    durable = publish_region.find("RemoteRecordKind::PublicationReceipt", postread)
+    latest = publish_region.find("verify_latest_inner(state, latest)?", durable)
+    if min(publish, postread, durable, latest) < 0 or not (publish < postread < durable < latest):
+        errors.append("publish/post-read/publication-receipt/latest order changed")
+
+    transport_region = workflow.split("pub(crate) fn publish_transport_fixture_with(", 1)[-1].split("fn begin_operation", 1)[0]
+    transport_order = [
+        "broker.create_tag(", ".read_tag(", ".read_draft(", "broker.create_draft(",
+        "let before = broker", "broker.upload_asset(", "let after = broker",
+        "verify_download(", "broker.publish_draft(", "let published = broker", "verify_download(",
+    ]
+    cursor = -1
+    for item in transport_order:
+        cursor = transport_region.find(item, cursor + 1)
+        if cursor < 0:
+            errors.append("transport tag/draft/pre-upload/post/download/publish order changed")
+            break
+
+    trait = current["github"].split("pub(crate) trait BrokerTransport", 1)[-1].split("pub(crate) trait LatestTransport", 1)[0]
+    methods = re.findall(r"^    fn ([a-z0-9_]+)\(", trait, re.MULTILINE)
+    if methods != [
+        "config_sha256", "create_tag", "read_tag", "read_draft", "create_draft",
+        "upload_asset", "download_asset", "publish_draft",
+    ]:
+        errors.append(f"workflow broker authority changed: {methods}")
+    for forbidden in ["delete", "replace", "token", "credential", "route", "host", "request"]:
+        if re.search(rf"fn [a-z_]*{forbidden}[a-z_]*\(", trait):
+            errors.append(f"workflow broker gained forbidden {forbidden} method")
+
+    production_network = current["workflow"] + "\n" + current["github"]
+    for forbidden in ["reqwest::", "ureq::", "curl::", "std::net::", "Command::new("]:
+        if forbidden in production_network:
+            errors.append(f"Task 10 gained alternate network/process authority: {forbidden}")
+    if "CredentialFreeFetcher::" in current["github"] or "FetchRequest" in current["github"]:
+        errors.append("publisher bypasses the fixed latest API with general acquisition authority")
+    if "https://" in current["workflow"] or "https://" in current["github"]:
+        errors.append("publisher gained a URL literal outside the fixed acquire transport")
+
+    manifest = current["manifest"]
+    try:
+        import json
+        value = json.loads(manifest)
+    except Exception:
+        errors.append("transport manifest is not JSON")
+    else:
+        if json.dumps(value, sort_keys=True, separators=(",", ":")) != manifest:
+            errors.append("transport manifest is not canonical JSON")
+        expected_asset = {
+            "name": "github-release-asset-v1.txt",
+            "sha256": "12238677d13a13b3e9a47a952b8a96d45e06f4cb38fcb51cd5ddc04e2c624d95",
+            "size": 70,
+        }
+        if value.get("repository") != "Devalch/Fluxsemble-runtime-catalog" or value.get("tag") != "transport-v1":
+            errors.append("transport repository/tag changed")
+        if value.get("draft") is not True or value.get("prerelease") is not True:
+            errors.append("transport draft/prerelease state changed")
+        if value.get("assets") != [expected_asset]:
+            errors.append("transport exact support-only inventory changed")
+        if any(asset.get("name") == "catalog-v1.json" for asset in value.get("assets", [])):
+            errors.append("transport fixture gained catalog-v1.json")
+    asset = current["asset"].encode()
+    import hashlib
+    if len(asset) != 70 or hashlib.sha256(asset).hexdigest() != "12238677d13a13b3e9a47a952b8a96d45e06f4cb38fcb51cd5ddc04e2c624d95":
+        errors.append("transport fixture bytes changed")
+    return errors
+
+errors = task10_errors(sources)
+if errors:
+    print(errors[0], file=sys.stderr)
+    sys.exit(1)
+
+for source, label, snippet, expected in policies + test_policies:
+    for occurrence in range(expected):
+        start = -1
+        for _ in range(occurrence + 1):
+            start = sources[source].find(snippet, start + 1)
+        if start < 0:
+            print(f"Task 10 mutation could not be applied: {label}", file=sys.stderr)
+            sys.exit(1)
+        mutated = dict(sources)
+        mutated[source] = (
+            sources[source][:start]
+            + f"REMOVED_TASK10_POLICY_{label}"
+            + sources[source][start + len(snippet):]
+        )
+        if not task10_errors(mutated):
+            print(f"Task 10 scanner accepted removed enforcement: {label}", file=sys.stderr)
+            sys.exit(1)
+
+semantic_mutations = [
+    ("workflow", "tag commit bypass", "actual.commit_sha != expected_commit", "false /* actual.commit_sha expected_commit */"),
+    ("workflow", "release ID bypass", "release_id.is_some_and(|expected| release.release_id != expected)", "false /* release_id release.release_id expected */"),
+    ("workflow", "prior asset-set bypass", "after[..before.len()] != *before", "false /* after before asset set */"),
+    ("workflow", "download digest bypass", "sha256(&bytes) != expected.sha256", "false /* sha256 bytes expected */"),
+    ("workflow", "approval digest bypass", "approval.draft_receipt_sha256 != sha256(&canonical(receipt)?)", "false /* approval draft_receipt_sha256 canonical receipt */"),
+    ("workflow", "latest digest bypass", "sha256(&bytes) != expected.sha256", "false /* latest sha256 bytes expected */"),
+    ("workflow", "transport catalog bypass", '.any(|asset| asset.name == "catalog-v1.json")', "any(|_| false) /* catalog-v1.json */"),
+    ("github", "scratch canonical directory bypass", "ScratchIdentity::from_metadata(&canonical_directory_metadata) != self.identity", "false /* canonical directory identity */"),
+    ("github", "scratch canonical bytes bypass", "read_scratch_file(&canonical, expected_size)? != bytes", "false /* canonical scratch bytes */"),
+    ("broker", "release-list bound bypass", "if releases.len() >= 100", "if false /* releases len 100 */"),
+]
+for source, label, old, new in semantic_mutations:
+    mutated = dict(sources)
+    mutated[source] = mutated[source].replace(old, new, 1)
+    if mutated[source] == sources[source] or not task10_errors(mutated):
+        print(f"Task 10 scanner accepted semantic bypass: {label}", file=sys.stderr)
         sys.exit(1)
 PY
