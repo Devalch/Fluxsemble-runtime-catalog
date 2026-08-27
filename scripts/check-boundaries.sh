@@ -1496,6 +1496,9 @@ policies = [
     ("owner-only directory mode", "metadata.permissions().mode() & 0o7777 == 0o700", 1),
     ("component no-symlink resolution", "0x02 | 0x04 | 0x08,", 2),
     ("retained root identity", "FileIdentity::from_metadata(&root_metadata) != self.root_identity", 1),
+    ("canonical state root rebind", "FileIdentity::from_metadata(&rebound_root_metadata) != self.root_identity", 1),
+    ("canonical state objects rebind", "FileIdentity::from_metadata(&rebound_objects_metadata) != self.objects_identity", 1),
+    ("canonical state latest rebind", "FileIdentity::from_metadata(&rebound_latest_metadata) != self.latest_identity", 1),
     ("retained bundle identity", "FileIdentity::from_metadata(&bundle_metadata) != self.bundle_identity", 1),
     ("retained named file identity", "FileIdentity::from_metadata(&rebound_metadata) != retained.identity", 1),
     ("retained all-file revalidation", "bundle.reverify_all().map_err(|_| prior_preserved())?;", 2),
@@ -1512,6 +1515,17 @@ policies = [
     ("immutable source descriptor copy", "let mut input = source.file.try_clone().map_err(|_| rejected())?;", 1),
     ("immutable object readback", "hash_descriptor(&rebound, source.size)? != source.sha256", 1),
     ("immutable object fsync", "objects.sync_all().map_err(|_| rejected())?;", 2),
+    ("persistent bounded streaming", "stream_names_bounded(&self.objects, object_enumeration_limits", 1),
+    ("persistent object count bound", "entries = bounded_add(entries, 1, limits.maximum_entries)?;", 1),
+    ("persistent cumulative byte bound", "self.limits.maximum_cumulative_bytes,\n            )?;", 1),
+    ("persistent per-object byte bound", "metadata.len() > self.limits.maximum_object_bytes", 1),
+    ("persistent object name bound", "name_bytes > limits.maximum_name_bytes", 1),
+    ("persistent enumeration work bound", "work = bounded_add(work, 1, limits.maximum_work)?;", 1),
+    ("persistent checked arithmetic", "current.checked_add(amount).ok_or_else(rejected)?", 1),
+    ("persistent arithmetic maximum", "if next > maximum", 1),
+    ("bounded intended inventory", "validate_staging_inventory(bundle, state.limits)", 1),
+    ("bounded recovery inventory", "validate_recovery_inventory(&record, state.limits)", 1),
+    ("existing root validation before children", "let existing_names = validate_existing_state_layout(&root)?;", 1),
     ("record before latest", "let transaction = install_recovery_record(&state, &record_bytes)", 1),
     ("exact gated prior", "if gated != prior_bytes", 1),
     ("atomic latest rename", "libc::SYS_renameat2,", 1),
@@ -1522,7 +1536,9 @@ policies = [
     ("transaction lock", "libc::LOCK_EX | libc::LOCK_NB", 1),
     ("exact recovery commit", "current.as_deref() == Some(intended_bytes.as_slice())", 1),
     ("exact recovery abort", "current == prior_bytes", 1),
-    ("uncertain no guessing", "return Err(uncertain());", 15),
+    ("staged before-success revalidation", "revalidate_before_staged_success(&state)", 2),
+    ("recovered before-success revalidation", "revalidate_before_recovered_success(&state)", 2),
+    ("uncertain no guessing", "return Err(uncertain());", 16),
     ("previsibility prior preserved", "return Err(prior_preserved());", 6),
     ("record visibility recovery required", "return Err(recovery_required());", 10),
     ("uncertainty record retention", "FaultPoint::AfterLatestDirectorySync", 1),
@@ -1535,6 +1551,11 @@ def publisher_errors(local_source, lib_source, main_source, manifest_source, tes
         actual = local_source.count(snippet)
         if actual != count:
             errors.append(f"missing exact publisher policy {label}: expected {count}, got {actual}")
+    prepare_state = local_source.split("fn prepare_state(", 1)[-1].split("fn open_existing_state(", 1)[0]
+    validation = prepare_state.find("let existing_names = validate_existing_state_layout(&root)?;")
+    first_child_mkdir = prepare_state.find('ensure_state_child(&root, "objects")?;')
+    if validation < 0 or first_child_mkdir < 0 or validation > first_child_mkdir:
+        errors.append("pre-existing state validation no longer precedes fixed-child mkdir")
     production_sources = lib_source + "\n" + main_source + "\n" + local_source
     for forbidden in [
         "SigningKey", "DecodePrivateKey", "from_pkcs8", "PRIVATE KEY",
@@ -1586,6 +1607,18 @@ for label, snippet, _count in policies:
     if not publisher_errors(mutation, lib, main, manifest, tests):
         print(f"publisher scanner accepted removed enforcement: {label}", file=sys.stderr)
         sys.exit(1)
+
+initialization_order_mutation = local.replace(
+    "    if existed {\n        let existing_names = validate_existing_state_layout(&root)?;",
+    '    ensure_state_child(&root, "objects")?;\n    if existed {\n        let existing_names = validate_existing_state_layout(&root)?;',
+    1,
+)
+if initialization_order_mutation == local:
+    print("publisher initialization-order mutation could not be applied", file=sys.stderr)
+    sys.exit(1)
+if not publisher_errors(initialization_order_mutation, lib, main, manifest, tests):
+    print("publisher scanner accepted child mkdir before existing-root validation", file=sys.stderr)
+    sys.exit(1)
 
 key_mutation = local + "\nfn forbidden_key_mutation(_: SigningKey) {}\n"
 if not publisher_errors(key_mutation, lib, main, manifest, tests):

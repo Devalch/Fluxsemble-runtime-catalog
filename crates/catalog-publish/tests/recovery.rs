@@ -1,9 +1,12 @@
 #![cfg(unix)]
 
 use std::{
+    collections::BTreeMap,
     fs::{self, File},
     os::fd::AsRawFd,
     process::Command,
+    sync::mpsc,
+    thread,
 };
 
 #[allow(dead_code)]
@@ -11,8 +14,8 @@ use std::{
 mod local;
 mod support;
 
-use local::{FailureOutcome, FaultPoint, PublishOutcome};
-use support::{TempTree, fixture_transfer, set_mode};
+use local::{FailureOutcome, FaultPoint, PublishOutcome, StateCheckpoint};
+use support::{TempTree, fixture_transfer, private_directory, set_mode};
 
 fn stage_baseline(temp: &TempTree) -> (std::path::PathBuf, Vec<u8>) {
     let transfer = temp.path("baseline-transfer");
@@ -266,5 +269,102 @@ fn recover_cli_is_strictly_recover_only_and_accepts_no_candidate() {
         assert!(!rejected.status.success());
         assert!(rejected.stdout.is_empty());
         assert_eq!(rejected.stderr, b"catalog publication failed\n");
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SwappedStateComponent {
+    Root,
+    Objects,
+    Latest,
+}
+
+fn state_file_snapshot(directory: &std::path::Path) -> BTreeMap<String, Vec<u8>> {
+    fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            (
+                path.file_name().unwrap().to_str().unwrap().to_owned(),
+                fs::read(path).unwrap(),
+            )
+        })
+        .collect()
+}
+
+fn replace_canonical_state(
+    temp: &TempTree,
+    state: &std::path::Path,
+    component: SwappedStateComponent,
+) {
+    match component {
+        SwappedStateComponent::Root => {
+            fs::rename(state, temp.path("detached-state")).unwrap();
+            private_directory(state);
+            private_directory(&state.join("objects"));
+            private_directory(&state.join("latest"));
+        }
+        SwappedStateComponent::Objects => {
+            fs::rename(state.join("objects"), temp.path("detached-objects")).unwrap();
+            private_directory(&state.join("objects"));
+        }
+        SwappedStateComponent::Latest => {
+            fs::rename(state.join("latest"), temp.path("detached-latest")).unwrap();
+            private_directory(&state.join("latest"));
+        }
+    }
+}
+
+#[test]
+fn canonical_state_swaps_never_claim_recovered_success() {
+    for checkpoint in [
+        StateCheckpoint::AfterOpen,
+        StateCheckpoint::BeforeMutation,
+        StateCheckpoint::BeforeSuccess,
+    ] {
+        for component in [
+            SwappedStateComponent::Root,
+            SwappedStateComponent::Objects,
+            SwappedStateComponent::Latest,
+        ] {
+            let temp = TempTree::new(&format!("recover-swap-{checkpoint:?}-{component:?}"));
+            let (state, _) = stage_baseline(&temp);
+            let transfer = temp.path("candidate-transfer");
+            fixture_transfer(&transfer, 43, b"candidate");
+            let candidate = local::verify_transferred_fixture_signed_bundle(&transfer).unwrap();
+            let _ =
+                local::stage_local_with_fault(&candidate, &state, FaultPoint::AfterRecoveryRecord);
+            let worker_state = state.clone();
+            let (reached_tx, reached_rx) = mpsc::sync_channel(0);
+            let (resume_tx, resume_rx) = mpsc::sync_channel(0);
+            let worker = thread::spawn(move || {
+                local::recover_local_with_checkpoint(
+                    &worker_state,
+                    checkpoint,
+                    reached_tx,
+                    resume_rx,
+                )
+            });
+
+            reached_rx.recv().unwrap();
+            replace_canonical_state(&temp, &state, component);
+            let replacement_objects = state_file_snapshot(&state.join("objects"));
+            let replacement_latest = state_file_snapshot(&state.join("latest"));
+            resume_tx.send(()).unwrap();
+            assert!(
+                worker.join().unwrap().is_err(),
+                "{checkpoint:?} {component:?}"
+            );
+            assert_eq!(
+                state_file_snapshot(&state.join("objects")),
+                replacement_objects,
+                "canonical replacement objects changed at {checkpoint:?} {component:?}"
+            );
+            assert_eq!(
+                state_file_snapshot(&state.join("latest")),
+                replacement_latest,
+                "canonical replacement latest changed at {checkpoint:?} {component:?}"
+            );
+        }
     }
 }

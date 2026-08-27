@@ -186,6 +186,10 @@ pub fn fixture_transfer(root: &Path, sequence: u64, support: &[u8]) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o400)).unwrap();
 }
 
+pub fn private_directory(path: &Path) {
+    fs::DirBuilder::new().mode(0o700).create(path).unwrap();
+}
+
 pub fn set_mode(path: &Path, mode: u32) {
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
 }

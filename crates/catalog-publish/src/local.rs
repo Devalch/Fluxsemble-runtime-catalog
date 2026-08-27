@@ -37,6 +37,12 @@ const MAX_TRANSFER_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_TRANSFER_ENTRIES: usize = 64;
 const MAX_STATE_RECORD_BYTES: u64 = 64 * 1024;
 const MAX_REFERENCE_BYTES: u64 = 16 * 1024;
+const MAX_PERSISTENT_OBJECTS: u64 = 4_096;
+const MAX_PERSISTENT_OBJECT_BYTES: u64 = MAX_TRANSFER_BYTES;
+const MAX_PERSISTENT_CUMULATIVE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const MAX_PERSISTENT_OBJECT_NAME_BYTES: u64 = 64;
+const MAX_PERSISTENT_NAME_BYTES: u64 = MAX_PERSISTENT_OBJECTS * MAX_PERSISTENT_OBJECT_NAME_BYTES;
+const MAX_PERSISTENT_ENUMERATION_WORK: u64 = MAX_PERSISTENT_OBJECTS + 2;
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 const OPERATION_DOMAIN: &[u8] = b"fluxsemble:runtime-catalog-local-operation:v1\0";
 
@@ -303,7 +309,7 @@ impl VerifiedTransferredSignedBundle {
         if !secure_directory(&root_metadata)
             || root_metadata.nlink() != 3
             || FileIdentity::from_metadata(&root_metadata) != self.root_identity
-            || enumerate_names(&self.root)? != self.root_names
+            || enumerate_names(&self.root, TRANSFER_ROOT_ENUMERATION_LIMITS)? != self.root_names
         {
             return Err(rejected());
         }
@@ -312,7 +318,8 @@ impl VerifiedTransferredSignedBundle {
         if !secure_directory(&bundle_metadata)
             || bundle_metadata.nlink() != 2
             || FileIdentity::from_metadata(&bundle_metadata) != self.bundle_identity
-            || enumerate_names(&self.bundle)? != self.bundle_names
+            || enumerate_names(&self.bundle, TRANSFER_BUNDLE_ENUMERATION_LIMITS)?
+                != self.bundle_names
         {
             return Err(rejected());
         }
@@ -360,7 +367,7 @@ fn verify_transferred_signed_bundle_with(
         return Err(rejected());
     }
     let root_identity = FileIdentity::from_metadata(&root_metadata);
-    let root_names = enumerate_names(&root)?;
+    let root_names = enumerate_names(&root, TRANSFER_ROOT_ENUMERATION_LIMITS)?;
     if root_names != BTreeSet::from([TRANSFER_MANIFEST.to_owned(), SIGNED_BUNDLE.to_owned()]) {
         return Err(rejected());
     }
@@ -370,7 +377,7 @@ fn verify_transferred_signed_bundle_with(
         return Err(rejected());
     }
     let bundle_identity = FileIdentity::from_metadata(&bundle_metadata);
-    let bundle_names = enumerate_names(&bundle)?;
+    let bundle_names = enumerate_names(&bundle, TRANSFER_BUNDLE_ENUMERATION_LIMITS)?;
 
     let transfer_file = open_regular_at(&root, TRANSFER_MANIFEST)?;
     let transfer_metadata = transfer_file.metadata().map_err(|_| rejected())?;
@@ -706,13 +713,108 @@ fn verify_release_bindings(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct EnumerationLimits {
+    maximum_entries: u64,
+    maximum_name_bytes: u64,
+    maximum_cumulative_name_bytes: u64,
+    maximum_work: u64,
+}
+
+const TRANSFER_ROOT_ENUMERATION_LIMITS: EnumerationLimits = EnumerationLimits {
+    maximum_entries: 2,
+    maximum_name_bytes: 255,
+    maximum_cumulative_name_bytes: 255 * 2,
+    maximum_work: 4,
+};
+const TRANSFER_BUNDLE_ENUMERATION_LIMITS: EnumerationLimits = EnumerationLimits {
+    maximum_entries: MAX_TRANSFER_ENTRIES as u64,
+    maximum_name_bytes: 255,
+    maximum_cumulative_name_bytes: 255 * MAX_TRANSFER_ENTRIES as u64,
+    maximum_work: MAX_TRANSFER_ENTRIES as u64 + 2,
+};
+const STATE_ROOT_ENUMERATION_LIMITS: EnumerationLimits = EnumerationLimits {
+    maximum_entries: 2,
+    maximum_name_bytes: 7,
+    maximum_cumulative_name_bytes: 13,
+    maximum_work: 4,
+};
+const STATE_LATEST_ENUMERATION_LIMITS: EnumerationLimits = EnumerationLimits {
+    maximum_entries: 4,
+    maximum_name_bytes: 64,
+    maximum_cumulative_name_bytes: 256,
+    maximum_work: 6,
+};
+
+#[derive(Clone, Copy)]
+struct PersistentStateLimits {
+    maximum_object_count: u64,
+    maximum_object_bytes: u64,
+    maximum_cumulative_bytes: u64,
+    maximum_name_bytes: u64,
+    maximum_cumulative_name_bytes: u64,
+    maximum_enumeration_work: u64,
+}
+
+const PERSISTENT_STATE_LIMITS: PersistentStateLimits = PersistentStateLimits {
+    maximum_object_count: MAX_PERSISTENT_OBJECTS,
+    maximum_object_bytes: MAX_PERSISTENT_OBJECT_BYTES,
+    maximum_cumulative_bytes: MAX_PERSISTENT_CUMULATIVE_BYTES,
+    maximum_name_bytes: MAX_PERSISTENT_OBJECT_NAME_BYTES,
+    maximum_cumulative_name_bytes: MAX_PERSISTENT_NAME_BYTES,
+    maximum_enumeration_work: MAX_PERSISTENT_ENUMERATION_WORK,
+};
+
+#[allow(dead_code)]
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub struct TestPersistentStateLimits {
+    pub maximum_object_count: u64,
+    pub maximum_object_bytes: u64,
+    pub maximum_cumulative_bytes: u64,
+    pub maximum_name_bytes: u64,
+    pub maximum_cumulative_name_bytes: u64,
+    pub maximum_enumeration_work: u64,
+}
+
+#[cfg(test)]
+impl Default for TestPersistentStateLimits {
+    fn default() -> Self {
+        Self {
+            maximum_object_count: MAX_PERSISTENT_OBJECTS,
+            maximum_object_bytes: MAX_PERSISTENT_OBJECT_BYTES,
+            maximum_cumulative_bytes: MAX_PERSISTENT_CUMULATIVE_BYTES,
+            maximum_name_bytes: MAX_PERSISTENT_OBJECT_NAME_BYTES,
+            maximum_cumulative_name_bytes: MAX_PERSISTENT_NAME_BYTES,
+            maximum_enumeration_work: MAX_PERSISTENT_ENUMERATION_WORK,
+        }
+    }
+}
+
+#[cfg(test)]
+impl From<TestPersistentStateLimits> for PersistentStateLimits {
+    fn from(limits: TestPersistentStateLimits) -> Self {
+        Self {
+            maximum_object_count: limits.maximum_object_count,
+            maximum_object_bytes: limits.maximum_object_bytes,
+            maximum_cumulative_bytes: limits.maximum_cumulative_bytes,
+            maximum_name_bytes: limits.maximum_name_bytes,
+            maximum_cumulative_name_bytes: limits.maximum_cumulative_name_bytes,
+            maximum_enumeration_work: limits.maximum_enumeration_work,
+        }
+    }
+}
+
 struct StateCapabilities {
+    parent: fs::File,
+    root_name: String,
     root: fs::File,
     root_identity: FileIdentity,
     objects: fs::File,
     objects_identity: FileIdentity,
     latest: fs::File,
     latest_identity: FileIdentity,
+    limits: PersistentStateLimits,
 }
 
 impl StateCapabilities {
@@ -720,45 +822,82 @@ impl StateCapabilities {
         let root = self.root.metadata().map_err(|_| rejected())?;
         let objects = self.objects.metadata().map_err(|_| rejected())?;
         let latest = self.latest.metadata().map_err(|_| rejected())?;
-        if !secure_directory(&root)
+        let rebound_root = open_directory_at(&self.parent, &self.root_name)?;
+        let rebound_root_metadata = rebound_root.metadata().map_err(|_| rejected())?;
+        let rebound_objects = open_directory_at(&self.root, "objects")?;
+        let rebound_objects_metadata = rebound_objects.metadata().map_err(|_| rejected())?;
+        let rebound_latest = open_directory_at(&self.root, "latest")?;
+        let rebound_latest_metadata = rebound_latest.metadata().map_err(|_| rejected())?;
+        if !same_directory_policy_facts(&root, &rebound_root_metadata)
+            || FileIdentity::from_metadata(&rebound_root_metadata) != self.root_identity
+            || !secure_directory(&root)
             || root.nlink() != 4
             || FileIdentity::from_metadata(&root) != self.root_identity
-            || enumerate_names(&self.root)?
+            || enumerate_names(&self.root, STATE_ROOT_ENUMERATION_LIMITS)?
                 != BTreeSet::from(["latest".to_owned(), "objects".to_owned()])
+            || !same_directory_policy_facts(&objects, &rebound_objects_metadata)
+            || FileIdentity::from_metadata(&rebound_objects_metadata) != self.objects_identity
             || !secure_directory(&objects)
             || objects.nlink() != 2
             || FileIdentity::from_metadata(&objects) != self.objects_identity
+            || !same_directory_policy_facts(&latest, &rebound_latest_metadata)
+            || FileIdentity::from_metadata(&rebound_latest_metadata) != self.latest_identity
             || !secure_directory(&latest)
             || latest.nlink() != 2
             || FileIdentity::from_metadata(&latest) != self.latest_identity
         {
             return Err(rejected());
         }
-        for name in enumerate_names(&self.objects)? {
-            if !valid_sha256(&name) {
+
+        let object_enumeration_limits = EnumerationLimits {
+            maximum_entries: self.limits.maximum_object_count,
+            maximum_name_bytes: self.limits.maximum_name_bytes,
+            maximum_cumulative_name_bytes: self.limits.maximum_cumulative_name_bytes,
+            maximum_work: self.limits.maximum_enumeration_work,
+        };
+        let mut cumulative_bytes = 0_u64;
+        stream_names_bounded(&self.objects, object_enumeration_limits, |name| {
+            if !valid_sha256(name) {
                 return Err(rejected());
             }
-            let file = open_regular_at(&self.objects, &name)?;
+            let file = open_regular_at(&self.objects, name)?;
             let metadata = file.metadata().map_err(|_| rejected())?;
             if !secure_file(&metadata)
                 || metadata.len() == 0
-                || metadata.len() > MAX_ENTRY_BYTES
-                || hash_descriptor(&file, metadata.len())? != name
+                || metadata.len() > self.limits.maximum_object_bytes
             {
                 return Err(rejected());
             }
-        }
+            cumulative_bytes = bounded_add(
+                cumulative_bytes,
+                metadata.len(),
+                self.limits.maximum_cumulative_bytes,
+            )?;
+            if hash_descriptor(&file, metadata.len())? != name {
+                return Err(rejected());
+            }
+            Ok(())
+        })?;
+
         let allowed = BTreeSet::from([
             LATEST_REFERENCE.to_owned(),
             LATEST_TEMP.to_owned(),
             RECOVERY_RECORD.to_owned(),
             RECOVERY_TEMP.to_owned(),
         ]);
-        if !enumerate_names(&self.latest)?.is_subset(&allowed) {
+        if !enumerate_names(&self.latest, STATE_LATEST_ENUMERATION_LIMITS)?.is_subset(&allowed) {
             return Err(rejected());
         }
         Ok(())
     }
+}
+
+fn same_directory_policy_facts(retained: &fs::Metadata, rebound: &fs::Metadata) -> bool {
+    retained.uid() == rebound.uid()
+        && retained.permissions().mode() & 0o7777 == rebound.permissions().mode() & 0o7777
+        && retained.nlink() == rebound.nlink()
+        && secure_directory(retained)
+        && secure_directory(rebound)
 }
 
 /// Stages every retained public release object into exact owner-private local state.
@@ -767,9 +906,9 @@ pub fn stage_local(
     state: &Path,
 ) -> Result<PublishOutcome, PublishError> {
     #[cfg(test)]
-    return stage_local_inner(bundle, state, None);
+    return stage_local_inner(bundle, state, TestPlan::default(), PERSISTENT_STATE_LIMITS);
     #[cfg(not(test))]
-    stage_local_inner(bundle, state, ())
+    stage_local_inner(bundle, state, (), PERSISTENT_STATE_LIMITS)
 }
 
 #[allow(dead_code)]
@@ -803,10 +942,52 @@ impl FaultPoint {
     }
 }
 
+#[allow(dead_code)]
 #[cfg(test)]
-type FaultPlan = Option<FaultPoint>;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateCheckpoint {
+    AfterOpen,
+    BeforeChildCreation,
+    BeforeMutation,
+    BeforeSuccess,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StateBoundary {
+    AfterOpen,
+    BeforeChildCreation,
+    BeforeMutation,
+    BeforeSuccess,
+}
+
+#[cfg(test)]
+impl From<StateCheckpoint> for StateBoundary {
+    fn from(checkpoint: StateCheckpoint) -> Self {
+        match checkpoint {
+            StateCheckpoint::AfterOpen => Self::AfterOpen,
+            StateCheckpoint::BeforeChildCreation => Self::BeforeChildCreation,
+            StateCheckpoint::BeforeMutation => Self::BeforeMutation,
+            StateCheckpoint::BeforeSuccess => Self::BeforeSuccess,
+        }
+    }
+}
+
+#[cfg(test)]
+struct TestPause {
+    checkpoint: StateBoundary,
+    reached: std::sync::mpsc::SyncSender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TestPlan {
+    fault: Option<FaultPoint>,
+    pause: Option<TestPause>,
+}
+
 #[cfg(not(test))]
-type FaultPlan = ();
+type TestPlan = ();
 
 #[allow(dead_code)]
 #[cfg(test)]
@@ -815,7 +996,49 @@ pub fn stage_local_with_fault(
     state: &Path,
     fault: FaultPoint,
 ) -> Result<PublishOutcome, PublishError> {
-    stage_local_inner(bundle, state, Some(fault))
+    stage_local_inner(
+        bundle,
+        state,
+        TestPlan {
+            fault: Some(fault),
+            pause: None,
+        },
+        PERSISTENT_STATE_LIMITS,
+    )
+}
+
+#[allow(dead_code)]
+#[cfg(test)]
+pub fn stage_local_with_checkpoint(
+    bundle: &VerifiedTransferredSignedBundle,
+    state: &Path,
+    checkpoint: StateCheckpoint,
+    reached: std::sync::mpsc::SyncSender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+) -> Result<PublishOutcome, PublishError> {
+    stage_local_inner(
+        bundle,
+        state,
+        TestPlan {
+            fault: None,
+            pause: Some(TestPause {
+                checkpoint: checkpoint.into(),
+                reached,
+                resume,
+            }),
+        },
+        PERSISTENT_STATE_LIMITS,
+    )
+}
+
+#[allow(dead_code)]
+#[cfg(test)]
+pub fn stage_local_with_persistent_limits(
+    bundle: &VerifiedTransferredSignedBundle,
+    state: &Path,
+    limits: TestPersistentStateLimits,
+) -> Result<PublishOutcome, PublishError> {
+    stage_local_inner(bundle, state, TestPlan::default(), limits.into())
 }
 
 #[derive(Clone, Copy)]
@@ -831,9 +1054,9 @@ enum Checkpoint {
 }
 
 #[cfg(test)]
-fn fault_at(plan: FaultPlan, checkpoint: Checkpoint) -> bool {
+fn fault_at(plan: &TestPlan, checkpoint: Checkpoint) -> bool {
     matches!(
-        (plan, checkpoint),
+        (plan.fault, checkpoint),
         (
             Some(FaultPoint::BeforeObjectWrite),
             Checkpoint::BeforeObjectWrite
@@ -866,19 +1089,38 @@ fn fault_at(plan: FaultPlan, checkpoint: Checkpoint) -> bool {
 }
 
 #[cfg(not(test))]
-const fn fault_at(_plan: FaultPlan, _checkpoint: Checkpoint) -> bool {
+const fn fault_at(_plan: &TestPlan, _checkpoint: Checkpoint) -> bool {
     false
+}
+
+#[cfg(test)]
+fn pause_at(plan: &TestPlan, checkpoint: StateBoundary) -> Result<(), PublishError> {
+    if let Some(pause) = &plan.pause
+        && pause.checkpoint == checkpoint
+    {
+        pause.reached.send(()).map_err(|_| rejected())?;
+        pause.resume.recv().map_err(|_| rejected())?;
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+const fn pause_at(_plan: &TestPlan, _checkpoint: StateBoundary) -> Result<(), PublishError> {
+    Ok(())
 }
 
 fn stage_local_inner(
     bundle: &VerifiedTransferredSignedBundle,
     state_path: &Path,
-    fault: FaultPlan,
+    plan: TestPlan,
+    limits: PersistentStateLimits,
 ) -> Result<PublishOutcome, PublishError> {
     bundle.reverify_all().map_err(|_| prior_preserved())?;
-    let state = prepare_state(state_path).map_err(|_| prior_preserved())?;
+    let state = prepare_state(state_path, limits, &plan).map_err(|_| prior_preserved())?;
+    pause_at(&plan, StateBoundary::AfterOpen).map_err(|_| prior_preserved())?;
     state.revalidate().map_err(|_| prior_preserved())?;
-    let latest_names = enumerate_names(&state.latest).map_err(|_| prior_preserved())?;
+    let latest_names = enumerate_names(&state.latest, STATE_LATEST_ENUMERATION_LIMITS)
+        .map_err(|_| prior_preserved())?;
     if latest_names.contains(RECOVERY_RECORD)
         || latest_names.contains(RECOVERY_TEMP)
         || latest_names.contains(LATEST_TEMP)
@@ -908,26 +1150,31 @@ fn stage_local_inner(
         return Err(prior_preserved());
     }
 
-    if fault_at(fault, Checkpoint::BeforeObjectWrite) {
+    if fault_at(&plan, Checkpoint::BeforeObjectWrite) {
         return Err(prior_preserved());
     }
+    pause_at(&plan, StateBoundary::BeforeMutation).map_err(|_| prior_preserved())?;
+    state.revalidate().map_err(|_| prior_preserved())?;
+    validate_staging_inventory(bundle, state.limits).map_err(|_| prior_preserved())?;
     for source in bundle.files.values() {
         publish_or_reuse_object(&state.objects, source).map_err(|_| prior_preserved())?;
     }
     bundle.reverify_all().map_err(|_| prior_preserved())?;
     state.objects.sync_all().map_err(|_| prior_preserved())?;
-    if fault_at(fault, Checkpoint::AfterObjects) {
+    if fault_at(&plan, Checkpoint::AfterObjects) {
         return Err(prior_preserved());
     }
     if prior.as_ref() == Some(&intended) {
-        state.revalidate().map_err(|_| prior_preserved())?;
+        pause_at(&plan, StateBoundary::BeforeSuccess).map_err(|_| prior_preserved())?;
+        revalidate_before_staged_success(&state).map_err(|_| prior_preserved())?;
         return Ok(PublishOutcome::Staged);
     }
-    if fault_at(fault, Checkpoint::BeforeRecoveryRecord) {
+    if fault_at(&plan, Checkpoint::BeforeRecoveryRecord) {
         return Err(prior_preserved());
     }
 
     let record = build_recovery_record(bundle, intended.clone(), prior.clone())?;
+    validate_recovery_inventory(&record, state.limits).map_err(|_| prior_preserved())?;
     let record_bytes = serde_jcs::to_vec(&record).map_err(|_| prior_preserved())?;
     if record_bytes.len() as u64 > MAX_STATE_RECORD_BYTES {
         return Err(prior_preserved());
@@ -941,7 +1188,7 @@ fn stage_local_inner(
             prior_preserved()
         }
     })?;
-    if fault_at(fault, Checkpoint::AfterRecoveryRecord) {
+    if fault_at(&plan, Checkpoint::AfterRecoveryRecord) {
         return Err(recovery_required());
     }
 
@@ -952,7 +1199,7 @@ fn stage_local_inner(
         return Err(uncertain());
     }
     install_latest(&state, &intended_bytes, prior.is_some()).map_err(|_| uncertain())?;
-    if fault_at(fault, Checkpoint::AfterLatestRename) {
+    if fault_at(&plan, Checkpoint::AfterLatestRename) {
         return Err(uncertain());
     }
     let readback =
@@ -961,19 +1208,74 @@ fn stage_local_inner(
     if readback.as_deref() != Some(intended_bytes.as_slice()) {
         return Err(uncertain());
     }
-    if fault_at(fault, Checkpoint::AfterLatestReadback)
-        || fault_at(fault, Checkpoint::BeforeLatestDirectorySync)
+    if fault_at(&plan, Checkpoint::AfterLatestReadback)
+        || fault_at(&plan, Checkpoint::BeforeLatestDirectorySync)
     {
         return Err(uncertain());
     }
     state.latest.sync_all().map_err(|_| uncertain())?;
-    if fault_at(fault, Checkpoint::AfterLatestDirectorySync) {
+    if fault_at(&plan, Checkpoint::AfterLatestDirectorySync) {
         return Err(uncertain());
     }
     verify_recovery_relation(&state, &record, &intended_bytes).map_err(|_| uncertain())?;
     cleanup_recovery_record(&state, &transaction).map_err(|_| uncertain())?;
-    state.revalidate().map_err(|_| uncertain())?;
+    pause_at(&plan, StateBoundary::BeforeSuccess).map_err(|_| uncertain())?;
+    revalidate_before_staged_success(&state).map_err(|_| uncertain())?;
     Ok(PublishOutcome::Staged)
+}
+
+fn revalidate_before_staged_success(state: &StateCapabilities) -> Result<(), PublishError> {
+    state.revalidate()
+}
+
+fn validate_staging_inventory(
+    bundle: &VerifiedTransferredSignedBundle,
+    limits: PersistentStateLimits,
+) -> Result<(), PublishError> {
+    let count = u64::try_from(bundle.files.len()).map_err(|_| rejected())?;
+    if count == 0 || count > limits.maximum_object_count {
+        return Err(rejected());
+    }
+    let mut cumulative_bytes = 0_u64;
+    for source in bundle.files.values() {
+        if source.sha256.len() as u64 > limits.maximum_name_bytes
+            || source.size == 0
+            || source.size > limits.maximum_object_bytes
+        {
+            return Err(rejected());
+        }
+        cumulative_bytes = bounded_add(
+            cumulative_bytes,
+            source.size,
+            limits.maximum_cumulative_bytes,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_recovery_inventory(
+    record: &RecoveryRecordV1,
+    limits: PersistentStateLimits,
+) -> Result<(), PublishError> {
+    let count = u64::try_from(record.objects.len()).map_err(|_| rejected())?;
+    if count == 0 || count > limits.maximum_object_count {
+        return Err(rejected());
+    }
+    let mut cumulative_bytes = 0_u64;
+    for object in &record.objects {
+        if object.sha256.len() as u64 > limits.maximum_name_bytes
+            || object.size == 0
+            || object.size > limits.maximum_object_bytes
+        {
+            return Err(rejected());
+        }
+        cumulative_bytes = bounded_add(
+            cumulative_bytes,
+            object.size,
+            limits.maximum_cumulative_bytes,
+        )?;
+    }
+    Ok(())
 }
 
 fn build_recovery_record(
@@ -1096,7 +1398,36 @@ fn install_latest(
 
 /// Recovers only the exact durable operation already recorded in local state.
 pub fn recover_local(state_path: &Path) -> Result<PublishOutcome, PublishError> {
+    #[cfg(test)]
+    return recover_local_inner(state_path, TestPlan::default());
+    #[cfg(not(test))]
+    recover_local_inner(state_path, ())
+}
+
+#[allow(dead_code)]
+#[cfg(test)]
+pub fn recover_local_with_checkpoint(
+    state: &Path,
+    checkpoint: StateCheckpoint,
+    reached: std::sync::mpsc::SyncSender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+) -> Result<PublishOutcome, PublishError> {
+    recover_local_inner(
+        state,
+        TestPlan {
+            fault: None,
+            pause: Some(TestPause {
+                checkpoint: checkpoint.into(),
+                reached,
+                resume,
+            }),
+        },
+    )
+}
+
+fn recover_local_inner(state_path: &Path, plan: TestPlan) -> Result<PublishOutcome, PublishError> {
     let state = open_existing_state(state_path).map_err(|_| uncertain())?;
+    pause_at(&plan, StateBoundary::AfterOpen).map_err(|_| uncertain())?;
     state.revalidate().map_err(|_| uncertain())?;
     if name_exists(&state.latest, LATEST_TEMP).map_err(|_| uncertain())? {
         return Err(recovery_required());
@@ -1107,7 +1438,10 @@ pub fn recover_local(state_path: &Path) -> Result<PublishOutcome, PublishError> 
         if temporary_exists {
             return Err(recovery_required());
         }
-        return clean_recovery_outcome(&state);
+        let outcome = clean_recovery_outcome(&state)?;
+        pause_at(&plan, StateBoundary::BeforeSuccess).map_err(|_| uncertain())?;
+        revalidate_before_recovered_success(&state).map_err(|_| uncertain())?;
+        return Ok(outcome);
     }
 
     let marker = open_regular_at(&state.latest, RECOVERY_RECORD).map_err(|_| uncertain())?;
@@ -1131,7 +1465,7 @@ pub fn recover_local(state_path: &Path) -> Result<PublishOutcome, PublishError> 
             return Err(uncertain());
         }
     }
-    let record = parse_recovery_record(&bytes)?;
+    let record = parse_recovery_record(&bytes, state.limits)?;
     verify_record_objects(&state, &record)?;
     if let Some(prior) = &record.prior_reference {
         verify_reference_object(&state, prior)?;
@@ -1159,9 +1493,16 @@ pub fn recover_local(state_path: &Path) -> Result<PublishOutcome, PublishError> 
         file: marker,
         identity,
     };
-    cleanup_recovery_record(&state, &transaction).map_err(|_| uncertain())?;
+    pause_at(&plan, StateBoundary::BeforeMutation).map_err(|_| uncertain())?;
     state.revalidate().map_err(|_| uncertain())?;
+    cleanup_recovery_record(&state, &transaction).map_err(|_| uncertain())?;
+    pause_at(&plan, StateBoundary::BeforeSuccess).map_err(|_| uncertain())?;
+    revalidate_before_recovered_success(&state).map_err(|_| uncertain())?;
     Ok(outcome)
+}
+
+fn revalidate_before_recovered_success(state: &StateCapabilities) -> Result<(), PublishError> {
+    state.revalidate()
 }
 
 fn clean_recovery_outcome(state: &StateCapabilities) -> Result<PublishOutcome, PublishError> {
@@ -1178,7 +1519,10 @@ fn clean_recovery_outcome(state: &StateCapabilities) -> Result<PublishOutcome, P
     }
 }
 
-fn parse_recovery_record(bytes: &[u8]) -> Result<RecoveryRecordV1, PublishError> {
+fn parse_recovery_record(
+    bytes: &[u8],
+    limits: PersistentStateLimits,
+) -> Result<RecoveryRecordV1, PublishError> {
     if bytes.is_empty() || bytes.len() as u64 > MAX_STATE_RECORD_BYTES {
         return Err(uncertain());
     }
@@ -1234,6 +1578,7 @@ fn parse_recovery_record(bytes: &[u8]) -> Result<RecoveryRecordV1, PublishError>
             return Err(uncertain());
         }
     }
+    validate_recovery_inventory(&record, limits).map_err(|_| uncertain())?;
     let catalog = record
         .objects
         .iter()
@@ -1260,13 +1605,21 @@ fn verify_record_objects(
     state: &StateCapabilities,
     record: &RecoveryRecordV1,
 ) -> Result<(), PublishError> {
+    validate_recovery_inventory(record, state.limits).map_err(|_| uncertain())?;
+    let mut cumulative_bytes = 0_u64;
     for object in &record.objects {
         let file = open_regular_at(&state.objects, &object.sha256).map_err(|_| uncertain())?;
         let metadata = file.metadata().map_err(|_| uncertain())?;
-        if !secure_file(&metadata)
-            || metadata.len() != object.size
-            || hash_descriptor(&file, object.size).map_err(|_| uncertain())? != object.sha256
-        {
+        if !secure_file(&metadata) || metadata.len() != object.size {
+            return Err(uncertain());
+        }
+        cumulative_bytes = bounded_add(
+            cumulative_bytes,
+            metadata.len(),
+            state.limits.maximum_cumulative_bytes,
+        )
+        .map_err(|_| uncertain())?;
+        if hash_descriptor(&file, object.size).map_err(|_| uncertain())? != object.sha256 {
             return Err(uncertain());
         }
     }
@@ -1281,7 +1634,7 @@ fn verify_recovery_relation(
     let record_bytes =
         read_optional_state_file(&state.latest, RECOVERY_RECORD, MAX_STATE_RECORD_BYTES, true)?
             .ok_or_else(rejected)?;
-    if parse_recovery_record(&record_bytes)? != *record {
+    if parse_recovery_record(&record_bytes, state.limits)? != *record {
         return Err(rejected());
     }
     let latest =
@@ -1440,32 +1793,71 @@ fn publish_or_reuse_object(objects: &fs::File, source: &RetainedFile) -> Result<
     Ok(())
 }
 
-fn prepare_state(path: &Path) -> Result<StateCapabilities, PublishError> {
+fn prepare_state(
+    path: &Path,
+    limits: PersistentStateLimits,
+    plan: &TestPlan,
+) -> Result<StateCapabilities, PublishError> {
     let (parent, name) = open_absolute_parent(path)?;
-    if !name_exists(&parent, &name)? {
-        let name = CString::new(name.as_bytes()).map_err(|_| rejected())?;
+    let existed = name_exists(&parent, &name)?;
+    if !existed {
+        let component = CString::new(name.as_bytes()).map_err(|_| rejected())?;
         // SAFETY: retained parent and validated final component are valid.
-        if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+        if unsafe { libc::mkdirat(parent.as_raw_fd(), component.as_ptr(), 0o700) } != 0 {
             return Err(rejected());
         }
         parent.sync_all().map_err(|_| rejected())?;
     }
     let root = open_directory_at_os(&parent, std::ffi::OsStr::new(&name))?;
+    if existed {
+        let existing_names = validate_existing_state_layout(&root)?;
+        if existing_names.len() != 2 {
+            pause_at(plan, StateBoundary::BeforeChildCreation)?;
+        }
+    }
     ensure_state_child(&root, "objects")?;
     ensure_state_child(&root, "latest")?;
-    state_from_root(root)
+    state_from_root(parent, name, root, limits)
 }
 
 fn open_existing_state(path: &Path) -> Result<StateCapabilities, PublishError> {
-    state_from_root(open_absolute_directory(path)?)
+    let (parent, name) = open_absolute_parent(path)?;
+    let root = open_directory_at_os(&parent, std::ffi::OsStr::new(&name))?;
+    state_from_root(parent, name, root, PERSISTENT_STATE_LIMITS)
 }
 
-fn state_from_root(root: fs::File) -> Result<StateCapabilities, PublishError> {
+fn validate_existing_state_layout(root: &fs::File) -> Result<BTreeSet<String>, PublishError> {
+    let root_metadata = root.metadata().map_err(|_| rejected())?;
+    if !secure_directory(&root_metadata) {
+        return Err(rejected());
+    }
+    let names = enumerate_names(root, STATE_ROOT_ENUMERATION_LIMITS)?;
+    let allowed = BTreeSet::from(["latest".to_owned(), "objects".to_owned()]);
+    if !names.is_subset(&allowed) {
+        return Err(rejected());
+    }
+    for name in &names {
+        validate_state_child(root, name)?;
+    }
+    if root_metadata.nlink() != 2 + names.len() as u64 {
+        return Err(rejected());
+    }
+    Ok(names)
+}
+
+fn state_from_root(
+    parent: fs::File,
+    root_name: String,
+    root: fs::File,
+    limits: PersistentStateLimits,
+) -> Result<StateCapabilities, PublishError> {
     let root_metadata = root.metadata().map_err(|_| rejected())?;
     if !secure_directory(&root_metadata) || root_metadata.nlink() != 4 {
         return Err(rejected());
     }
-    if enumerate_names(&root)? != BTreeSet::from(["latest".to_owned(), "objects".to_owned()]) {
+    if enumerate_names(&root, STATE_ROOT_ENUMERATION_LIMITS)?
+        != BTreeSet::from(["latest".to_owned(), "objects".to_owned()])
+    {
         return Err(rejected());
     }
     let objects = open_directory_at(&root, "objects")?;
@@ -1480,24 +1872,33 @@ fn state_from_root(root: fs::File) -> Result<StateCapabilities, PublishError> {
         return Err(rejected());
     }
     Ok(StateCapabilities {
+        parent,
+        root_name,
         root_identity: FileIdentity::from_metadata(&root_metadata),
         objects_identity: FileIdentity::from_metadata(&objects_metadata),
         latest_identity: FileIdentity::from_metadata(&latest_metadata),
         root,
         objects,
         latest,
+        limits,
     })
 }
 
 fn ensure_state_child(root: &fs::File, name: &str) -> Result<(), PublishError> {
     if !name_exists(root, name)? {
-        let name = CString::new(name).expect("fixed state directory");
-        // SAFETY: retained parent and fixed component are valid.
-        if unsafe { libc::mkdirat(root.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+        let component = CString::new(name).expect("fixed state directory");
+        // SAFETY: retained parent and fixed component are valid. EEXIST is revalidated below.
+        if unsafe { libc::mkdirat(root.as_raw_fd(), component.as_ptr(), 0o700) } != 0
+            && std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST)
+        {
             return Err(rejected());
         }
         root.sync_all().map_err(|_| rejected())?;
     }
+    validate_state_child(root, name)
+}
+
+fn validate_state_child(root: &fs::File, name: &str) -> Result<(), PublishError> {
     let child = open_directory_at(root, name)?;
     let metadata = child.metadata().map_err(|_| rejected())?;
     if !secure_directory(&metadata) || metadata.nlink() != 2 {
@@ -1616,7 +2017,25 @@ struct OpenHow {
     resolve: u64,
 }
 
-fn enumerate_names(directory: &fs::File) -> Result<BTreeSet<String>, PublishError> {
+fn enumerate_names(
+    directory: &fs::File,
+    limits: EnumerationLimits,
+) -> Result<BTreeSet<String>, PublishError> {
+    let mut names = BTreeSet::new();
+    stream_names_bounded(directory, limits, |name| {
+        if !names.insert(name.to_owned()) {
+            return Err(rejected());
+        }
+        Ok(())
+    })?;
+    Ok(names)
+}
+
+fn stream_names_bounded(
+    directory: &fs::File,
+    limits: EnumerationLimits,
+    mut visit: impl FnMut(&str) -> Result<(), PublishError>,
+) -> Result<(), PublishError> {
     // SAFETY: fcntl duplicates the retained descriptor.
     let duplicate = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
     if duplicate < 0 {
@@ -1632,7 +2051,9 @@ fn enumerate_names(directory: &fs::File) -> Result<BTreeSet<String>, PublishErro
     // SAFETY: stream is valid and thread-confined.
     unsafe { libc::rewinddir(stream) };
     let result = (|| {
-        let mut names = BTreeSet::new();
+        let mut entries = 0_u64;
+        let mut cumulative_name_bytes = 0_u64;
+        let mut work = 0_u64;
         loop {
             // SAFETY: errno is thread-local on Linux.
             unsafe { *libc::__errno_location() = 0 };
@@ -1645,23 +2066,43 @@ fn enumerate_names(directory: &fs::File) -> Result<BTreeSet<String>, PublishErro
                 }
                 break;
             }
+            work = bounded_add(work, 1, limits.maximum_work)?;
             // SAFETY: d_name is NUL terminated.
             let bytes = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
             if matches!(bytes, b"." | b"..") {
                 continue;
             }
-            let name = std::str::from_utf8(bytes).map_err(|_| rejected())?;
-            if !safe_component(name) || !names.insert(name.to_owned()) {
+            entries = bounded_add(entries, 1, limits.maximum_entries)?;
+            let name_bytes = u64::try_from(bytes.len()).map_err(|_| rejected())?;
+            if name_bytes > limits.maximum_name_bytes {
                 return Err(rejected());
             }
+            cumulative_name_bytes = bounded_add(
+                cumulative_name_bytes,
+                name_bytes,
+                limits.maximum_cumulative_name_bytes,
+            )?;
+            let name = std::str::from_utf8(bytes).map_err(|_| rejected())?;
+            if !safe_component(name) {
+                return Err(rejected());
+            }
+            visit(name)?;
         }
-        Ok(names)
+        Ok(())
     })();
     // SAFETY: closes the stream and duplicate descriptor.
     if unsafe { libc::closedir(stream) } != 0 {
         return Err(rejected());
     }
     result
+}
+
+fn bounded_add(current: u64, amount: u64, maximum: u64) -> Result<u64, PublishError> {
+    let next = current.checked_add(amount).ok_or_else(rejected)?;
+    if next > maximum {
+        return Err(rejected());
+    }
+    Ok(next)
 }
 
 fn verify_retained(parent: &fs::File, retained: &RetainedFile) -> Result<(), PublishError> {
@@ -1950,4 +2391,16 @@ fn sha256(bytes: &[u8]) -> String {
 
 fn encode_hex(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[cfg(test)]
+mod persistent_arithmetic_tests {
+    use super::{bounded_add, rejected};
+
+    #[test]
+    fn persistent_budget_checked_arithmetic_rejects_overflow_and_limit_crossing() {
+        assert_eq!(bounded_add(u64::MAX, 1, u64::MAX), Err(rejected()));
+        assert_eq!(bounded_add(2, 1, 2), Err(rejected()));
+        assert_eq!(bounded_add(1, 1, 2), Ok(2));
+    }
 }

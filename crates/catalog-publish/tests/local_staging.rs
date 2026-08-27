@@ -1,14 +1,16 @@
 #![cfg(unix)]
 
-use std::{fs, os::unix::fs::PermissionsExt};
+use std::{collections::BTreeMap, fs, os::unix::fs::PermissionsExt, sync::mpsc, thread};
 
 #[allow(dead_code)]
 #[path = "../src/local.rs"]
 mod local;
 mod support;
 
-use local::{FailureOutcome, FaultPoint, PublishOutcome};
-use support::{TempTree, fixture_transfer, set_mode};
+use local::{
+    FailureOutcome, FaultPoint, PublishOutcome, StateCheckpoint, TestPersistentStateLimits,
+};
+use support::{TempTree, fixture_transfer, private_directory, set_mode};
 
 #[test]
 fn reverse_transfer_and_both_signatures_are_verified_before_state_mutation() {
@@ -270,4 +272,280 @@ fn transferred_links_writable_content_and_identity_substitution_are_rejected() {
     fs::rename(&original, &moved).unwrap();
     symlink(&moved, &original).unwrap();
     assert!(local::verify_transferred_fixture_signed_bundle(&transfer).is_err());
+}
+
+#[test]
+fn preexisting_partial_state_is_validated_before_missing_children_are_created() {
+    for existing_child in [None, Some("objects"), Some("latest")] {
+        let label = existing_child.unwrap_or("empty");
+        let temp = TempTree::new(&format!("partial-state-{label}"));
+        let transfer = temp.path("transfer");
+        let state = temp.path("state");
+        fixture_transfer(&transfer, 42, label.as_bytes());
+        private_directory(&state);
+        if let Some(child) = existing_child {
+            private_directory(&state.join(child));
+        }
+        let verified = local::verify_transferred_fixture_signed_bundle(&transfer).unwrap();
+
+        assert_eq!(
+            local::stage_local(&verified, &state).unwrap(),
+            PublishOutcome::Staged,
+            "{label}"
+        );
+        assert!(state.join("objects").is_dir(), "{label}");
+        assert!(state.join("latest").is_dir(), "{label}");
+    }
+}
+
+#[test]
+fn unknown_or_unsafe_preexisting_state_is_rejected_without_mutation_or_cleanup() {
+    let temp = TempTree::new("unknown-preexisting-state");
+    let transfer = temp.path("transfer");
+    let state = temp.path("state");
+    fixture_transfer(&transfer, 42, b"unknown");
+    private_directory(&state);
+    let sentinel = state.join("sentinel");
+    fs::write(&sentinel, b"preserve exactly").unwrap();
+    set_mode(&sentinel, 0o600);
+    let verified = local::verify_transferred_fixture_signed_bundle(&transfer).unwrap();
+
+    assert!(local::stage_local(&verified, &state).is_err());
+    assert_eq!(fs::read(&sentinel).unwrap(), b"preserve exactly");
+    assert_eq!(
+        fs::read_dir(&state)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["sentinel"]
+    );
+
+    for unsafe_kind in ["linked", "mode"] {
+        let state = temp.path(&format!("unsafe-{unsafe_kind}"));
+        private_directory(&state);
+        if unsafe_kind == "linked" {
+            std::os::unix::fs::symlink(
+                temp.path("unknown-preexisting-state"),
+                state.join("objects"),
+            )
+            .unwrap();
+        } else {
+            private_directory(&state.join("objects"));
+            set_mode(&state.join("objects"), 0o755);
+        }
+        assert!(
+            local::stage_local(&verified, &state).is_err(),
+            "{unsafe_kind}"
+        );
+        assert!(
+            fs::symlink_metadata(state.join("objects")).is_ok(),
+            "{unsafe_kind}"
+        );
+        assert!(!state.join("latest").exists(), "{unsafe_kind}");
+    }
+}
+
+#[test]
+fn concurrently_appearing_fixed_child_is_validated_without_cleanup() {
+    for safe in [true, false] {
+        let temp = TempTree::new(if safe {
+            "concurrent-safe-child"
+        } else {
+            "concurrent-unsafe-child"
+        });
+        let transfer = temp.path("transfer");
+        let state = temp.path("state");
+        fixture_transfer(&transfer, 42, b"concurrent-child");
+        private_directory(&state);
+        let verified = local::verify_transferred_fixture_signed_bundle(&transfer).unwrap();
+        let worker_state = state.clone();
+        let (reached_tx, reached_rx) = mpsc::sync_channel(0);
+        let (resume_tx, resume_rx) = mpsc::sync_channel(0);
+        let worker = thread::spawn(move || {
+            local::stage_local_with_checkpoint(
+                &verified,
+                &worker_state,
+                StateCheckpoint::BeforeChildCreation,
+                reached_tx,
+                resume_rx,
+            )
+        });
+
+        reached_rx.recv().unwrap();
+        if safe {
+            private_directory(&state.join("objects"));
+        } else {
+            std::os::unix::fs::symlink(temp.path("state"), state.join("objects")).unwrap();
+        }
+        resume_tx.send(()).unwrap();
+        let result = worker.join().unwrap();
+        if safe {
+            assert_eq!(result.unwrap(), PublishOutcome::Staged);
+        } else {
+            assert!(result.is_err());
+            assert!(
+                fs::symlink_metadata(state.join("objects"))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert!(!state.join("latest").exists());
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SwappedStateComponent {
+    Root,
+    Objects,
+    Latest,
+}
+
+fn replace_canonical_state(
+    temp: &TempTree,
+    state: &std::path::Path,
+    component: SwappedStateComponent,
+) {
+    match component {
+        SwappedStateComponent::Root => {
+            fs::rename(state, temp.path("detached-state")).unwrap();
+            private_directory(state);
+            private_directory(&state.join("objects"));
+            private_directory(&state.join("latest"));
+        }
+        SwappedStateComponent::Objects => {
+            fs::rename(state.join("objects"), temp.path("detached-objects")).unwrap();
+            private_directory(&state.join("objects"));
+        }
+        SwappedStateComponent::Latest => {
+            fs::rename(state.join("latest"), temp.path("detached-latest")).unwrap();
+            private_directory(&state.join("latest"));
+        }
+    }
+}
+
+#[test]
+fn canonical_state_swaps_never_claim_staged_success() {
+    for checkpoint in [
+        StateCheckpoint::AfterOpen,
+        StateCheckpoint::BeforeMutation,
+        StateCheckpoint::BeforeSuccess,
+    ] {
+        for component in [
+            SwappedStateComponent::Root,
+            SwappedStateComponent::Objects,
+            SwappedStateComponent::Latest,
+        ] {
+            let temp = TempTree::new(&format!("stage-swap-{checkpoint:?}-{component:?}"));
+            let baseline_transfer = temp.path("baseline-transfer");
+            let candidate_transfer = temp.path("candidate-transfer");
+            let state = temp.path("state");
+            fixture_transfer(&baseline_transfer, 42, b"baseline");
+            fixture_transfer(&candidate_transfer, 43, b"candidate");
+            let baseline =
+                local::verify_transferred_fixture_signed_bundle(&baseline_transfer).unwrap();
+            local::stage_local(&baseline, &state).unwrap();
+            let candidate =
+                local::verify_transferred_fixture_signed_bundle(&candidate_transfer).unwrap();
+            let worker_state = state.clone();
+            let (reached_tx, reached_rx) = mpsc::sync_channel(0);
+            let (resume_tx, resume_rx) = mpsc::sync_channel(0);
+            let worker = thread::spawn(move || {
+                local::stage_local_with_checkpoint(
+                    &candidate,
+                    &worker_state,
+                    checkpoint,
+                    reached_tx,
+                    resume_rx,
+                )
+            });
+
+            reached_rx.recv().unwrap();
+            replace_canonical_state(&temp, &state, component);
+            let replacement_objects = persistent_object_snapshot(&state);
+            let replacement_latest = state_file_snapshot(&state.join("latest"));
+            resume_tx.send(()).unwrap();
+            assert!(
+                worker.join().unwrap().is_err(),
+                "{checkpoint:?} {component:?}"
+            );
+            assert_eq!(
+                persistent_object_snapshot(&state),
+                replacement_objects,
+                "canonical replacement objects changed at {checkpoint:?} {component:?}"
+            );
+            assert_eq!(
+                state_file_snapshot(&state.join("latest")),
+                replacement_latest,
+                "canonical replacement latest changed at {checkpoint:?} {component:?}"
+            );
+        }
+    }
+}
+
+fn state_file_snapshot(directory: &std::path::Path) -> BTreeMap<String, (Vec<u8>, u32)> {
+    fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_str().unwrap().to_owned();
+            let bytes = fs::read(&path).unwrap();
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+            (name, (bytes, mode))
+        })
+        .collect()
+}
+
+fn persistent_object_snapshot(state: &std::path::Path) -> BTreeMap<String, (Vec<u8>, u32)> {
+    fs::read_dir(state.join("objects"))
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_str().unwrap().to_owned();
+            let bytes = fs::read(&path).unwrap();
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+            (name, (bytes, mode))
+        })
+        .collect()
+}
+
+#[test]
+fn persistent_state_count_bytes_names_and_enumeration_work_are_bounded() {
+    let temp = TempTree::new("persistent-bounds");
+    let transfer = temp.path("transfer");
+    let state = temp.path("state");
+    fixture_transfer(&transfer, 42, b"bounded-state");
+    let verified = local::verify_transferred_fixture_signed_bundle(&transfer).unwrap();
+    local::stage_local(&verified, &state).unwrap();
+    let baseline = persistent_object_snapshot(&state);
+    let total_bytes = baseline
+        .values()
+        .map(|(bytes, _)| bytes.len() as u64)
+        .sum::<u64>();
+
+    for limits in [
+        TestPersistentStateLimits {
+            maximum_object_count: baseline.len() as u64 - 1,
+            ..TestPersistentStateLimits::default()
+        },
+        TestPersistentStateLimits {
+            maximum_cumulative_bytes: total_bytes - 1,
+            ..TestPersistentStateLimits::default()
+        },
+        TestPersistentStateLimits {
+            maximum_enumeration_work: baseline.len() as u64 + 1,
+            ..TestPersistentStateLimits::default()
+        },
+    ] {
+        assert!(local::stage_local_with_persistent_limits(&verified, &state, limits).is_err());
+        assert_eq!(persistent_object_snapshot(&state), baseline);
+    }
+
+    let oversized_name = "a".repeat(65);
+    let oversized_path = state.join("objects").join(&oversized_name);
+    fs::write(&oversized_path, b"preserved oversized name").unwrap();
+    set_mode(&oversized_path, 0o400);
+    let with_oversized_name = persistent_object_snapshot(&state);
+    assert!(local::stage_local(&verified, &state).is_err());
+    assert_eq!(persistent_object_snapshot(&state), with_oversized_name);
 }
