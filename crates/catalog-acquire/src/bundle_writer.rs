@@ -67,6 +67,61 @@ impl PublicBundleObject {
         verify_object_descriptor(&mut object.file, object.size, &object.sha256)?;
         Ok(object)
     }
+
+    /// Retains one exact support file extracted by the authenticated root-archive parser.
+    pub(crate) fn from_extracted_bytes(
+        cache_root: &Path,
+        source_url: String,
+        size: u64,
+        sha256: String,
+        bytes: &[u8],
+    ) -> Result<Self, AcquireError> {
+        if bytes.len() as u64 != size || sha256_bytes(bytes) != sha256 {
+            return Err(AcquireError::Bundle);
+        }
+        let root_name =
+            CString::new(cache_root.as_os_str().as_bytes()).map_err(|_| AcquireError::Bundle)?;
+        let root = openat2_raw(
+            libc::AT_FDCWD,
+            &root_name,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            0,
+            // RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS.
+            0x02 | 0x04,
+        )
+        .map_err(|_| AcquireError::Bundle)?;
+        if !secure_directory(&root.metadata().map_err(|_| AcquireError::Bundle)?) {
+            return Err(AcquireError::Bundle);
+        }
+        let name = format!("extracted-{sha256}");
+        let mut file = open_component(
+            &root,
+            &name,
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
+            0o600,
+        )
+        .map_err(|_| AcquireError::Bundle)?;
+        let identity =
+            FileIdentity::from_metadata(&file.metadata().map_err(|_| AcquireError::Bundle)?);
+        file.write_all(bytes).map_err(|_| AcquireError::Bundle)?;
+        file.flush().map_err(|_| AcquireError::Bundle)?;
+        file.set_permissions(fs::Permissions::from_mode(0o400))
+            .map_err(|_| AcquireError::Bundle)?;
+        file.sync_all().map_err(|_| AcquireError::Bundle)?;
+        root.sync_all().map_err(|_| AcquireError::Bundle)?;
+        let reopened = open_component(&root, &name, libc::O_RDONLY | libc::O_CLOEXEC, 0)
+            .map_err(|_| AcquireError::Bundle)?;
+        if FileIdentity::from_metadata(&reopened.metadata().map_err(|_| AcquireError::Bundle)?)
+            != identity
+        {
+            return Err(AcquireError::Bundle);
+        }
+        Self::verified_file(reopened, source_url, size, sha256)
+    }
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 pub struct BundleRecord {
@@ -1634,6 +1689,52 @@ mod tests {
         VerifiedBundleWriteRequest, export_transfer_bundle_after_preflight_for_test,
         write_verified_bundle, write_verified_bundle_after_preflight_for_test,
     };
+
+    #[test]
+    fn extracted_support_object_is_exact_read_only_and_descriptor_retained() {
+        let root = TempDirectory::new();
+        let bytes = b"authenticated root member";
+        let digest = super::sha256(bytes);
+        let mut object = PublicBundleObject::from_extracted_bytes(
+            &root.path,
+            "https://github.com/Devalch/Fluxsemble-runtime-catalog/releases/download/catalog-v1-sequence-1/support.json".to_owned(),
+            bytes.len() as u64,
+            digest.clone(),
+            bytes,
+        )
+        .unwrap();
+        assert_eq!(object.size, bytes.len() as u64);
+        assert_eq!(object.sha256, digest);
+        assert_eq!(
+            object.file.metadata().unwrap().permissions().mode() & 0o7777,
+            0o400
+        );
+        let mut actual = Vec::new();
+        object.file.seek(SeekFrom::Start(0)).unwrap();
+        std::io::Read::read_to_end(&mut object.file, &mut actual).unwrap();
+        assert_eq!(actual, bytes);
+
+        assert!(
+            PublicBundleObject::from_extracted_bytes(
+                &root.path,
+                "https://github.com/support-size.json".to_owned(),
+                bytes.len() as u64 + 1,
+                super::sha256(bytes),
+                bytes,
+            )
+            .is_err()
+        );
+        assert!(
+            PublicBundleObject::from_extracted_bytes(
+                &root.path,
+                "https://github.com/support-digest.json".to_owned(),
+                bytes.len() as u64,
+                "0".repeat(64),
+                bytes,
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn output_parent_must_be_exact_owner_private_and_symlink_free() {

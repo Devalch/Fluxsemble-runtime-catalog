@@ -54,6 +54,19 @@ pub struct DiscoverInputsRequest {
     pub cancellation: AcquisitionCancellation,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SupportAcquisition {
+    ExtractFromVerifiedRoot,
+    FetchPublishedObjects,
+}
+
+const fn support_acquisition(source_kind: InputSourceKind) -> SupportAcquisition {
+    match source_kind {
+        InputSourceKind::ReleaseIntent => SupportAcquisition::ExtractFromVerifiedRoot,
+        InputSourceKind::CatalogSource => SupportAcquisition::FetchPublishedObjects,
+    }
+}
+
 pub async fn discover_inputs(
     request: DiscoverInputsRequest,
 ) -> Result<PackageInputManifestV1, AcquireError> {
@@ -145,20 +158,25 @@ pub async fn acquire_release(
         &request.cancellation,
     )
     .await?;
-    let manifest_fetched = fetch_immutable(
-        &request.cache_root,
-        metadata.root_package_manifest(),
-        &intent,
-        &request.cancellation,
-    )
-    .await?;
-    let shrinkwrap_fetched = fetch_immutable(
-        &request.cache_root,
-        metadata.shipped_shrinkwrap().artifact(),
-        &intent,
-        &request.cancellation,
-    )
-    .await?;
+    let support_fetched = match support_acquisition(source_kind) {
+        SupportAcquisition::ExtractFromVerifiedRoot => None,
+        SupportAcquisition::FetchPublishedObjects => Some((
+            fetch_immutable(
+                &request.cache_root,
+                metadata.root_package_manifest(),
+                &intent,
+                &request.cancellation,
+            )
+            .await?,
+            fetch_immutable(
+                &request.cache_root,
+                metadata.shipped_shrinkwrap().artifact(),
+                &intent,
+                &request.cancellation,
+            )
+            .await?,
+        )),
+    };
 
     let mut locked = Vec::with_capacity(metadata.shipped_shrinkwrap().locked_packages().len());
     for record in metadata.shipped_shrinkwrap().locked_packages() {
@@ -204,36 +222,47 @@ pub async fn acquire_release(
         &request.cancellation,
     )
     .await?;
-    let manifest_object = verify_public_object(
-        manifest_fetched,
-        metadata.root_package_manifest().url().as_str().to_owned(),
-        metadata.root_package_manifest().size_bytes().get(),
-        metadata
-            .root_package_manifest()
-            .sha256()
-            .as_str()
-            .to_owned(),
-        &request.cancellation,
-    )
-    .await?;
-    let shrinkwrap_object = verify_public_object(
-        shrinkwrap_fetched,
-        metadata
-            .shipped_shrinkwrap()
-            .artifact()
-            .url()
-            .as_str()
-            .to_owned(),
-        metadata.shipped_shrinkwrap().artifact().size_bytes().get(),
-        metadata
-            .shipped_shrinkwrap()
-            .artifact()
-            .sha256()
-            .as_str()
-            .to_owned(),
-        &request.cancellation,
-    )
-    .await?;
+    let manifest_url = metadata.root_package_manifest().url().as_str().to_owned();
+    let manifest_size = metadata.root_package_manifest().size_bytes().get();
+    let manifest_sha256 = metadata
+        .root_package_manifest()
+        .sha256()
+        .as_str()
+        .to_owned();
+    let shrinkwrap_url = metadata
+        .shipped_shrinkwrap()
+        .artifact()
+        .url()
+        .as_str()
+        .to_owned();
+    let shrinkwrap_size = metadata.shipped_shrinkwrap().artifact().size_bytes().get();
+    let shrinkwrap_sha256 = metadata
+        .shipped_shrinkwrap()
+        .artifact()
+        .sha256()
+        .as_str()
+        .to_owned();
+    let published_support_objects = match support_fetched {
+        Some((manifest_fetched, shrinkwrap_fetched)) => Some((
+            verify_public_object(
+                manifest_fetched,
+                manifest_url.clone(),
+                manifest_size,
+                manifest_sha256.clone(),
+                &request.cancellation,
+            )
+            .await?,
+            verify_public_object(
+                shrinkwrap_fetched,
+                shrinkwrap_url.clone(),
+                shrinkwrap_size,
+                shrinkwrap_sha256.clone(),
+                &request.cancellation,
+            )
+            .await?,
+        )),
+        None => None,
+    };
 
     records.push(BundleRecord {
         role: "package_inputs".to_owned(),
@@ -241,6 +270,7 @@ pub async fn acquire_release(
     });
     let package_inputs = request.package_inputs;
     let output = request.output;
+    let cache_root = request.cache_root;
     run_publication_blocking(&request.cancellation, move |control| {
         let graph = verify_npm_graph(NpmGraphRequest {
             intent,
@@ -250,11 +280,28 @@ pub async fn acquire_release(
             package_inputs,
         })?;
         let (_, node, root, locked, _, root_manifest, shrinkwrap) = graph.into_parts();
-        if sha256(&root_manifest) != manifest_object_digest(&manifest_object)
-            || sha256(&shrinkwrap) != manifest_object_digest(&shrinkwrap_object)
-        {
+        if sha256(&root_manifest) != manifest_sha256 || sha256(&shrinkwrap) != shrinkwrap_sha256 {
             return Err(AcquireError::Graph);
         }
+        let (manifest_object, shrinkwrap_object) = match published_support_objects {
+            Some(objects) => objects,
+            None => (
+                PublicBundleObject::from_extracted_bytes(
+                    &cache_root,
+                    manifest_url,
+                    manifest_size,
+                    manifest_sha256,
+                    &root_manifest,
+                )?,
+                PublicBundleObject::from_extracted_bytes(
+                    &cache_root,
+                    shrinkwrap_url,
+                    shrinkwrap_size,
+                    shrinkwrap_sha256,
+                    &shrinkwrap,
+                )?,
+            ),
+        };
         let mut objects = vec![
             PublicBundleObject::from_archive(node),
             PublicBundleObject::from_archive(root),
@@ -759,10 +806,6 @@ fn intent_semantic_digest(intent: &InitialPiReleaseIntentV1) -> Result<String, A
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn manifest_object_digest(object: &PublicBundleObject) -> String {
-    object.sha256().to_owned()
-}
-
 fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -794,8 +837,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        AcquireError, AcquisitionCancellation, PackageInputManifestV1, run_publication_blocking,
-        write_discovery,
+        AcquireError, AcquisitionCancellation, PackageInputManifestV1, SupportAcquisition,
+        run_publication_blocking, support_acquisition, write_discovery,
     };
 
     const PRUNED: [(&str, &[&str]); 9] = [
@@ -836,6 +879,18 @@ mod tests {
             &["declaration.os", "lock.os"],
         ),
     ];
+
+    #[test]
+    fn intent_extracts_support_without_network_while_final_source_fetches_it() {
+        assert_eq!(
+            support_acquisition(catalog_core::InputSourceKind::ReleaseIntent),
+            SupportAcquisition::ExtractFromVerifiedRoot,
+        );
+        assert_eq!(
+            support_acquisition(catalog_core::InputSourceKind::CatalogSource),
+            SupportAcquisition::FetchPublishedObjects,
+        );
+    }
 
     #[test]
     fn discovery_publishes_one_verified_read_only_file_atomically() {

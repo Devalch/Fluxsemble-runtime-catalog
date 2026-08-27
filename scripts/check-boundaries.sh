@@ -2553,3 +2553,185 @@ for source, label, old, new in semantic_mutations:
         print(f"Task 10 scanner accepted semantic bypass: {label}", file=sys.stderr)
         sys.exit(1)
 PY
+
+python3 - <<'PY'
+from pathlib import Path
+import copy
+import hashlib
+import json
+import subprocess
+import sys
+
+paths = {
+    "ignore": Path(".gitignore"),
+    "intent": Path("catalogs/intents/catalog-v1-sequence-1-intent.json"),
+    "inputs": Path("catalogs/inputs/pi-0.83.0-linux-x86_64-packages-v1.json"),
+    "payload": Path("conformance/catalog-v1/initial-exact-candidate-payload.json"),
+    "envelope": Path("conformance/catalog-v1/initial-exact-candidate-envelope.json"),
+    "manifest": Path("conformance/catalog-v1/manifest-v1.json"),
+    "docs": Path("docs/first-release.md"),
+    "acquire": Path("crates/catalog-acquire/src/lib.rs"),
+    "writer": Path("crates/catalog-acquire/src/bundle_writer.rs"),
+    "vector_test": Path("crates/catalog-core/tests/initial_exact_candidate.rs"),
+}
+current = {name: path.read_bytes() for name, path in paths.items()}
+tracked = subprocess.check_output(
+    ["git", "ls-files", "--cached", "--others", "--exclude-standard"], text=True
+).splitlines()
+
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def unique(data):
+    def pairs(items):
+        value = {}
+        for key, child in items:
+            if key in value:
+                raise ValueError("duplicate")
+            value[key] = child
+        return value
+    return json.loads(data, object_pairs_hook=pairs)
+
+
+def task11_errors(source, names):
+    errors = []
+    forbidden_paths = [
+        name for name in names
+        if name == "catalog-v1.json"
+        or name.startswith("signed-release-bundle/")
+        or name.startswith(".release-work/")
+        or name.endswith((".tgz", ".tar.xz", ".private.pem"))
+        or "/packages/archives/" in name
+        or "pi-0.83.0/" in name
+    ]
+    if forbidden_paths:
+        errors.append("tracked release output, archive, corpus, or private key")
+    required = [str(path) for path in paths.values()]
+    if any(name not in names for name in required):
+        errors.append("Task 11 required path missing")
+    for name in ("intent", "inputs", "payload", "envelope", "manifest"):
+        try:
+            value = unique(source[name])
+            if canonical(value) != source[name]:
+                errors.append(f"{name} is not strict canonical JSON")
+        except Exception:
+            errors.append(f"{name} JSON rejected")
+            value = None
+        source[f"_{name}_value"] = value
+    intent = source.get("_intent_value")
+    inputs = source.get("_inputs_value")
+    payload = source.get("_payload_value")
+    envelope = source.get("_envelope_value")
+    manifest = source.get("_manifest_value")
+    if not isinstance(intent, dict) or set(intent) != {"sequence", "tag", "generated_at", "expires_at", "fluxsemble_requirement", "release"}:
+        errors.append("intent authority fields changed")
+    elif (intent["sequence"], intent["tag"], intent["generated_at"], intent["expires_at"], intent["fluxsemble_requirement"]) != (
+        "1", "catalog-v1-sequence-1", "2026-08-26T00:00:00Z", "2026-09-26T00:00:00Z", "=0.1.0"
+    ):
+        errors.append("initial sequence/freshness/requirement changed")
+    elif intent["release"].get("provider") != "builtin:pi" or intent["release"].get("allowed_origins") != ["https://github.com", "https://nodejs.org", "https://registry.npmjs.org"]:
+        errors.append("initial provider/origins changed")
+    else:
+        release = intent["release"].get("release", {})
+        if release.get("version") != "0.83.0" or release.get("target") != "linux_x86_64":
+            errors.append("initial Pi target changed")
+        components = release.get("components", [])
+        if [item.get("component_id") for item in components] != ["component:node", "component:pi"] or [item.get("version") for item in components] != ["22.19.0", "0.83.0"]:
+            errors.append("initial component tuple changed")
+        extension = release.get("provider_extension", {}).get("metadata", {})
+        locked = extension.get("shipped_shrinkwrap", {}).get("locked_packages", [])
+        if len(locked) != 139 or [item.get("locator") for item in locked] != sorted(item.get("locator") for item in locked):
+            errors.append("intent locked closure count/order changed")
+    if not isinstance(inputs, dict) or len(inputs.get("locked_packages", [])) != 139:
+        errors.append("package-input count changed")
+    else:
+        locked = inputs["locked_packages"]
+        if [item.get("locator") for item in locked] != sorted(item.get("locator") for item in locked):
+            errors.append("package-input order changed")
+        if any(not item.get("resolved_url", "").startswith("https://registry.npmjs.org/") for item in locked):
+            errors.append("package-input origin changed")
+        if inputs.get("pre_prune_package_count") != 131 or inputs.get("applicable_package_count") != 130:
+            errors.append("package applicability counts changed")
+    if len(source["inputs"]) != 78346 or digest(source["inputs"]) != "d511e45be4fc28ec20c62c2450b61ab61e61fbbd12024a1e95698ab0b702a02d":
+        errors.append("package-input digest changed")
+    if len(source["intent"]) != 55798 or digest(source["intent"]) != "9d9d6023b95f1908edd51f7d08c04c85dc64e35a8c08866e45a2b2bdcfedd047":
+        errors.append("intent digest changed")
+    if isinstance(intent, dict):
+        projected = {"schema_version": 1, "sequence": intent.get("sequence"), "generated_at": intent.get("generated_at"), "expires_at": intent.get("expires_at"), "compatibility_ranges": [intent.get("fluxsemble_requirement")], "providers": [{"provider_id": intent.get("release", {}).get("provider"), "allowed_origins": intent.get("release", {}).get("allowed_origins"), "releases": [intent.get("release", {}).get("release")]}]}
+        if canonical(projected) != source["payload"]:
+            errors.append("candidate is not the exact intent projection")
+    if len(source["payload"]) != 55797 or digest(source["payload"]) != "7dba62c8b44883cbd7b3615fd9fe3b1a08a3aa2c75c7729704c14804d1cc2a2b":
+        errors.append("candidate frozen digest changed")
+    if not isinstance(envelope, dict) or envelope.get("key_id") != "catalog-test-key-v1" or envelope.get("payload") != payload or len(source["envelope"]) != 55994 or digest(source["envelope"]) != "036191a94f62afe8a7a547790b1c9d4c54a7c277dc76bfae191601dea5738cac":
+        errors.append("fixture envelope relation changed")
+    expected_entries = []
+    for name in ["initial-exact-candidate-envelope.json", "initial-exact-candidate-payload.json", "rejected-fields.json", "valid-envelope.json", "valid-payload.json"]:
+        data = Path("conformance/catalog-v1", name).read_bytes() if not name.startswith("initial-") else source["envelope" if "envelope" in name else "payload"]
+        expected_entries.append({"path": name, "sha256": digest(data), "size": len(data)})
+    if not isinstance(manifest, dict) or manifest.get("fixture_key_id") != "catalog-test-key-v1" or manifest.get("entries") != expected_entries:
+        errors.append("conformance manifest relation changed")
+    acquire = source["acquire"].decode()
+    writer = source["writer"].decode()
+    vector_test = source["vector_test"].decode()
+    for token in ["InputSourceKind::ReleaseIntent => SupportAcquisition::ExtractFromVerifiedRoot", "InputSourceKind::CatalogSource => SupportAcquisition::FetchPublishedObjects", "PublicBundleObject::from_extracted_bytes(", "fetch_immutable("]:
+        if token not in acquire:
+            errors.append(f"bootstrap support policy missing: {token}")
+    for token in ["bytes.len() as u64 != size || sha256_bytes(bytes) != sha256", "libc::O_CREAT | libc::O_EXCL", "0o400", "Self::verified_file(reopened, source_url, size, sha256)"]:
+        if token not in writer:
+            errors.append(f"extracted support descriptor policy missing: {token}")
+    for token in ["verify_fixture_signed_catalog(ENVELOPE)", "55_797", "7dba62c8b44883cbd7b3615fd9fe3b1a08a3aa2c75c7729704c14804d1cc2a2b"]:
+        if token not in vector_test:
+            errors.append(f"fixture/production vector evidence missing: {token}")
+    if vector_test.count("assert!(verify_signed_catalog(ENVELOPE).is_err())") != 2:
+        errors.append("exact production-verifier vector rejection evidence changed")
+    docs = source["docs"].decode()
+    for token in ["5e36894da626292cdacdaaae650d1af5d2f12873f950f925487b1b5467c22ad4", "902d26005b161dc18b0247d9eca100e73b9fded21cd4e11f7d7c4de710b5dcbf", "No production key, credential, SSH state, remote mutation"]:
+        if token not in docs:
+            errors.append(f"first-release evidence missing: {token}")
+    if ".release-work/" not in source["ignore"].decode().splitlines():
+        errors.append("release work is not ignored")
+    for name in ("intent", "inputs", "docs", "payload", "envelope"):
+        text = source[name].decode(errors="ignore")
+        if any(token in text for token in ["/home/", ".worktrees/", "file://"]):
+            errors.append(f"private/external checkout path in {name}")
+    return errors
+
+
+errors = task11_errors(dict(current), list(tracked))
+if errors:
+    print(errors[0], file=sys.stderr)
+    sys.exit(1)
+
+mutations = []
+def json_mutation(name, change):
+    changed = dict(current); value = unique(changed[name]); change(value); changed[name] = canonical(value); mutations.append(changed)
+json_mutation("intent", lambda value: value.update(sequence="2"))
+json_mutation("intent", lambda value: value.update(build={"forbidden": True}))
+json_mutation("inputs", lambda value: value["locked_packages"].pop())
+json_mutation("inputs", lambda value: value["locked_packages"].reverse())
+json_mutation("inputs", lambda value: value["locked_packages"][0].update(resolved_url="https://example.invalid/archive.tgz"))
+json_mutation("payload", lambda value: value.update(sequence="2"))
+json_mutation("envelope", lambda value: value.update(key_id="runtime-catalog-ed25519-forbidden"))
+json_mutation("manifest", lambda value: value["entries"].pop(0))
+for name, old, new in [
+    ("docs", b"5e36894da626292cdacdaaae650d1af5d2f12873f950f925487b1b5467c22ad4", b"0" * 64),
+    ("ignore", b".release-work/", b"removed-release-work/"),
+    ("acquire", b"InputSourceKind::ReleaseIntent => SupportAcquisition::ExtractFromVerifiedRoot", b"InputSourceKind::ReleaseIntent => SupportAcquisition::FetchPublishedObjects"),
+    ("writer", b"bytes.len() as u64 != size || sha256_bytes(bytes) != sha256", b"false"),
+    ("vector_test", b"assert!(verify_signed_catalog(ENVELOPE).is_err())", b"assert!(true)"),
+]:
+    changed = dict(current); changed[name] = changed[name].replace(old, new, 1); mutations.append(changed)
+for index, changed in enumerate(mutations):
+    if not task11_errors(dict(changed), list(tracked)):
+        print(f"Task 11 boundary mutation {index} was accepted", file=sys.stderr)
+        sys.exit(1)
+if not task11_errors(dict(current), list(tracked) + ["catalog-v1.json"]):
+    print("tracked production catalog mutation was accepted", file=sys.stderr)
+    sys.exit(1)
+PY
