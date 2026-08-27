@@ -3,7 +3,7 @@ use std::{
     error::Error,
     ffi::{CStr, CString, OsStr, OsString},
     fmt, fs,
-    io::{Read, Seek, SeekFrom, Write},
+    io::{ErrorKind, Read, Seek, SeekFrom, Write},
     os::{
         fd::{AsRawFd, FromRawFd},
         unix::{
@@ -13,12 +13,7 @@ use std::{
         },
     },
     path::{Component, Path, PathBuf},
-    process::{Child, Command, Stdio},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    thread,
+    process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio},
     time::{Duration, Instant},
 };
 
@@ -31,6 +26,9 @@ const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 const MAX_RESPONSE_BYTES: usize = 128 * 1024;
 const MAX_CHILD_STDERR_BYTES: usize = 64 * 1024;
 const MAX_EXECUTABLE_BYTES: u64 = 128 * 1024 * 1024;
+#[cfg(test)]
+const MAX_ASSET_BYTES: u64 = 64 * 1024;
+#[cfg(not(test))]
 const MAX_ASSET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_PATH_BYTES: usize = 4_096;
 const MAX_JSON_DEPTH: usize = 16;
@@ -41,7 +39,11 @@ const MAX_RELEASE_ASSETS: usize = 128;
 const CHILD_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(not(test))]
 const CHILD_TIMEOUT: Duration = Duration::from_secs(120);
-const POLL_INTERVAL: Duration = Duration::from_millis(5);
+const POLL_INTERVAL: Duration = Duration::from_millis(10);
+const IO_CHUNK_BYTES: usize = 8 * 1024;
+const ELF_HEADER_BYTES: usize = 64;
+const ELF_PROGRAM_HEADER_BYTES: u64 = 56;
+const MAX_ELF_PROGRAM_HEADERS: u16 = 1_024;
 const FAILURE_LINE: &[u8] = b"github broker failed\n";
 
 /// Strict configuration for the broker's executable and credential-directory capabilities.
@@ -87,6 +89,7 @@ pub enum BrokerRequestV1 {
         schema_version: u16,
         repository: String,
         release_id: String,
+        tag: String,
         name: String,
         input_path: String,
     },
@@ -176,12 +179,14 @@ impl BrokerRequestV1 {
                 schema_version,
                 repository,
                 release_id,
+                tag,
                 name,
                 input_path,
             } => {
                 valid_schema(*schema_version)?;
                 valid_repository(repository)?;
                 valid_decimal_id(release_id)?;
+                valid_tag(tag)?;
                 valid_asset_name(name)?;
                 valid_path_text(input_path)
             }
@@ -237,6 +242,12 @@ pub struct BrokerTransferredAssetV1 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum BrokerAssetUploadStatusV1 {
+    AssetUploaded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BrokerPublicationStatusV1 {
     Published,
 }
@@ -259,6 +270,13 @@ pub enum BrokerResponseV1 {
         draft: bool,
         prerelease: bool,
         assets: Vec<BrokerReleaseAssetV1>,
+    },
+    AssetUploaded {
+        schema_version: u16,
+        status: BrokerAssetUploadStatusV1,
+        name: String,
+        size: u64,
+        sha256: String,
     },
     Asset {
         schema_version: u16,
@@ -310,6 +328,20 @@ impl BrokerResponseV1 {
                 valid_tag(tag)?;
                 valid_sha1(target_commitish)?;
                 valid_release_assets(assets)
+            }
+            Self::AssetUploaded {
+                schema_version,
+                status: BrokerAssetUploadStatusV1::AssetUploaded,
+                name,
+                size,
+                sha256,
+            } => {
+                valid_schema(*schema_version)?;
+                valid_asset_name(name)?;
+                if *size == 0 || *size > MAX_ASSET_BYTES {
+                    return Err(rejected());
+                }
+                valid_sha256(sha256)
             }
             Self::Asset {
                 schema_version,
@@ -390,7 +422,6 @@ struct VerifiedExecutable {
     file: fs::File,
     identity: Identity,
     sha256: String,
-    script: bool,
 }
 
 struct VerifiedDirectory {
@@ -409,12 +440,50 @@ struct VerifiedBrokerConfig {
     config_directory: VerifiedDirectory,
 }
 
-struct UploadCapability {
+struct VerifiedUploadSource {
     file: fs::File,
     path: PathBuf,
     identity: Identity,
     size: u64,
     sha256: String,
+}
+
+struct UploadCapability {
+    directory_path: PathBuf,
+    directory: fs::File,
+    directory_identity: Identity,
+    name: CString,
+    path: PathBuf,
+    file: fs::File,
+    identity: Identity,
+    size: u64,
+    sha256: String,
+}
+
+impl Drop for UploadCapability {
+    fn drop(&mut self) {
+        if let Ok(rebound) = openat_regular(&self.directory, &self.name, libc::O_RDONLY)
+            && rebound
+                .metadata()
+                .ok()
+                .map(|metadata| Identity::from_metadata(&metadata))
+                .is_some_and(|identity| same_file_node(identity, self.identity))
+        {
+            // SAFETY: retained private parent and exact validated component are valid.
+            unsafe {
+                libc::unlinkat(self.directory.as_raw_fd(), self.name.as_ptr(), 0);
+            }
+        }
+        if verify_directory_rebind(
+            &self.directory_path,
+            &self.directory,
+            self.directory_identity,
+        )
+        .is_ok()
+        {
+            let _ = fs::remove_dir(&self.directory_path);
+        }
+    }
 }
 
 struct DownloadCapability {
@@ -455,7 +524,11 @@ impl Drop for DownloadCapability {
 }
 
 impl DownloadCapability {
-    fn finish(&mut self) -> Result<(u64, String), BrokerError> {
+    fn finish(
+        &mut self,
+        streamed_size: u64,
+        streamed_sha256: &str,
+    ) -> Result<(u64, String), BrokerError> {
         let metadata = self.file.metadata().map_err(|_| rejected())?;
         if !secure_download_file(&metadata, self.identity, 0o600)
             || metadata.len() == 0
@@ -485,7 +558,9 @@ impl DownloadCapability {
         verify_directory_rebind(&self.parent_path, &self.parent, self.parent_identity)?;
         let rebound = openat_regular(&self.parent, &self.name, libc::O_RDONLY)?;
         let rebound_metadata = rebound.metadata().map_err(|_| rejected())?;
-        if Identity::from_metadata(&rebound_metadata) != final_identity
+        if final_identity.size != streamed_size
+            || digest != streamed_sha256
+            || Identity::from_metadata(&rebound_metadata) != final_identity
             || hash_descriptor(&rebound, final_identity.size)? != digest
         {
             return Err(rejected());
@@ -523,6 +598,7 @@ impl Drop for FreshHome {
 pub(crate) trait BrokerTestCheckpoints {
     fn after_executable_hash(&mut self) {}
     fn before_spawn(&mut self) {}
+    fn after_final_rebind(&mut self) {}
 }
 
 #[cfg(test)]
@@ -561,10 +637,10 @@ fn execute_impl(
         #[cfg(test)]
         checkpoints,
     )?;
-    let mut upload = match request {
-        BrokerRequestV1::UploadAsset { input_path, .. } => {
-            Some(open_upload(Path::new(input_path))?)
-        }
+    let upload = match request {
+        BrokerRequestV1::UploadAsset {
+            input_path, name, ..
+        } => Some(materialize_upload(Path::new(input_path), name)?),
         _ => None,
     };
     let mut download = match request {
@@ -587,16 +663,14 @@ fn execute_impl(
     if let Some(capability) = &download {
         verify_download_before_spawn(capability)?;
     }
+    #[cfg(test)]
+    checkpoints.after_final_rebind();
 
     let plan = command_plan(request, upload.as_ref())?;
-    let executable_path = if config.executable.script {
-        config.executable.path.as_os_str().to_owned()
-    } else {
-        OsString::from(format!(
-            "/proc/self/fd/{}",
-            config.executable.file.as_raw_fd()
-        ))
-    };
+    let executable_path = OsString::from(format!(
+        "/proc/self/fd/{}",
+        config.executable.file.as_raw_fd()
+    ));
     let mut command = Command::new(executable_path);
     command.args(&plan.arguments);
     command.env_clear();
@@ -608,87 +682,41 @@ fn execute_impl(
     command.env("LANG", "C");
     command.env("LC_ALL", "C");
     command.env("TZ", "UTC");
-    command.stdin(if plan.stdin.is_some() {
-        Stdio::piped()
-    } else {
-        Stdio::null()
-    });
-    if let Some(capability) = &download {
-        command.stdout(Stdio::from(
-            capability.file.try_clone().map_err(|_| rejected())?,
-        ));
-    } else {
-        command.stdout(Stdio::piped());
-    }
+    command.stdin(Stdio::piped());
+    command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
-    // SAFETY: setpgid is async-signal-safe and touches only the child before exec.
+    let executable_descriptor = config.executable.file.as_raw_fd();
+    let config_directory_descriptor = config.config_directory.file.as_raw_fd();
+    // SAFETY: setpgid and fcntl are async-signal-safe and touch only child descriptor state.
     unsafe {
-        command.pre_exec(|| {
+        command.pre_exec(move || {
             if libc::setpgid(0, 0) != 0 {
                 return Err(std::io::Error::last_os_error());
+            }
+            for descriptor in [executable_descriptor, config_directory_descriptor] {
+                let flags = libc::fcntl(descriptor, libc::F_GETFD);
+                if flags < 0
+                    || libc::fcntl(descriptor, libc::F_SETFD, flags & !libc::FD_CLOEXEC) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
             }
             Ok(())
         });
     }
 
-    let _config_directory_inheritance = InheritedFd::new(&config.config_directory.file)?;
-    let _upload_inheritance = upload
-        .as_ref()
-        .map(|capability| InheritedFd::new(&capability.file))
-        .transpose()?;
-    let mut child = command.spawn().map_err(|_| rejected())?;
-
-    if let Some(bytes) = plan.stdin {
-        let mut stdin = child.stdin.take().ok_or_else(rejected)?;
-        stdin.write_all(&bytes).map_err(|_| {
-            terminate_and_reap(&mut child);
-            rejected()
-        })?;
-        drop(stdin);
-    }
-
-    let overflow = Arc::new(AtomicBool::new(false));
-    let stdout_thread = child
-        .stdout
-        .take()
-        .map(|stdout| spawn_bounded_reader(stdout, MAX_RESPONSE_BYTES, Arc::clone(&overflow)));
-    let stderr = child.stderr.take().ok_or_else(|| {
-        terminate_and_reap(&mut child);
-        rejected()
-    })?;
-    let stderr_thread = spawn_bounded_reader(stderr, MAX_CHILD_STDERR_BYTES, Arc::clone(&overflow));
     let deadline = Instant::now() + CHILD_TIMEOUT;
-    let status = loop {
-        if overflow.load(Ordering::Acquire)
-            || download
-                .as_ref()
-                .and_then(|capability| capability.file.metadata().ok())
-                .is_some_and(|metadata| metadata.len() > MAX_ASSET_BYTES)
-            || Instant::now() >= deadline
-        {
-            terminate_and_reap(&mut child);
-            break None;
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) => thread::sleep(POLL_INTERVAL),
-            Err(_) => {
-                terminate_and_reap(&mut child);
-                break None;
-            }
-        }
-    };
-    let stdout = match stdout_thread {
-        Some(reader) => reader.join().map_err(|_| rejected())?,
-        None => Vec::new(),
-    };
-    let _stderr = stderr_thread.join().map_err(|_| rejected())?;
-    if status.is_none_or(|status| !status.success()) || overflow.load(Ordering::Acquire) {
-        return Err(rejected());
-    }
+    let mut child = command.spawn().map_err(|_| rejected())?;
+    let supervised = supervise_child(
+        &mut child,
+        plan.stdin.as_deref().unwrap_or_default(),
+        download.as_mut(),
+        deadline,
+    )?;
 
     let response = if let Some(capability) = &mut download {
-        let (size, sha256) = capability.finish()?;
+        let stream = supervised.download.ok_or_else(rejected)?;
+        let (size, sha256) = capability.finish(stream.size, &stream.sha256)?;
         let BrokerRequestV1::DownloadAsset { asset_id, name, .. } = request else {
             return Err(rejected());
         };
@@ -702,7 +730,7 @@ fn execute_impl(
             },
         }
     } else {
-        project_child_response(request, &stdout, upload.take())?
+        project_child_response(request, &supervised.stdout, upload.as_ref())?
     };
     response.validate()?;
     Ok(response)
@@ -717,32 +745,29 @@ fn command_plan(
     request: &BrokerRequestV1,
     upload: Option<&UploadCapability>,
 ) -> Result<CommandPlan, BrokerError> {
-    let mut arguments = vec![OsString::from("api")];
-    let (method, endpoint, body, header, input) = match request {
+    match request {
         BrokerRequestV1::CreateTag {
             repository,
             tag,
             commit_sha,
             ..
-        } => (
+        } => Ok(api_command_plan(
             "POST",
             format!("/repos/{repository}/git/refs"),
+            "Accept: application/vnd.github+json",
             Some(canonical_value(&serde_json::json!({
                 "ref": format!("refs/tags/{tag}"),
                 "sha": commit_sha,
             }))?),
-            None,
-            Some(OsString::from("-")),
-        ),
+        )),
         BrokerRequestV1::ReadTag {
             repository, tag, ..
-        } => (
+        } => Ok(api_command_plan(
             "GET",
             format!("/repos/{repository}/git/ref/tags/{tag}"),
+            "Accept: application/vnd.github+json",
             None,
-            None,
-            None,
-        ),
+        )),
         BrokerRequestV1::CreateDraft {
             repository,
             tag,
@@ -751,9 +776,10 @@ fn command_plan(
             notes,
             prerelease,
             ..
-        } => (
+        } => Ok(api_command_plan(
             "POST",
             format!("/repos/{repository}/releases"),
+            "Accept: application/vnd.github+json",
             Some(canonical_value(&serde_json::json!({
                 "body": notes,
                 "draft": true,
@@ -762,95 +788,84 @@ fn command_plan(
                 "tag_name": tag,
                 "target_commitish": target_commitish,
             }))?),
-            None,
-            Some(OsString::from("-")),
-        ),
+        )),
         BrokerRequestV1::ReadDraft {
             repository, tag, ..
-        } => (
+        } => Ok(api_command_plan(
             "GET",
             format!("/repos/{repository}/releases/tags/{tag}"),
+            "Accept: application/vnd.github+json",
             None,
-            None,
-            None,
-        ),
+        )),
         BrokerRequestV1::UploadAsset {
-            repository,
-            release_id,
-            name,
-            ..
+            repository, tag, ..
         } => {
             let capability = upload.ok_or_else(rejected)?;
-            (
-                "POST",
-                format!(
-                    "/repos/{repository}/releases/{release_id}/assets?name={}",
-                    percent_encode(name)
-                ),
-                None,
-                Some("Content-Type: application/octet-stream"),
-                Some(OsString::from(format!(
-                    "/proc/self/fd/{}",
-                    capability.file.as_raw_fd()
-                ))),
-            )
+            Ok(CommandPlan {
+                arguments: vec![
+                    OsString::from("release"),
+                    OsString::from("upload"),
+                    OsString::from(tag),
+                    capability.path.as_os_str().to_owned(),
+                    OsString::from("--repo"),
+                    OsString::from(repository),
+                ],
+                stdin: None,
+            })
         }
         BrokerRequestV1::DownloadAsset {
             repository,
             asset_id,
             ..
-        } => (
+        } => Ok(api_command_plan(
             "GET",
             format!("/repos/{repository}/releases/assets/{asset_id}"),
+            "Accept: application/octet-stream",
             None,
-            Some("Accept: application/octet-stream"),
-            None,
-        ),
+        )),
         BrokerRequestV1::PublishDraft {
             repository,
             release_id,
             ..
-        } => (
+        } => Ok(api_command_plan(
             "PATCH",
             format!("/repos/{repository}/releases/{release_id}"),
+            "Accept: application/vnd.github+json",
             Some(canonical_value(&serde_json::json!({"draft": false}))?),
-            None,
-            Some(OsString::from("-")),
-        ),
-    };
-    arguments.extend([
+        )),
+    }
+}
+
+fn api_command_plan(
+    method: &'static str,
+    endpoint: String,
+    accept: &'static str,
+    stdin: Option<Vec<u8>>,
+) -> CommandPlan {
+    let mut arguments = vec![
+        OsString::from("api"),
         OsString::from("--method"),
         OsString::from(method),
         OsString::from(endpoint),
         OsString::from("--header"),
-        OsString::from(
-            header
-                .filter(|value| value.starts_with("Accept: "))
-                .unwrap_or("Accept: application/vnd.github+json"),
-        ),
+        OsString::from(accept),
         OsString::from("--header"),
         OsString::from("X-GitHub-Api-Version: 2022-11-28"),
-    ]);
-    if let Some(header) = header.filter(|value| !value.starts_with("Accept: ")) {
-        arguments.extend([OsString::from("--header"), OsString::from(header)]);
+    ];
+    if stdin.is_some() {
+        arguments.extend([OsString::from("--input"), OsString::from("-")]);
     }
-    if let Some(input) = input {
-        arguments.extend([OsString::from("--input"), input]);
-    }
-    Ok(CommandPlan {
-        arguments,
-        stdin: body,
-    })
+    CommandPlan { arguments, stdin }
 }
 
 fn project_child_response(
     request: &BrokerRequestV1,
     bytes: &[u8],
-    upload: Option<UploadCapability>,
+    upload: Option<&UploadCapability>,
 ) -> Result<BrokerResponseV1, BrokerError> {
-    let value = parse_json_value(bytes, MAX_RESPONSE_BYTES as u64, false)?;
     match request {
         BrokerRequestV1::CreateTag { tag, .. } | BrokerRequestV1::ReadTag { tag, .. } => {
+            let value = parse_json_value(bytes, MAX_RESPONSE_BYTES as u64, false)?;
             let root = object(&value)?;
             if string_field(root, "ref")? != format!("refs/tags/{tag}") {
                 return Err(rejected());
@@ -871,28 +886,21 @@ fn project_child_response(
             })
         }
         BrokerRequestV1::CreateDraft { .. } | BrokerRequestV1::ReadDraft { .. } => {
+            let value = parse_json_value(bytes, MAX_RESPONSE_BYTES as u64, false)?;
             project_draft(&value)
         }
         BrokerRequestV1::UploadAsset { name, .. } => {
             let upload = upload.ok_or_else(rejected)?;
-            let child = object(&value)?;
-            let asset_id = decimal_json_field(child, "id")?;
-            let child_name = string_field(child, "name")?;
-            let child_size = u64_field(child, "size")?;
-            if child_name != name || child_size != upload.size {
-                return Err(rejected());
-            }
-            Ok(BrokerResponseV1::Asset {
+            Ok(BrokerResponseV1::AssetUploaded {
                 schema_version: 1,
-                asset: BrokerTransferredAssetV1 {
-                    asset_id,
-                    name: name.clone(),
-                    size: upload.size,
-                    sha256: upload.sha256,
-                },
+                status: BrokerAssetUploadStatusV1::AssetUploaded,
+                name: name.clone(),
+                size: upload.size,
+                sha256: upload.sha256.clone(),
             })
         }
         BrokerRequestV1::PublishDraft { release_id, .. } => {
+            let value = parse_json_value(bytes, MAX_RESPONSE_BYTES as u64, false)?;
             let child = object(&value)?;
             if decimal_json_field(child, "id")? != *release_id || bool_field(child, "draft")? {
                 return Err(rejected());
@@ -988,7 +996,7 @@ fn read_config(
     if executable_sha256 != value.gh_sha256 {
         return Err(rejected());
     }
-    let script = descriptor_starts_with(&executable_file, b"#!")?;
+    validate_elf_executable(&executable_file, executable_identity.size)?;
     let executable_after = executable_file.metadata().map_err(|_| rejected())?;
     if Identity::from_metadata(&executable_after) != executable_identity {
         return Err(rejected());
@@ -1000,7 +1008,6 @@ fn read_config(
         file: executable_file,
         identity: executable_identity,
         sha256: executable_sha256,
-        script,
     };
     rebind_executable(&executable)?;
 
@@ -1063,7 +1070,7 @@ fn rebind_directory(directory: &VerifiedDirectory) -> Result<(), BrokerError> {
     verify_directory_rebind(&directory.path, &directory.file, directory.identity)
 }
 
-fn open_upload(path: &Path) -> Result<UploadCapability, BrokerError> {
+fn open_upload_source(path: &Path) -> Result<VerifiedUploadSource, BrokerError> {
     let path = canonical_existing_path(path)?;
     let file = open_absolute_no_links(&path, libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK)?;
     let before = file.metadata().map_err(|_| rejected())?;
@@ -1072,29 +1079,131 @@ fn open_upload(path: &Path) -> Result<UploadCapability, BrokerError> {
     }
     let identity = Identity::from_metadata(&before);
     let sha256 = hash_descriptor(&file, identity.size)?;
-    let after = file.metadata().map_err(|_| rejected())?;
-    if Identity::from_metadata(&after) != identity {
-        return Err(rejected());
-    }
-    let capability = UploadCapability {
+    let source = VerifiedUploadSource {
         file,
         path,
         identity,
         size: identity.size,
         sha256,
     };
+    rebind_upload_source(&source)?;
+    Ok(source)
+}
+
+fn rebind_upload_source(source: &VerifiedUploadSource) -> Result<(), BrokerError> {
+    verify_named_file(
+        &source.path,
+        &source.file,
+        source.identity,
+        secure_upload_file,
+    )?;
+    if hash_descriptor(&source.file, source.size)? != source.sha256 {
+        return Err(rejected());
+    }
+    Ok(())
+}
+
+fn materialize_upload(path: &Path, asset_name: &str) -> Result<UploadCapability, BrokerError> {
+    let source = open_upload_source(path)?;
+    let (directory_path, directory, directory_identity) =
+        create_private_directory(b"/tmp/catalog-gh-broker-upload-XXXXXX\0")?;
+    let name = CString::new(asset_name.as_bytes()).map_err(|_| rejected())?;
+    // SAFETY: retained owner-private parent, validated exact asset component, and no-clobber flags.
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0o400,
+        )
+    };
+    if descriptor < 0 {
+        let _ = fs::remove_dir(&directory_path);
+        return Err(rejected());
+    }
+    // SAFETY: openat returned one newly owned descriptor.
+    let file = unsafe { fs::File::from_raw_fd(descriptor) };
+    let initial = Identity::from_metadata(&file.metadata().map_err(|_| rejected())?);
+    let mut capability = UploadCapability {
+        path: directory_path.join(asset_name),
+        directory_path,
+        directory,
+        directory_identity,
+        name,
+        file,
+        identity: initial,
+        size: 0,
+        sha256: String::new(),
+    };
+    if !secure_download_file(
+        &capability.file.metadata().map_err(|_| rejected())?,
+        initial,
+        0o400,
+    ) || initial.size != 0
+    {
+        return Err(rejected());
+    }
+
+    rebind_upload_source(&source)?;
+    let mut source_reader = source.file.try_clone().map_err(|_| rejected())?;
+    source_reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| rejected())?;
+    let mut copied = 0_u64;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = source_reader.read(&mut buffer).map_err(|_| rejected())?;
+        if read == 0 {
+            break;
+        }
+        copied = copied.checked_add(read as u64).ok_or_else(rejected)?;
+        if copied > source.size || copied > MAX_ASSET_BYTES {
+            return Err(rejected());
+        }
+        capability
+            .file
+            .write_all(&buffer[..read])
+            .map_err(|_| rejected())?;
+        hasher.update(&buffer[..read]);
+    }
+    let digest = format!("{:x}", hasher.finalize());
+    if copied != source.size || digest != source.sha256 {
+        return Err(rejected());
+    }
+    capability.file.sync_all().map_err(|_| rejected())?;
+    rebind_upload_source(&source)?;
+    let metadata = capability.file.metadata().map_err(|_| rejected())?;
+    let identity = Identity::from_metadata(&metadata);
+    if !secure_download_file(&metadata, identity, 0o400)
+        || identity.size != copied
+        || hash_descriptor(&capability.file, copied)? != digest
+    {
+        return Err(rejected());
+    }
+    capability.identity = identity;
+    capability.size = copied;
+    capability.sha256 = digest;
     rebind_upload(&capability)?;
     Ok(capability)
 }
 
 fn rebind_upload(capability: &UploadCapability) -> Result<(), BrokerError> {
-    verify_named_file(
-        &capability.path,
-        &capability.file,
-        capability.identity,
-        secure_upload_file,
+    verify_directory_rebind(
+        &capability.directory_path,
+        &capability.directory,
+        capability.directory_identity,
     )?;
-    if hash_descriptor(&capability.file, capability.size)? != capability.sha256 {
+    let metadata = capability.file.metadata().map_err(|_| rejected())?;
+    let rebound = openat_regular(&capability.directory, &capability.name, libc::O_RDONLY)?;
+    let rebound_metadata = rebound.metadata().map_err(|_| rejected())?;
+    if Identity::from_metadata(&metadata) != capability.identity
+        || Identity::from_metadata(&rebound_metadata) != capability.identity
+        || !secure_upload_file(&metadata)
+        || !secure_upload_file(&rebound_metadata)
+        || hash_descriptor(&capability.file, capability.size)? != capability.sha256
+        || hash_descriptor(&rebound, capability.size)? != capability.sha256
+    {
         return Err(rejected());
     }
     Ok(())
@@ -1172,9 +1281,14 @@ fn verify_download_before_spawn(capability: &DownloadCapability) -> Result<(), B
     Ok(())
 }
 
-fn create_fresh_home() -> Result<FreshHome, BrokerError> {
-    let mut template = b"/tmp/catalog-gh-broker-home-XXXXXX\0".to_vec();
-    // SAFETY: template is writable, NUL-terminated, and ends in six X bytes as required.
+fn create_private_directory(
+    fixed_template: &[u8],
+) -> Result<(PathBuf, fs::File, Identity), BrokerError> {
+    if !fixed_template.ends_with(b"XXXXXX\0") {
+        return Err(rejected());
+    }
+    let mut template = fixed_template.to_vec();
+    // SAFETY: the fixed template is writable, NUL-terminated, and ends in six X bytes.
     let pointer = unsafe { libc::mkdtemp(template.as_mut_ptr().cast()) };
     if pointer.is_null() {
         return Err(rejected());
@@ -1186,12 +1300,19 @@ fn create_fresh_home() -> Result<FreshHome, BrokerError> {
     let file = open_absolute_no_links(&path, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC)?;
     let metadata = file.metadata().map_err(|_| rejected())?;
     if !secure_private_directory(&metadata) || metadata.nlink() != 2 {
+        let _ = fs::remove_dir(&path);
         return Err(rejected());
     }
+    let identity = Identity::from_metadata(&metadata);
+    Ok((path, file, identity))
+}
+
+fn create_fresh_home() -> Result<FreshHome, BrokerError> {
+    let (path, file, identity) = create_private_directory(b"/tmp/catalog-gh-broker-home-XXXXXX\0")?;
     let home = FreshHome {
         path,
         file,
-        identity: Identity::from_metadata(&metadata),
+        identity,
     };
     verify_home(&home)?;
     Ok(home)
@@ -1241,101 +1362,292 @@ fn verify_home(home: &FreshHome) -> Result<(), BrokerError> {
     Ok(())
 }
 
-struct InheritedFd {
-    descriptor: i32,
-    original_flags: i32,
+struct DownloadStream {
+    size: u64,
+    sha256: String,
 }
 
-impl InheritedFd {
-    fn new(file: &fs::File) -> Result<Self, BrokerError> {
-        let descriptor = file.as_raw_fd();
-        // SAFETY: descriptor is retained and F_GETFD does not mutate memory.
-        let original_flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
-        if original_flags < 0 {
+struct SupervisedOutput {
+    stdout: Vec<u8>,
+    download: Option<DownloadStream>,
+}
+
+struct DownloadAccumulator {
+    size: u64,
+    hasher: Sha256,
+}
+
+fn supervise_child(
+    child: &mut Child,
+    stdin_bytes: &[u8],
+    download: Option<&mut DownloadCapability>,
+    deadline: Instant,
+) -> Result<SupervisedOutput, BrokerError> {
+    match supervise_io(child, stdin_bytes, download, deadline) {
+        Ok(output) => Ok(output),
+        Err(error) => {
+            terminate_and_reap(child, deadline);
+            Err(error)
+        }
+    }
+}
+
+fn supervise_io(
+    child: &mut Child,
+    stdin_bytes: &[u8],
+    mut download: Option<&mut DownloadCapability>,
+    deadline: Instant,
+) -> Result<SupervisedOutput, BrokerError> {
+    let mut stdin = Some(child.stdin.take().ok_or_else(rejected)?);
+    let mut stdout = child.stdout.take().ok_or_else(rejected)?;
+    let mut stderr = child.stderr.take().ok_or_else(rejected)?;
+    set_nonblocking(stdin.as_ref().ok_or_else(rejected)?)?;
+    set_nonblocking(&stdout)?;
+    set_nonblocking(&stderr)?;
+
+    let mut stdin_position = 0_usize;
+    let mut stdin_open = !stdin_bytes.is_empty();
+    if !stdin_open {
+        stdin.take();
+    }
+    let mut stdout_open = true;
+    let mut stderr_open = true;
+    let mut stdout_bytes = Vec::with_capacity(16 * 1024);
+    let mut stderr_bytes = Vec::with_capacity(8 * 1024);
+    let mut download_accumulator = download.as_ref().map(|_| DownloadAccumulator {
+        size: 0,
+        hasher: Sha256::new(),
+    });
+    let mut leader_status: Option<ExitStatus> = None;
+
+    loop {
+        let now = Instant::now();
+        if deadline.saturating_duration_since(now) <= Duration::from_millis(100) {
             return Err(rejected());
         }
-        // SAFETY: descriptor remains retained for the lifetime of this guard.
-        if unsafe {
-            libc::fcntl(
-                descriptor,
-                libc::F_SETFD,
-                original_flags & !libc::FD_CLOEXEC,
+
+        let mut descriptors = Vec::with_capacity(3);
+        if stdin_open {
+            descriptors.push(libc::pollfd {
+                fd: stdin.as_ref().ok_or_else(rejected)?.as_raw_fd(),
+                events: libc::POLLOUT,
+                revents: 0,
+            });
+        }
+        if stdout_open {
+            descriptors.push(libc::pollfd {
+                fd: stdout.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            });
+        }
+        if stderr_open {
+            descriptors.push(libc::pollfd {
+                fd: stderr.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            });
+        }
+        let wait = deadline.saturating_duration_since(now).min(POLL_INTERVAL);
+        let timeout = i32::try_from(wait.as_millis().max(1)).unwrap_or(i32::MAX);
+        // SAFETY: the pollfd vector is valid for its exact initialized length.
+        let result = unsafe {
+            libc::poll(
+                descriptors.as_mut_ptr(),
+                descriptors.len() as libc::nfds_t,
+                timeout,
             )
-        } != 0
-        {
+        };
+        if result < 0 {
+            if std::io::Error::last_os_error().kind() == ErrorKind::Interrupted {
+                continue;
+            }
             return Err(rejected());
         }
-        Ok(Self {
-            descriptor,
-            original_flags,
-        })
-    }
-}
 
-impl Drop for InheritedFd {
-    fn drop(&mut self) {
-        // SAFETY: the owning file outlives this guard; best-effort restoration only tightens access.
-        unsafe {
-            libc::fcntl(self.descriptor, libc::F_SETFD, self.original_flags);
-        }
-    }
-}
-
-fn spawn_bounded_reader<R: Read + Send + 'static>(
-    mut reader: R,
-    maximum: usize,
-    overflow: Arc<AtomicBool>,
-) -> thread::JoinHandle<Vec<u8>> {
-    thread::spawn(move || {
-        let mut captured = Vec::with_capacity(maximum.min(16 * 1024));
-        let mut buffer = [0_u8; 8 * 1024];
-        loop {
-            match reader.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(read) => {
-                    if captured.len().saturating_add(read) > maximum {
-                        overflow.store(true, Ordering::Release);
-                    } else if !overflow.load(Ordering::Acquire) {
-                        captured.extend_from_slice(&buffer[..read]);
+        let mut index = 0_usize;
+        if stdin_open {
+            let events = descriptors[index].revents;
+            index += 1;
+            if events & (libc::POLLOUT | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+                match write_nonblocking_stdin(
+                    stdin.as_mut().ok_or_else(rejected)?,
+                    stdin_bytes,
+                    &mut stdin_position,
+                ) {
+                    Ok(true) => {
+                        stdin_open = false;
+                        stdin.take();
                     }
-                }
-                Err(_) => {
-                    overflow.store(true, Ordering::Release);
-                    break;
+                    Ok(false) => {}
+                    Err(_) => return Err(rejected()),
                 }
             }
         }
-        captured
-    })
+        if stdout_open {
+            let events = descriptors[index].revents;
+            index += 1;
+            if events & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+                stdout_open = if let (Some(capability), Some(accumulator)) =
+                    (download.as_deref_mut(), download_accumulator.as_mut())
+                {
+                    !drain_download_stdout(&mut stdout, capability, accumulator, deadline)?
+                } else {
+                    !drain_bounded_pipe(&mut stdout, &mut stdout_bytes, MAX_RESPONSE_BYTES)?
+                };
+            }
+        }
+        if stderr_open {
+            let events = descriptors[index].revents;
+            if events & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+                stderr_open =
+                    !drain_bounded_pipe(&mut stderr, &mut stderr_bytes, MAX_CHILD_STDERR_BYTES)?;
+            }
+        }
+
+        if leader_status.is_none() {
+            leader_status = child.try_wait().map_err(|_| rejected())?;
+        }
+        if leader_status.is_some_and(|status| !status.success()) {
+            return Err(rejected());
+        }
+        if leader_status.is_some() && !stdin_open && !stdout_open && !stderr_open {
+            let download = download_accumulator.map(|accumulator| DownloadStream {
+                size: accumulator.size,
+                sha256: format!("{:x}", accumulator.hasher.finalize()),
+            });
+            return Ok(SupervisedOutput {
+                stdout: stdout_bytes,
+                download,
+            });
+        }
+    }
 }
 
-fn terminate_and_reap(child: &mut Child) {
+fn set_nonblocking(descriptor: &impl AsRawFd) -> Result<(), BrokerError> {
+    // SAFETY: F_GETFL/F_SETFL operate on the retained pipe descriptor.
+    let flags = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0
+        || unsafe {
+            libc::fcntl(
+                descriptor.as_raw_fd(),
+                libc::F_SETFL,
+                flags | libc::O_NONBLOCK,
+            )
+        } != 0
+    {
+        return Err(rejected());
+    }
+    Ok(())
+}
+
+fn write_nonblocking_stdin(
+    stdin: &mut ChildStdin,
+    bytes: &[u8],
+    position: &mut usize,
+) -> Result<bool, BrokerError> {
+    let end = position.saturating_add(IO_CHUNK_BYTES).min(bytes.len());
+    match stdin.write(&bytes[*position..end]) {
+        Ok(0) => Err(rejected()),
+        Ok(written) => {
+            *position += written;
+            Ok(*position == bytes.len())
+        }
+        Err(error) if error.kind() == ErrorKind::WouldBlock => Ok(false),
+        Err(_) => Err(rejected()),
+    }
+}
+
+fn drain_bounded_pipe<R: Read>(
+    pipe: &mut R,
+    captured: &mut Vec<u8>,
+    maximum: usize,
+) -> Result<bool, BrokerError> {
+    loop {
+        let remaining = maximum.saturating_sub(captured.len());
+        let mut buffer = [0_u8; IO_CHUNK_BYTES];
+        let requested = if remaining == 0 {
+            1
+        } else {
+            remaining.min(buffer.len())
+        };
+        match pipe.read(&mut buffer[..requested]) {
+            Ok(0) => return Ok(true),
+            Ok(read) if remaining == 0 || read > remaining => return Err(rejected()),
+            Ok(read) => captured.extend_from_slice(&buffer[..read]),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(false),
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => return Err(rejected()),
+        }
+    }
+}
+
+fn drain_download_stdout(
+    stdout: &mut ChildStdout,
+    capability: &mut DownloadCapability,
+    accumulator: &mut DownloadAccumulator,
+    deadline: Instant,
+) -> Result<bool, BrokerError> {
+    loop {
+        if Instant::now() >= deadline {
+            return Err(rejected());
+        }
+        let remaining = MAX_ASSET_BYTES.saturating_sub(accumulator.size);
+        let mut buffer = [0_u8; IO_CHUNK_BYTES];
+        let requested = if remaining == 0 {
+            1
+        } else {
+            usize::try_from(remaining.min(buffer.len() as u64)).map_err(|_| rejected())?
+        };
+        match stdout.read(&mut buffer[..requested]) {
+            Ok(0) => return Ok(true),
+            Ok(_) if remaining == 0 => return Err(rejected()),
+            Ok(read) => {
+                capability
+                    .file
+                    .write_all(&buffer[..read])
+                    .map_err(|_| rejected())?;
+                accumulator.size = accumulator
+                    .size
+                    .checked_add(read as u64)
+                    .ok_or_else(rejected)?;
+                accumulator.hasher.update(&buffer[..read]);
+                if Instant::now() >= deadline {
+                    return Err(rejected());
+                }
+            }
+            Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(false),
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => return Err(rejected()),
+        }
+    }
+}
+
+fn terminate_and_reap(child: &mut Child, deadline: Instant) {
     let pid = child.id() as i32;
     // SAFETY: the child created its own process group with PGID equal to its PID.
     unsafe {
         libc::kill(-pid, libc::SIGKILL);
     }
     let _ = child.kill();
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) => {
+                let mut no_descriptors: [libc::pollfd; 0] = [];
+                // SAFETY: zero descriptors and a one-millisecond timeout are valid.
+                unsafe {
+                    libc::poll(no_descriptors.as_mut_ptr(), 0, 1);
+                }
+            }
+        }
+    }
+    // SIGKILL has already been delivered; this final wait robustly reaps the leader.
     let _ = child.wait();
 }
 
 fn canonical_value(value: &Value) -> Result<Vec<u8>, BrokerError> {
     serde_jcs::to_vec(value).map_err(|_| rejected())
-}
-
-fn percent_encode(value: &str) -> String {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let mut encoded = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
-            encoded.push(char::from(byte));
-        } else {
-            encoded.push('%');
-            encoded.push(char::from(HEX[(byte >> 4) as usize]));
-            encoded.push(char::from(HEX[(byte & 0x0f) as usize]));
-        }
-    }
-    encoded
 }
 
 fn valid_schema(schema_version: u16) -> Result<(), BrokerError> {
@@ -1718,12 +2030,120 @@ fn same_directory_identity(left: Identity, right: Identity) -> bool {
         && left.mode == right.mode
 }
 
-fn descriptor_starts_with(file: &fs::File, prefix: &[u8]) -> Result<bool, BrokerError> {
-    let mut file = file.try_clone().map_err(|_| rejected())?;
-    file.seek(SeekFrom::Start(0)).map_err(|_| rejected())?;
-    let mut bytes = vec![0_u8; prefix.len()];
-    file.read_exact(&mut bytes).map_err(|_| rejected())?;
-    Ok(bytes == prefix)
+fn validate_elf_executable(file: &fs::File, size: u64) -> Result<(), BrokerError> {
+    if size < ELF_HEADER_BYTES as u64 {
+        return Err(rejected());
+    }
+    let mut header = [0_u8; ELF_HEADER_BYTES];
+    read_descriptor_at(file, 0, &mut header)?;
+    if &header[0..4] != b"\x7fELF"
+        || header[4] != 2
+        || header[5] != 1
+        || header[6] != 1
+        || !matches!(header[7], 0 | 3)
+        || header[8] != 0
+        || !matches!(u16::from_le_bytes([header[16], header[17]]), 2 | 3)
+        || u16::from_le_bytes([header[18], header[19]]) != 62
+        || u32::from_le_bytes(header[20..24].try_into().map_err(|_| rejected())?) != 1
+        || u16::from_le_bytes([header[52], header[53]]) != ELF_HEADER_BYTES as u16
+        || u64::from(u16::from_le_bytes([header[54], header[55]])) != ELF_PROGRAM_HEADER_BYTES
+    {
+        return Err(rejected());
+    }
+    let program_offset = u64::from_le_bytes(header[32..40].try_into().map_err(|_| rejected())?);
+    let program_count = u16::from_le_bytes([header[56], header[57]]);
+    let table_size = u64::from(program_count)
+        .checked_mul(ELF_PROGRAM_HEADER_BYTES)
+        .ok_or_else(rejected)?;
+    if program_offset < ELF_HEADER_BYTES as u64
+        || program_count == 0
+        || program_count > MAX_ELF_PROGRAM_HEADERS
+        || program_offset
+            .checked_add(table_size)
+            .filter(|end| *end <= size)
+            .is_none()
+    {
+        return Err(rejected());
+    }
+
+    let mut has_load = false;
+    let mut has_executable_load = false;
+    for index in 0..program_count {
+        let offset = program_offset
+            .checked_add(u64::from(index) * ELF_PROGRAM_HEADER_BYTES)
+            .ok_or_else(rejected)?;
+        let mut program = [0_u8; ELF_PROGRAM_HEADER_BYTES as usize];
+        read_descriptor_at(file, offset, &mut program)?;
+        let kind = u32::from_le_bytes(program[0..4].try_into().map_err(|_| rejected())?);
+        let flags = u32::from_le_bytes(program[4..8].try_into().map_err(|_| rejected())?);
+        let file_offset = u64::from_le_bytes(program[8..16].try_into().map_err(|_| rejected())?);
+        let virtual_address =
+            u64::from_le_bytes(program[16..24].try_into().map_err(|_| rejected())?);
+        let file_size = u64::from_le_bytes(program[32..40].try_into().map_err(|_| rejected())?);
+        let memory_size = u64::from_le_bytes(program[40..48].try_into().map_err(|_| rejected())?);
+        let alignment = u64::from_le_bytes(program[48..56].try_into().map_err(|_| rejected())?);
+        if file_offset
+            .checked_add(file_size)
+            .filter(|end| *end <= size)
+            .is_none()
+        {
+            return Err(rejected());
+        }
+        if kind == 1 {
+            if file_size > memory_size
+                || !(alignment <= 1 || alignment.is_power_of_two())
+                || (alignment > 1 && file_offset % alignment != virtual_address % alignment)
+            {
+                return Err(rejected());
+            }
+            has_load = true;
+            has_executable_load |= flags & 1 != 0;
+        } else if kind == 3 {
+            if !(2..=4_096).contains(&file_size) {
+                return Err(rejected());
+            }
+            let mut interpreter = vec![0_u8; file_size as usize];
+            read_descriptor_at(file, file_offset, &mut interpreter)?;
+            if interpreter.last() != Some(&0)
+                || interpreter[..interpreter.len() - 1].contains(&0)
+                || interpreter.first() != Some(&b'/')
+            {
+                return Err(rejected());
+            }
+        }
+    }
+    if !has_load || !has_executable_load {
+        return Err(rejected());
+    }
+    Ok(())
+}
+
+fn read_descriptor_at(
+    file: &fs::File,
+    offset: u64,
+    destination: &mut [u8],
+) -> Result<(), BrokerError> {
+    let mut completed = 0_usize;
+    while completed < destination.len() {
+        let absolute = offset
+            .checked_add(completed as u64)
+            .and_then(|value| i64::try_from(value).ok())
+            .ok_or_else(rejected)?;
+        // SAFETY: retained file, writable destination slice, bounded count, and checked offset.
+        let read = unsafe {
+            libc::pread(
+                file.as_raw_fd(),
+                destination[completed..].as_mut_ptr().cast(),
+                destination.len() - completed,
+                absolute,
+            )
+        };
+        if read <= 0 {
+            return Err(rejected());
+        }
+        completed += read as usize;
+    }
+    Ok(())
 }
 
 fn read_descriptor(file: &fs::File, size: u64, maximum: u64) -> Result<Vec<u8>, BrokerError> {

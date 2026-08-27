@@ -1807,40 +1807,56 @@ policies = [
     ("executable execute policy", "mode & 0o111 != 0", 1),
     ("executable full SHA-256 recheck", "hash_descriptor(&executable.file, executable.identity.size)? != executable.sha256", 1),
     ("immediate executable rebind", "rebind_executable(&config.executable)?;", 1),
+    ("ELF-only executable admission", "validate_elf_executable(&executable_file, executable_identity.size)?;", 1),
+    ("ELF64 little-endian identity", '|| header[4] != 2\n        || header[5] != 1', 1),
+    ("ELF x86-64 machine", 'u16::from_le_bytes([header[18], header[19]]) != 62', 1),
+    ("ELF program-header bound", "program_count > MAX_ELF_PROGRAM_HEADERS", 1),
+    ("ELF load segment required", "if !has_load || !has_executable_load", 1),
     ("config directory exact mode", "metadata.permissions().mode() & 0o7777 == 0o700", 1),
     ("immediate config directory rebind", "rebind_directory(&config.config_directory)?;", 1),
     ("clear child environment", "command.env_clear();", 1),
-    ("hard child deadline", "Instant::now() + CHILD_TIMEOUT", 1),
+    ("single hard child deadline", "let deadline = Instant::now() + CHILD_TIMEOUT;", 1),
+    ("all child pipes are broker pipes", "command.stdout(Stdio::piped());", 1),
+    ("child pipes nonblocking", "flags | libc::O_NONBLOCK", 1),
+    ("single poll IO state machine", "fn supervise_io(", 1),
+    ("bounded concurrent stdin write", "write_nonblocking_stdin(", 2),
+    ("bounded stdout ceiling", "MAX_RESPONSE_BYTES)?", 1),
+    ("bounded stderr ceiling", "MAX_CHILD_STDERR_BYTES", 2),
+    ("one-byte overflow probe", "let requested = if remaining == 0 {", 2),
+    ("descendant-held pipe deadline", "!stdin_open && !stdout_open && !stderr_open", 1),
     ("child process-group kill", "libc::kill(-pid, libc::SIGKILL)", 1),
-    ("child reap", "let _ = child.wait();", 1),
-    ("bounded stdout drain", "spawn_bounded_reader(stdout, MAX_RESPONSE_BYTES", 1),
-    ("bounded stderr drain", "spawn_bounded_reader(stderr, MAX_CHILD_STDERR_BYTES", 1),
+    ("child robust reap", "let _ = child.wait();", 1),
     ("single exact launch call", "let mut command = Command::new(executable_path);", 1),
-    ("fixed REST accept header", '"Accept: application/vnd.github+json"', 1),
-    ("fixed REST version header", '"X-GitHub-Api-Version: 2022-11-28"', 1),
-    ("retained executable proc capability", 'format!(\n            "/proc/self/fd/{}",\n            config.executable.file.as_raw_fd()', 1),
-    ("retained config directory inheritance", "InheritedFd::new(&config.config_directory.file)?", 1),
-    ("retained upload inheritance", "InheritedFd::new(&capability.file)", 1),
+    ("retained executable proc capability", 'format!(\n        "/proc/self/fd/{}",\n        config.executable.file.as_raw_fd()', 1),
+    ("child-only executable and config inheritance", "for descriptor in [executable_descriptor, config_directory_descriptor]", 1),
+    ("private exact upload directory", 'create_private_directory(b"/tmp/catalog-gh-broker-upload-XXXXXX\\0")?', 1),
+    ("private upload no-clobber create", "libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW", 2),
     ("upload exact read-only mode", "metadata.permissions().mode() & 0o7777 == 0o400", 1),
-    ("download no-clobber create", "libc::O_EXCL", 1),
+    ("private upload source rebind", "rebind_upload_source(&source)?;", 3),
+    ("private upload final rebind", "rebind_upload(&capability)?;", 1),
+    ("upload descriptor and named hash readback", "hash_descriptor(&rebound, capability.size)? != capability.sha256", 1),
+    ("download streamed by broker", ".write_all(&buffer[..read])", 2),
+    ("download incremental ceiling", "MAX_ASSET_BYTES.saturating_sub(accumulator.size)", 1),
+    ("download incremental hash", "accumulator.hasher.update(&buffer[..read]);", 1),
     ("download fsync before and after mode settlement", "self.file.sync_all().map_err(|_| rejected())?;", 2),
     ("download descriptor/name hash readback", "hash_descriptor(&rebound, final_identity.size)? != digest", 1),
     ("download exact-node failure cleanup", "if !same_file_node(Identity::from_metadata(&rebound_metadata), self.identity)", 1),
+    ("upload no-ID response", "BrokerResponseV1::AssetUploaded {", 1),
     ("fixed failure output", 'const FAILURE_LINE: &[u8] = b"github broker failed\\n";', 1),
-    ("explicit child response projection", "project_child_response(request, &stdout, upload.take())?", 1),
+    ("explicit child response projection", "project_child_response(request, &supervised.stdout, upload.as_ref())?", 1),
 ]
 
 validator_calls = [
-    ("schema-version validation", "valid_schema(*schema_version)?;", 10),
+    ("schema-version validation", "valid_schema(*schema_version)?;", 11),
     ("repository validation", "valid_repository(repository)?;", 6),
-    ("tag validation", "valid_tag(tag)?;", 4),
+    ("tag validation", "valid_tag(tag)?;", 5),
     ("commit validation", "valid_sha1(commit_sha)", 2),
     ("target commit validation", "valid_sha1(target_commitish)?;", 2),
     ("title validation", "valid_title(title)?;", 1),
     ("notes validation", "valid_notes(notes)", 1),
     ("release ID validation", "valid_decimal_id(release_id)?;", 2),
     ("asset ID validation", "valid_decimal_id(asset_id)?;", 1),
-    ("asset name validation", "valid_asset_name(name)?;", 2),
+    ("asset name validation", "valid_asset_name(name)?;", 3),
     ("upload path validation", "valid_path_text(input_path)", 1),
     ("download path validation", "valid_path_text(output_path)", 1),
 ]
@@ -1908,28 +1924,38 @@ def broker_errors(source, binary_source=binary, lib_source=lib, local_source=loc
             errors.append(f"process launch escaped broker implementation: {name}")
     for forbidden in [
         "/bin/sh", "sh -c", "gh auth", "auth token", "api graphql", "--jq",
-        "--template", "--hostname", "reqwest::", "ureq::", "curl::", "std::net::",
-        "TcpStream", "UdpSocket", "println!(child", "eprintln!(child",
+        "--template", "--hostname", "--clobber", "reqwest::", "ureq::", "curl::",
+        "std::net::", "TcpStream", "UdpSocket", "println!(child", "eprintln!(child",
+        "spawn_bounded_reader", "thread::spawn", "Stdio::from(",
+        "config.executable.path.as_os_str().to_owned()",
     ]:
         if forbidden in source:
             errors.append(f"broker gained forbidden command/network/raw-output seam: {forbidden}")
-    for required in [
-        '"POST",\n            format!("/repos/{repository}/git/refs")',
-        '"GET",\n            format!("/repos/{repository}/git/ref/tags/{tag}")',
-        '"POST",\n            format!("/repos/{repository}/releases")',
-        '"GET",\n            format!("/repos/{repository}/releases/tags/{tag}")',
-        '"Content-Type: application/octet-stream"',
-        '"Accept: application/octet-stream"',
-        '"PATCH",\n            format!("/repos/{repository}/releases/{release_id}")',
-    ]:
-        if required not in source:
-            errors.append(f"fixed gh api matrix lost route/method/header: {required.splitlines()[0]}")
-    for required in [
+    command_matrix = [
+        ("create_tag method/route", '"POST",\n            format!("/repos/{repository}/git/refs")'),
+        ("create_tag body", '"ref": format!("refs/tags/{tag}"),\n                "sha": commit_sha'),
+        ("read_tag method/route", '"GET",\n            format!("/repos/{repository}/git/ref/tags/{tag}")'),
+        ("create_draft method/route", '"POST",\n            format!("/repos/{repository}/releases")'),
+        ("create_draft body", '"draft": true,\n                "name": title,\n                "prerelease": prerelease,\n                "tag_name": tag,\n                "target_commitish": target_commitish'),
+        ("read_draft method/route", '"GET",\n            format!("/repos/{repository}/releases/tags/{tag}")'),
+        ("upload fixed release family", 'OsString::from("release"),\n                    OsString::from("upload"),\n                    OsString::from(tag),\n                    capability.path.as_os_str().to_owned(),\n                    OsString::from("--repo"),\n                    OsString::from(repository)'),
+        ("download method/route/accept", '"GET",\n            format!("/repos/{repository}/releases/assets/{asset_id}"),\n            "Accept: application/octet-stream"'),
+        ("publish method/route/body", '"PATCH",\n            format!("/repos/{repository}/releases/{release_id}"),\n            "Accept: application/vnd.github+json",\n            Some(canonical_value(&serde_json::json!({"draft": false}))?)'),
+        ("fixed API version", 'OsString::from("X-GitHub-Api-Version: 2022-11-28")'),
+    ]
+    for label, required in command_matrix:
+        if source.count(required) != 1:
+            errors.append(f"fixed command matrix lost {label}")
+    required_tests = [
         "ambient-gh-token-canary", "ambient-github-token-canary", "ambient-proxy-canary",
         "ambient-agent-canary", "raw-token-canary", "CONFIG_CANARY", "FloodStdout",
         "FloodStderr", "Deadlock", "Timeout", "Signal", "InvalidUtf8", "download-no-clobber",
-        "replace-after-hash", "replace-before-spawn", "repeated_and_concurrent_requests",
-    ]:
+        "delayed-stdin", "non-reading-stdin", "leader-exits-descendant-holds-stdout-stderr",
+        "descendant-flood", "download-overflow", "download-descendant", "script-rejected",
+        "after-final-rebind", "replace-before-spawn", "repeated_and_concurrent_requests",
+        "release_upload_materializes_private_exact_file_and_returns_no_fabricated_id",
+    ]
+    for required in required_tests:
         if required not in test_source:
             errors.append(f"broker adversarial evidence missing: {required}")
     return errors
@@ -1954,11 +1980,39 @@ for label, snippet, expected in policies + validator_calls + validator_predicate
             print(f"broker scanner accepted removed enforcement: {label} occurrence {occurrence}", file=sys.stderr)
             sys.exit(1)
 
+# Semantic one-at-a-time bypasses retain neighboring method/route/body tokens so the scanner
+# freezes enforcement rather than merely noticing that the operation name still exists.
 for label, old, new in [
+    ("create_tag method", '"POST",\n            format!("/repos/{repository}/git/refs")', '"GET",\n            format!("/repos/{repository}/git/refs")'),
+    ("create_tag route", 'format!("/repos/{repository}/git/refs")', 'format!("/repos/{repository}/git/ref")'),
+    ("create_tag body", '"sha": commit_sha', '"target": commit_sha'),
+    ("read_tag method", '"GET",\n            format!("/repos/{repository}/git/ref/tags/{tag}")', '"POST",\n            format!("/repos/{repository}/git/ref/tags/{tag}")'),
+    ("read_tag route", 'format!("/repos/{repository}/git/ref/tags/{tag}")', 'format!("/repos/{repository}/git/refs/tags/{tag}")'),
+    ("create_draft method", '"POST",\n            format!("/repos/{repository}/releases")', '"GET",\n            format!("/repos/{repository}/releases")'),
+    ("create_draft route", 'format!("/repos/{repository}/releases")', 'format!("/repos/{repository}/release")'),
+    ("create_draft body", '"draft": true', '"draft": false'),
+    ("read_draft method", '"GET",\n            format!("/repos/{repository}/releases/tags/{tag}")', '"POST",\n            format!("/repos/{repository}/releases/tags/{tag}")'),
+    ("read_draft route", 'format!("/repos/{repository}/releases/tags/{tag}")', 'format!("/repos/{repository}/releases/tag/{tag}")'),
+    ("upload family", 'OsString::from("release"),\n                    OsString::from("upload")', 'OsString::from("api"),\n                    OsString::from("upload")'),
+    ("upload exact tag", 'OsString::from(tag),\n                    capability.path.as_os_str().to_owned()', 'OsString::from(repository),\n                    capability.path.as_os_str().to_owned()'),
+    ("upload repository binding", 'OsString::from("--repo"),\n                    OsString::from(repository)', 'OsString::from("--repo"),\n                    OsString::from(tag)'),
+    ("upload no-clobber", 'OsString::from("--repo"),', 'OsString::from("--clobber"),\n                    OsString::from("--repo"),'),
+    ("download method", '"GET",\n            format!("/repos/{repository}/releases/assets/{asset_id}")', '"POST",\n            format!("/repos/{repository}/releases/assets/{asset_id}")'),
+    ("download route", 'format!("/repos/{repository}/releases/assets/{asset_id}")', 'format!("/repos/{repository}/releases/{asset_id}")'),
+    ("download accept", '"Accept: application/octet-stream",\n            None,', '"Accept: application/vnd.github+json",\n            None,'),
+    ("publish method", '"PATCH",\n            format!("/repos/{repository}/releases/{release_id}")', '"POST",\n            format!("/repos/{repository}/releases/{release_id}")'),
+    ("publish route", 'format!("/repos/{repository}/releases/{release_id}")', 'format!("/repos/{repository}/release/{release_id}")'),
+    ("publish body", 'serde_json::json!({"draft": false})', 'serde_json::json!({"draft": true})'),
     ("executable hash bypass", "hash_descriptor(&executable.file, executable.identity.size)? != executable.sha256", "false /* hash_descriptor executable sha256 */"),
     ("download hash bypass", "hash_descriptor(&rebound, final_identity.size)? != digest", "false /* hash_descriptor rebound digest */"),
     ("request authority ordering", "request.validate()?;\n    let config = read_config", "let config = read_config /* request.validate moved after authority */"),
     ("child environment clear", "command.env_clear();", "/* command env_clear removed */"),
+    ("child pipe nonblocking", "flags | libc::O_NONBLOCK", "flags /* O_NONBLOCK retained token */"),
+    ("stdin supervision", "write_nonblocking_stdin(", "bypassed_nonblocking_stdin("),
+    ("descendant pipe completion", "!stdin_open && !stdout_open && !stderr_open", "leader_status.is_some()"),
+    ("download streaming ceiling", "MAX_ASSET_BYTES.saturating_sub(accumulator.size)", "u64::MAX.saturating_sub(accumulator.size) /* MAX_ASSET_BYTES */"),
+    ("ELF-only admission", "validate_elf_executable(&executable_file, executable_identity.size)?;", "/* validate_elf_executable retained but bypassed */"),
+    ("named execution fallback", "let executable_path = OsString::from(format!(", "let executable_path = config.executable.path.as_os_str().to_owned(); let _retained = OsString::from(format!("),
     ("fresh output no-clobber", "libc::O_EXCL", "0 /* O_EXCL */"),
 ]:
     mutation = broker.replace(old, new, 1)
