@@ -1537,6 +1537,21 @@ policies = [
     ("persistent enumeration work bound", "work = bounded_add(work, 1, limits.maximum_work)?;", 1),
     ("persistent checked arithmetic", "current.checked_add(amount).ok_or_else(rejected)?", 1),
     ("persistent arithmetic maximum", "if next > maximum", 1),
+    ("portable persistent directory links", "fn directory_nlink_matches(observed: u64, conventional: u64) -> bool {\n    observed == 1 || observed == conventional\n}", 1),
+    ("portable retained state root links", "!directory_nlink_matches(root.nlink(), 4)", 1),
+    ("portable retained objects links", "!directory_nlink_matches(objects.nlink(), 2)", 1),
+    ("portable retained latest links", "!directory_nlink_matches(latest.nlink(), 2)", 1),
+    ("portable partial state root links", "!directory_nlink_matches(root_metadata.nlink(), 2 + names.len() as u64)", 1),
+    ("portable opened state root links", "!directory_nlink_matches(root_metadata.nlink(), 4)", 1),
+    ("portable opened objects links", "!directory_nlink_matches(objects_metadata.nlink(), 2)", 1),
+    ("portable opened latest links", "!directory_nlink_matches(latest_metadata.nlink(), 2)", 1),
+    ("portable state child links", "!directory_nlink_matches(metadata.nlink(), 2)", 1),
+    ("recovery marker exact two links", "FileIdentity::from_metadata(&marker_metadata) != identity\n        || marker_metadata.nlink() != 2", 1),
+    ("recovery temporary exact two links", "FileIdentity::from_metadata(&metadata) != identity\n            || metadata.nlink() != 2", 1),
+    ("recovery record exact one link", "FileIdentity::from_metadata(&metadata) != transaction.identity || metadata.nlink() != 1", 1),
+    ("workflow lock retained exact one link", "retained_metadata.nlink() != 1", 1),
+    ("workflow lock rebound exact one link", "rebound_metadata.nlink() != 1", 1),
+    ("persistent file allowed exact links", "!links.contains(&metadata.nlink())", 1),
     ("bounded intended inventory", "validate_staging_inventory(bundle, state.limits)", 1),
     ("bounded recovery inventory", "validate_recovery_inventory(&record.operation, state.limits)", 1),
     ("existing root validation before children", "let existing_names = validate_existing_state_layout(&root)?;", 1),
@@ -1764,6 +1779,18 @@ for label, predicate in semantic_mutations:
         print(f"publisher scanner accepted bypassed comparison: {label}", file=sys.stderr)
         sys.exit(1)
 
+ext4_only_directory_mutation = local.replace(
+    "observed == 1 || observed == conventional",
+    "observed == conventional",
+    1,
+)
+if ext4_only_directory_mutation == local:
+    print("publisher portable-directory mutation could not be applied", file=sys.stderr)
+    sys.exit(1)
+if not publisher_errors(ext4_only_directory_mutation, lib, main, manifest, tests):
+    print("publisher scanner accepted ext4-only persistent directory links", file=sys.stderr)
+    sys.exit(1)
+
 initialization_order_mutation = local.replace(
     "    if existed {\n        let existing_names = validate_existing_state_layout(&root)?;",
     '    ensure_state_child(&root, "objects")?;\n    if existed {\n        let existing_names = validate_existing_state_layout(&root)?;',
@@ -1836,6 +1863,11 @@ policies = [
     ("ELF program-header bound", "program_count > MAX_ELF_PROGRAM_HEADERS", 1),
     ("ELF load segment required", "if !has_load || !has_executable_load", 1),
     ("config directory exact mode", "metadata.permissions().mode() & 0o7777 == 0o700", 1),
+    ("portable broker-private directory links", "fn directory_nlink_matches(observed: u64, conventional: u64) -> bool {\n    observed == 1 || observed == conventional\n}", 1),
+    ("portable fresh broker directory check", "!directory_nlink_matches(metadata.nlink(), 2)", 1),
+    ("broker regular metadata exact one link", "metadata.nlink() == 1", 4),
+    ("settlement regular stat exact one link", "stat.st_nlink == 1", 1),
+    ("regular file rebound link identity", "left.links == right.links", 1),
     ("immediate config directory rebind", "rebind_directory(&config.config_directory)?;", 1),
     ("clear child environment", "command.env_clear();", 1),
     ("single hard child deadline", "let deadline = Instant::now() + CHILD_TIMEOUT;", 1),
@@ -2170,6 +2202,7 @@ for label, old, new in [
     ("ELF-only admission", "validate_elf_executable(&executable_file, executable_identity.size)?;", "/* validate_elf_executable retained but bypassed */"),
     ("named execution fallback", "let executable_path = OsString::from(format!(", "let executable_path = config.executable.path.as_os_str().to_owned(); let _retained = OsString::from(format!("),
     ("fresh output no-clobber", "libc::O_EXCL", "0 /* O_EXCL */"),
+    ("portable broker directory links", "observed == 1 || observed == conventional", "observed == conventional"),
 ]:
     mutation = broker.replace(old, new, 1)
     if mutation == broker or not broker_errors(mutation):

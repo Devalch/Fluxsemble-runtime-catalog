@@ -1864,7 +1864,7 @@ fn create_private_directory(
     ));
     let file = open_absolute_no_links(&path, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC)?;
     let metadata = file.metadata().map_err(|_| rejected())?;
-    if !secure_private_directory(&metadata) || metadata.nlink() != 2 {
+    if !secure_private_directory(&metadata) || !directory_nlink_matches(metadata.nlink(), 2) {
         let _ = fs::remove_dir(&path);
         return Err(rejected());
     }
@@ -2677,6 +2677,10 @@ fn secure_executable(metadata: &fs::Metadata) -> bool {
         && metadata.len() <= MAX_EXECUTABLE_BYTES
 }
 
+fn directory_nlink_matches(observed: u64, conventional: u64) -> bool {
+    observed == 1 || observed == conventional
+}
+
 fn secure_private_directory(metadata: &fs::Metadata) -> bool {
     metadata.is_dir()
         && !metadata.file_type().is_symlink()
@@ -3163,4 +3167,17 @@ pub(crate) fn run_process() -> Result<(), BrokerError> {
 pub(crate) fn fail_process() -> ! {
     let _ = std::io::stderr().write_all(FAILURE_LINE);
     std::process::exit(1)
+}
+
+#[cfg(test)]
+mod directory_nlink_tests {
+    use super::directory_nlink_matches;
+
+    #[test]
+    fn broker_private_directory_link_count_accepts_portable_and_conventional_values_only() {
+        assert!(directory_nlink_matches(1, 2));
+        assert!(directory_nlink_matches(2, 2));
+        assert!(!directory_nlink_matches(0, 2));
+        assert!(!directory_nlink_matches(3, 2));
+    }
 }

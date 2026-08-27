@@ -960,19 +960,19 @@ impl StateCapabilities {
         if !same_directory_policy_facts(&root, &rebound_root_metadata)
             || FileIdentity::from_metadata(&rebound_root_metadata) != self.root_identity
             || !secure_directory(&root)
-            || root.nlink() != 4
+            || !directory_nlink_matches(root.nlink(), 4)
             || FileIdentity::from_metadata(&root) != self.root_identity
             || enumerate_names(&self.root, STATE_ROOT_ENUMERATION_LIMITS)?
                 != BTreeSet::from(["latest".to_owned(), "objects".to_owned()])
             || !same_directory_policy_facts(&objects, &rebound_objects_metadata)
             || FileIdentity::from_metadata(&rebound_objects_metadata) != self.objects_identity
             || !secure_directory(&objects)
-            || objects.nlink() != 2
+            || !directory_nlink_matches(objects.nlink(), 2)
             || FileIdentity::from_metadata(&objects) != self.objects_identity
             || !same_directory_policy_facts(&latest, &rebound_latest_metadata)
             || FileIdentity::from_metadata(&rebound_latest_metadata) != self.latest_identity
             || !secure_directory(&latest)
-            || latest.nlink() != 2
+            || !directory_nlink_matches(latest.nlink(), 2)
             || FileIdentity::from_metadata(&latest) != self.latest_identity
         {
             return Err(rejected());
@@ -3017,7 +3017,7 @@ fn validate_existing_state_layout(root: &fs::File) -> Result<BTreeSet<String>, P
     for name in &names {
         validate_state_child(root, name)?;
     }
-    if root_metadata.nlink() != 2 + names.len() as u64 {
+    if !directory_nlink_matches(root_metadata.nlink(), 2 + names.len() as u64) {
         return Err(rejected());
     }
     Ok(names)
@@ -3030,7 +3030,7 @@ fn state_from_root(
     limits: PersistentStateLimits,
 ) -> Result<StateCapabilities, PublishError> {
     let root_metadata = root.metadata().map_err(|_| rejected())?;
-    if !secure_directory(&root_metadata) || root_metadata.nlink() != 4 {
+    if !secure_directory(&root_metadata) || !directory_nlink_matches(root_metadata.nlink(), 4) {
         return Err(rejected());
     }
     if enumerate_names(&root, STATE_ROOT_ENUMERATION_LIMITS)?
@@ -3043,9 +3043,9 @@ fn state_from_root(
     let objects_metadata = objects.metadata().map_err(|_| rejected())?;
     let latest_metadata = latest.metadata().map_err(|_| rejected())?;
     if !secure_directory(&objects_metadata)
-        || objects_metadata.nlink() != 2
+        || !directory_nlink_matches(objects_metadata.nlink(), 2)
         || !secure_directory(&latest_metadata)
-        || latest_metadata.nlink() != 2
+        || !directory_nlink_matches(latest_metadata.nlink(), 2)
     {
         return Err(rejected());
     }
@@ -3079,7 +3079,7 @@ fn ensure_state_child(root: &fs::File, name: &str) -> Result<(), PublishError> {
 fn validate_state_child(root: &fs::File, name: &str) -> Result<(), PublishError> {
     let child = open_directory_at(root, name)?;
     let metadata = child.metadata().map_err(|_| rejected())?;
-    if !secure_directory(&metadata) || metadata.nlink() != 2 {
+    if !secure_directory(&metadata) || !directory_nlink_matches(metadata.nlink(), 2) {
         return Err(rejected());
     }
     Ok(())
@@ -3652,6 +3652,10 @@ fn unlink_name(parent: &fs::File, name: &str) -> Result<(), PublishError> {
     Ok(())
 }
 
+fn directory_nlink_matches(observed: u64, conventional: u64) -> bool {
+    observed == 1 || observed == conventional
+}
+
 fn secure_directory(metadata: &fs::Metadata) -> bool {
     metadata.is_dir()
         && !metadata.file_type().is_symlink()
@@ -3724,12 +3728,20 @@ fn encode_hex(bytes: &[u8; 32]) -> String {
 
 #[cfg(test)]
 mod persistent_arithmetic_tests {
-    use super::{bounded_add, rejected};
+    use super::{bounded_add, directory_nlink_matches, rejected};
 
     #[test]
     fn persistent_budget_checked_arithmetic_rejects_overflow_and_limit_crossing() {
         assert_eq!(bounded_add(u64::MAX, 1, u64::MAX), Err(rejected()));
         assert_eq!(bounded_add(2, 1, 2), Err(rejected()));
         assert_eq!(bounded_add(1, 1, 2), Ok(2));
+    }
+
+    #[test]
+    fn persistent_directory_link_count_accepts_portable_and_conventional_values_only() {
+        assert!(directory_nlink_matches(1, 4));
+        assert!(directory_nlink_matches(4, 4));
+        assert!(!directory_nlink_matches(0, 4));
+        assert!(!directory_nlink_matches(3, 4));
     }
 }
