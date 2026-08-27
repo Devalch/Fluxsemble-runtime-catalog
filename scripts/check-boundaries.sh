@@ -1778,3 +1778,191 @@ if not publisher_errors(local, lib, recover_mutation, manifest, tests):
     print("publisher scanner accepted a recover candidate argument", file=sys.stderr)
     sys.exit(1)
 PY
+
+python3 - <<'PY'
+from pathlib import Path
+import re
+import sys
+
+broker = Path("crates/catalog-publish/src/broker.rs").read_text(encoding="utf-8")
+binary = Path("crates/catalog-publish/src/bin/catalog-gh-broker.rs").read_text(encoding="utf-8")
+lib = Path("crates/catalog-publish/src/lib.rs").read_text(encoding="utf-8")
+local = Path("crates/catalog-publish/src/local.rs").read_text(encoding="utf-8")
+main = Path("crates/catalog-publish/src/main.rs").read_text(encoding="utf-8")
+tests = Path("crates/catalog-publish/tests/broker_boundary.rs").read_text(encoding="utf-8")
+
+# These strings name the executable predicates at the broker authority seam. Exact counts make
+# one-at-a-time removals fail even when neighboring identifiers and explanatory text remain.
+policies = [
+    ("exact seven request kinds", '"create_tag",\n            "read_tag",\n            "create_draft",\n            "read_draft",\n            "upload_asset",\n            "download_asset",\n            "publish_draft",', 1),
+    ("request validation before config authority", "request.validate()?;\n    let config = read_config", 1),
+    ("canonical request/config bytes", "serde_jcs::to_vec(&strict.0).map_err(|_| rejected())? != bytes", 1),
+    ("duplicate JSON member rejection", "if values.contains_key(&key)", 1),
+    ("JSON depth and node bounds", "if depth > MAX_JSON_DEPTH || *nodes > MAX_JSON_NODES", 1),
+    ("JSON collection bounds", "if values.len() > MAX_COLLECTION_MEMBERS", 2),
+    ("strict config schema", '#[serde(deny_unknown_fields)]\npub struct PublisherBrokerConfigV1', 1),
+    ("config exact owner-private mode", "metadata.permissions().mode() & 0o7777 == 0o600", 1),
+    ("root/current executable owner", "metadata.uid() == 0 || metadata.uid() == current_euid()", 1),
+    ("executable nonwritable policy", "mode & 0o022 == 0", 1),
+    ("executable execute policy", "mode & 0o111 != 0", 1),
+    ("executable full SHA-256 recheck", "hash_descriptor(&executable.file, executable.identity.size)? != executable.sha256", 1),
+    ("immediate executable rebind", "rebind_executable(&config.executable)?;", 1),
+    ("config directory exact mode", "metadata.permissions().mode() & 0o7777 == 0o700", 1),
+    ("immediate config directory rebind", "rebind_directory(&config.config_directory)?;", 1),
+    ("clear child environment", "command.env_clear();", 1),
+    ("hard child deadline", "Instant::now() + CHILD_TIMEOUT", 1),
+    ("child process-group kill", "libc::kill(-pid, libc::SIGKILL)", 1),
+    ("child reap", "let _ = child.wait();", 1),
+    ("bounded stdout drain", "spawn_bounded_reader(stdout, MAX_RESPONSE_BYTES", 1),
+    ("bounded stderr drain", "spawn_bounded_reader(stderr, MAX_CHILD_STDERR_BYTES", 1),
+    ("single exact launch call", "let mut command = Command::new(executable_path);", 1),
+    ("fixed REST accept header", '"Accept: application/vnd.github+json"', 1),
+    ("fixed REST version header", '"X-GitHub-Api-Version: 2022-11-28"', 1),
+    ("retained executable proc capability", 'format!(\n            "/proc/self/fd/{}",\n            config.executable.file.as_raw_fd()', 1),
+    ("retained config directory inheritance", "InheritedFd::new(&config.config_directory.file)?", 1),
+    ("retained upload inheritance", "InheritedFd::new(&capability.file)", 1),
+    ("upload exact read-only mode", "metadata.permissions().mode() & 0o7777 == 0o400", 1),
+    ("download no-clobber create", "libc::O_EXCL", 1),
+    ("download fsync before and after mode settlement", "self.file.sync_all().map_err(|_| rejected())?;", 2),
+    ("download descriptor/name hash readback", "hash_descriptor(&rebound, final_identity.size)? != digest", 1),
+    ("download exact-node failure cleanup", "if !same_file_node(Identity::from_metadata(&rebound_metadata), self.identity)", 1),
+    ("fixed failure output", 'const FAILURE_LINE: &[u8] = b"github broker failed\\n";', 1),
+    ("explicit child response projection", "project_child_response(request, &stdout, upload.take())?", 1),
+]
+
+validator_calls = [
+    ("schema-version validation", "valid_schema(*schema_version)?;", 10),
+    ("repository validation", "valid_repository(repository)?;", 6),
+    ("tag validation", "valid_tag(tag)?;", 4),
+    ("commit validation", "valid_sha1(commit_sha)", 2),
+    ("target commit validation", "valid_sha1(target_commitish)?;", 2),
+    ("title validation", "valid_title(title)?;", 1),
+    ("notes validation", "valid_notes(notes)", 1),
+    ("release ID validation", "valid_decimal_id(release_id)?;", 2),
+    ("asset ID validation", "valid_decimal_id(asset_id)?;", 1),
+    ("asset name validation", "valid_asset_name(name)?;", 2),
+    ("upload path validation", "valid_path_text(input_path)", 1),
+    ("download path validation", "valid_path_text(output_path)", 1),
+]
+
+validator_predicates = [
+    ("repository one-slash grammar", "repository.matches('/').count() != 1", 1),
+    ("owner bounded grammar", "owner.len() > 39", 1),
+    ("repository-name bounded grammar", "name.len() > 100", 1),
+    ("production tag prefix", '.strip_prefix("catalog-v1-sequence-")', 1),
+    ("transport tag", 'tag == "transport-v1"', 1),
+    ("full lowercase SHA-1", "value.len() != 40", 1),
+    ("bounded canonical decimal ID", "value.len() > 19", 1),
+    ("safe asset component grammar", "value.contains(\"..\")", 1),
+    ("bounded title", "value.len() > 256", 1),
+    ("bounded notes", "value.len() > 16 * 1024", 1),
+    ("absolute lexical asset path", "if !path.is_absolute()", 1),
+]
+
+
+def broker_errors(source, binary_source=binary, lib_source=lib, local_source=local, main_source=main, test_source=tests):
+    errors = []
+    for label, snippet, expected in policies + validator_calls + validator_predicates:
+        actual = source.count(snippet)
+        if actual != expected:
+            errors.append(f"missing exact broker policy {label}: expected {expected}, got {actual}")
+
+    request_enum = source.split("pub enum BrokerRequestV1 {", 1)[-1].split("impl BrokerRequestV1", 1)[0]
+    variants = re.findall(r"^    ([A-Z][A-Za-z]+) \{", request_enum, re.MULTILINE)
+    if variants != [
+        "CreateTag", "ReadTag", "CreateDraft", "ReadDraft", "UploadAsset",
+        "DownloadAsset", "PublishDraft",
+    ]:
+        errors.append(f"broker request variants changed: {variants}")
+    for forbidden in [
+        "method:", "endpoint:", "host:", "headers:", "gh_args:", "query:",
+        "template:", "jq:", "graphql:", "token:", "environment:", "git_command:",
+    ]:
+        if forbidden in request_enum:
+            errors.append(f"broker request gained arbitrary authority field: {forbidden}")
+
+    config_decl = source.split("pub struct PublisherBrokerConfigV1", 1)[-1].split("}", 1)[0]
+    config_fields = re.findall(r"pub ([a-z0-9_]+):", config_decl)
+    if config_fields != ["schema_version", "gh_path", "gh_sha256", "github_config_dir"]:
+        errors.append(f"broker config fields changed: {config_fields}")
+    for forbidden in ["token", "credential", "header", "host_override", "home"]:
+        if forbidden in config_decl.lower():
+            errors.append(f"broker config gained secret/discovery field: {forbidden}")
+
+    environment_names = re.findall(r'command\.env\(\s*"([A-Z_]+)"', source)
+    if environment_names != ["HOME", "GH_CONFIG_DIR", "LANG", "LC_ALL", "TZ"]:
+        errors.append(f"broker environment allowlist changed: {environment_names}")
+    command_sources = {
+        "crates/catalog-publish/src/broker.rs": source,
+        "crates/catalog-publish/src/bin/catalog-gh-broker.rs": binary_source,
+        "crates/catalog-publish/src/lib.rs": lib_source,
+        "crates/catalog-publish/src/local.rs": local_source,
+        "crates/catalog-publish/src/main.rs": main_source,
+    }
+    for name, candidate in command_sources.items():
+        count = candidate.count("Command::new(")
+        if name == "crates/catalog-publish/src/broker.rs":
+            if count != 1:
+                errors.append(f"broker launch call count changed: {count}")
+        elif count:
+            errors.append(f"process launch escaped broker implementation: {name}")
+    for forbidden in [
+        "/bin/sh", "sh -c", "gh auth", "auth token", "api graphql", "--jq",
+        "--template", "--hostname", "reqwest::", "ureq::", "curl::", "std::net::",
+        "TcpStream", "UdpSocket", "println!(child", "eprintln!(child",
+    ]:
+        if forbidden in source:
+            errors.append(f"broker gained forbidden command/network/raw-output seam: {forbidden}")
+    for required in [
+        '"POST",\n            format!("/repos/{repository}/git/refs")',
+        '"GET",\n            format!("/repos/{repository}/git/ref/tags/{tag}")',
+        '"POST",\n            format!("/repos/{repository}/releases")',
+        '"GET",\n            format!("/repos/{repository}/releases/tags/{tag}")',
+        '"Content-Type: application/octet-stream"',
+        '"Accept: application/octet-stream"',
+        '"PATCH",\n            format!("/repos/{repository}/releases/{release_id}")',
+    ]:
+        if required not in source:
+            errors.append(f"fixed gh api matrix lost route/method/header: {required.splitlines()[0]}")
+    for required in [
+        "ambient-gh-token-canary", "ambient-github-token-canary", "ambient-proxy-canary",
+        "ambient-agent-canary", "raw-token-canary", "CONFIG_CANARY", "FloodStdout",
+        "FloodStderr", "Deadlock", "Timeout", "Signal", "InvalidUtf8", "download-no-clobber",
+        "replace-after-hash", "replace-before-spawn", "repeated_and_concurrent_requests",
+    ]:
+        if required not in test_source:
+            errors.append(f"broker adversarial evidence missing: {required}")
+    return errors
+
+
+errors = broker_errors(broker)
+if errors:
+    print(errors[0], file=sys.stderr)
+    sys.exit(1)
+
+# Remove every occurrence independently where a policy has multiple enforcement call sites.
+for label, snippet, expected in policies + validator_calls + validator_predicates:
+    for occurrence in range(expected):
+        start = -1
+        for _ in range(occurrence + 1):
+            start = broker.find(snippet, start + 1)
+        if start < 0:
+            print(f"broker mutation could not be applied: {label} occurrence {occurrence}", file=sys.stderr)
+            sys.exit(1)
+        mutation = broker[:start] + f"REMOVED_BROKER_POLICY_{label}" + broker[start + len(snippet):]
+        if not broker_errors(mutation):
+            print(f"broker scanner accepted removed enforcement: {label} occurrence {occurrence}", file=sys.stderr)
+            sys.exit(1)
+
+for label, old, new in [
+    ("executable hash bypass", "hash_descriptor(&executable.file, executable.identity.size)? != executable.sha256", "false /* hash_descriptor executable sha256 */"),
+    ("download hash bypass", "hash_descriptor(&rebound, final_identity.size)? != digest", "false /* hash_descriptor rebound digest */"),
+    ("request authority ordering", "request.validate()?;\n    let config = read_config", "let config = read_config /* request.validate moved after authority */"),
+    ("child environment clear", "command.env_clear();", "/* command env_clear removed */"),
+    ("fresh output no-clobber", "libc::O_EXCL", "0 /* O_EXCL */"),
+]:
+    mutation = broker.replace(old, new, 1)
+    if mutation == broker or not broker_errors(mutation):
+        print(f"broker scanner accepted semantic bypass: {label}", file=sys.stderr)
+        sys.exit(1)
+PY

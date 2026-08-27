@@ -23,3 +23,7 @@ path = "src/lib.rs"
 [[bin]]
 name = "catalog-publish"
 path = "src/main.rs"
+
+[[bin]]
+name = "catalog-gh-broker"
+path = "src/bin/catalog-gh-broker.rs"
