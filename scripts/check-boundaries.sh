@@ -1265,6 +1265,16 @@ def round2_errors(source):
         errors.append("inner recovery mode predicate call/definition count changed")
     if source["signing"].count("self.parent.sync_all().is_err()") != 2:
         errors.append("both signed-output parent fsync uncertainty checks are not enforced")
+    absent_binding_before_stage_bind = """let Some(mut file) = open_recovery_binding(parent, true)? else {
+        return Err(output_rejected());
+    };"""
+    absent_binding_before_stage_cleanup = """let Some(file) = open_recovery_binding(parent, false)? else {
+        return Err(output_rejected());
+    };"""
+    if source["signing"].count(absent_binding_before_stage_bind) != 1:
+        errors.append("absent recovery binding before stage bind is not rejected")
+    if source["signing"].count(absent_binding_before_stage_cleanup) != 1:
+        errors.append("absent recovery binding before stage cleanup is not rejected")
     recover_region = source["signing"].split("fn recover_signed_output(", 1)[-1].split("fn catalog_payload_for_intent(", 1)[0]
     if recover_region.find("verify_signed_bytes(&signed, verification_policy)?;") > recover_region.find("settle_bound_empty_staging(parent_path)?;"):
         errors.append("recovery cleanup occurs before complete public output verification")
@@ -1303,6 +1313,16 @@ mutations = [
     ("signing", "self.parent.sync_all().is_err()", "false", "first/final fsync uncertainty"),
     ("signing", "container_metadata.nlink() != 2", "false", "exact empty cleanup identity"),
     ("signing", "if !secure_directory(&container_metadata)\n            || container_metadata.nlink() != 2\n            || !enumerate_names(&self.container)", "if !secure_directory(&container_metadata)\n            || container_metadata.nlink() != 2\n            || !removed_container_enumeration()", "nonempty cleanup rejection"),
+    ("signing", """let Some(mut file) = open_recovery_binding(parent, true)? else {
+        return Err(output_rejected());
+    };""", """let Some(mut file) = open_recovery_binding(parent, true)? else {
+        return Ok(());
+    };""", "absent binding before stage bind rejection"),
+    ("signing", """let Some(file) = open_recovery_binding(parent, false)? else {
+        return Err(output_rejected());
+    };""", """let Some(file) = open_recovery_binding(parent, false)? else {
+        return Ok(());
+    };""", "absent binding before stage cleanup rejection"),
     ("signing", "fn recover_signed_output(", "fn removed_public_recovery(", "exact public recovery"),
     ("signing", "verify_signed_bytes(&signed, verification_policy)?;", "", "recovery public verification"),
     ("signing", "settle_bound_empty_staging(parent_path)?;", "", "output-before-bound-stage cleanup"),

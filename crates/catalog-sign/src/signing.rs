@@ -2508,7 +2508,7 @@ fn bind_recovery_stage(
     directory: &fs::File,
 ) -> Result<(), SignError> {
     let Some(mut file) = open_recovery_binding(parent, true)? else {
-        return Ok(());
+        return Err(output_rejected());
     };
     let metadata = file.metadata().map_err(|_| output_rejected())?;
     if !secure_recovery_binding(&metadata, 0o600) {
@@ -2543,7 +2543,7 @@ fn authorize_bound_stage_cleanup(
     directory: &fs::File,
 ) -> Result<(), SignError> {
     let Some(file) = open_recovery_binding(parent, false)? else {
-        return Ok(());
+        return Err(output_rejected());
     };
     let (_, binding) = parse_recovery_binding(&file)?;
     let binding = binding.ok_or_else(output_rejected)?;
@@ -3926,6 +3926,7 @@ mod tests {
         assert_eq!(signed.manifest.tag().as_str(), "catalog-v1-sequence-1");
 
         let output = fixture.root.path.join("signed-output");
+        write_test_recovery_binding(&fixture.root.path);
         let result = write_signed_output(
             OutputPreflight::new(&output).unwrap(),
             signed,
@@ -3941,6 +3942,69 @@ mod tests {
             OutputPreflight::new(&output).is_err(),
             "no-clobber output was reusable"
         );
+    }
+
+    #[test]
+    fn missing_binding_before_stage_binding_rejects_without_visibility_and_retains_evidence() {
+        let fixture = CandidateFixture::new();
+        let bundle = verify_transferred_bundle(&fixture.final_bundle).unwrap();
+        let candidate = finalize_candidate_after_admission_for_test(
+            &bundle,
+            &fixture.source,
+            &fixture.qualification,
+        )
+        .unwrap();
+        let key = fixture_signing_key_for_test();
+        let signed = sign_candidate(&candidate, key.as_dalek(), "catalog-test-key-v1").unwrap();
+        drop(key);
+        let output = fixture.root.path.join("missing-binding-output");
+
+        assert_eq!(
+            write_signed_output(
+                OutputPreflight::new(&output).unwrap(),
+                signed,
+                SignatureVerificationPolicy::Fixture,
+            )
+            .unwrap_err(),
+            SignError::OutputRejected
+        );
+        assert!(!output.exists(), "payload became visible without a binding");
+        assert!(
+            !fixture.root.path.join(TRANSFER_MANIFEST_NAME).exists(),
+            "reverse manifest became visible without a binding"
+        );
+        let retained_stages = fs::read_dir(&fixture.root.path)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".catalog-sign-stage-")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(retained_stages.len(), 1);
+        assert!(retained_stages[0].join("payload").is_dir());
+    }
+
+    #[test]
+    fn missing_binding_before_cleanup_rejects_without_unlinking_stage() {
+        let fixture = CandidateFixture::new();
+        let output_path = fixture.root.path.join("missing-cleanup-binding-output");
+        write_test_recovery_binding(&fixture.root.path);
+        let mut output = StagedOutput::create(OutputPreflight::new(&output_path).unwrap()).unwrap();
+        let stage = fixture
+            .root
+            .path
+            .join(output.container_name.to_str().unwrap());
+        output.publish().unwrap();
+        fs::remove_file(fixture.root.path.join(RECOVERY_BINDING_NAME)).unwrap();
+
+        assert_eq!(
+            output.settle_verified_staging().unwrap_err(),
+            SignError::OutputRejected
+        );
+        assert!(stage.exists(), "unbound stage was unlinked");
     }
 
     #[test]
@@ -4079,7 +4143,9 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::File::open(&path).unwrap().sync_all().unwrap();
+        fs::File::open(parent).unwrap().sync_all().unwrap();
     }
 
     fn recovery_stage_name(parent: &Path) -> String {
