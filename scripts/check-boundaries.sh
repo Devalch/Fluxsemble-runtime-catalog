@@ -1485,7 +1485,7 @@ policies = [
     ("reverse exact kind", 'manifest.kind != "signer_output"', 1),
     ("reverse input digest", "attestation.input_transfer_sha256 != input_transfer_sha256", 1),
     ("reverse strict sorted paths", "pair[0].relative_path >= pair[1].relative_path", 1),
-    ("reverse exact file mode", 'entry.mode != "0400"', 1),
+    ("reverse exact file mode", 'entry.mode != "0400"', 2),
     ("reverse exact entry count/no-extra", "expected_names != bundle_names || expected_names.len() != manifest.entries.len()", 1),
     ("reverse individual size bound", "entry.size > MAX_ENTRY_BYTES", 1),
     ("reverse total size bound", "if total > MAX_TRANSFER_BYTES", 1),
@@ -1502,8 +1502,8 @@ policies = [
     ("retained bundle identity", "FileIdentity::from_metadata(&bundle_metadata) != self.bundle_identity", 1),
     ("retained named file identity", "FileIdentity::from_metadata(&rebound_metadata) != retained.identity", 1),
     ("retained all-file revalidation", "bundle.reverify_all().map_err(|_| prior_preserved())?;", 2),
-    ("production catalog signature", "verify_signed_catalog(&catalog_bytes).map_err(|_| rejected())?", 1),
-    ("production release signature", "verify_signed_release_bundle_manifest(&release_bytes)", 1),
+    ("production catalog signature", "VerificationPolicy::Production => verify_signed_catalog(bytes).map_err(|_| rejected())", 1),
+    ("production release signature", "verify_signed_release_bundle_manifest(bytes).map_err(|_| rejected())", 1),
     ("signed release inventory", "verify_signed_release_inventory(&inventory, &release_manifest)", 1),
     ("exact release file set", "files.keys().cloned().collect::<BTreeSet<_>>() != expected_names", 1),
     ("catalog envelope binding", "manifest.catalog_envelope().sha256().as_str() != catalog.sha256", 1),
@@ -1524,24 +1524,62 @@ policies = [
     ("persistent checked arithmetic", "current.checked_add(amount).ok_or_else(rejected)?", 1),
     ("persistent arithmetic maximum", "if next > maximum", 1),
     ("bounded intended inventory", "validate_staging_inventory(bundle, state.limits)", 1),
-    ("bounded recovery inventory", "validate_recovery_inventory(&record, state.limits)", 1),
+    ("bounded recovery inventory", "validate_recovery_inventory(&record.operation, state.limits)", 1),
     ("existing root validation before children", "let existing_names = validate_existing_state_layout(&root)?;", 1),
     ("record before latest", "let transaction = install_recovery_record(&state, &record_bytes)", 1),
     ("exact gated prior", "if gated != prior_bytes", 1),
     ("atomic latest rename", "libc::SYS_renameat2,", 1),
     ("no-replace absent latest", "libc::RENAME_NOREPLACE", 1),
     ("latest exact readback", "readback.as_deref() != Some(intended_bytes.as_slice())", 1),
-    ("latest parent fsync", "state.latest.sync_all().map_err(|_| uncertain())?;", 2),
-    ("recovery relation before cleanup", "verify_recovery_relation(&state, &record, &intended_bytes)", 1),
+    ("latest parent fsync", "state.latest.sync_all().map_err(|_| uncertain())?;", 3),
+    ("recovery relation before cleanup", "verify_recovery_relation(&state, &record, &intended_bytes, bundle.policy)", 1),
     ("transaction lock", "libc::LOCK_EX | libc::LOCK_NB", 1),
-    ("exact recovery commit", "current.as_deref() == Some(intended_bytes.as_slice())", 1),
+    ("exact recovery commit", "current.as_deref() == Some(intended_bytes.as_slice())", 2),
     ("exact recovery abort", "current == prior_bytes", 1),
     ("staged before-success revalidation", "revalidate_before_staged_success(&state)", 2),
-    ("recovered before-success revalidation", "revalidate_before_recovered_success(&state)", 2),
-    ("uncertain no guessing", "return Err(uncertain());", 16),
+    ("recovered before-success revalidation", "revalidate_before_recovered_success(&state)", 3),
+    ("uncertain no guessing", "return Err(uncertain());", 14),
     ("previsibility prior preserved", "return Err(prior_preserved());", 6),
-    ("record visibility recovery required", "return Err(recovery_required());", 10),
+    ("record visibility recovery required", "return Err(recovery_required());", 14),
     ("uncertainty record retention", "FaultPoint::AfterLatestDirectorySync", 1),
+    ("latest temp unnamed preparation", "let latest_temporary = open_latest_temporary(&state)", 1),
+    ("latest temp durable link and readback", "link_latest_temporary(&state, &latest_temporary, &intended_bytes)", 1),
+    ("latest temp durability checkpoint", "if fault_at(&plan, Checkpoint::AfterLatestTempDurable)", 1),
+    ("external SIGKILL blocking seam", "crash_pause_after_latest_temp(&plan)?;", 1),
+    ("latest temp current-owner one-link mode", "if !secure_file(&metadata)\n        || FileIdentity::from_metadata(&metadata) != operation.latest_temporary_identity", 1),
+    ("latest temp exact intended bytes", "read_descriptor(&file, metadata.len())? != intended_bytes", 1),
+    ("latest temp exact intended hash", "hash_descriptor(&file, metadata.len())? != sha256(intended_bytes)", 1),
+    ("latest temp descriptor/name rebound", "FileIdentity::from_metadata(&rebound_metadata) != operation.latest_temporary_identity\n        || FileIdentity::from_metadata(&rebound_metadata) != FileIdentity::from_metadata(&metadata)", 1),
+    ("latest temp exact bound unlink", "unlink_bound_latest_temporary(", 2),
+    ("exact prior before and after temp cleanup", "verify_exact_prior(&state, &record, &prior_bytes, policy)?;", 3),
+    ("exact current prior relation", "current != *prior_bytes", 1),
+    ("unexpected temp alongside intended", "if current.as_deref() == Some(intended_bytes.as_slice()) {\n            return Err(recovery_required());", 1),
+    ("complete operation canonical digest", "let canonical = serde_jcs::to_vec(operation).map_err(|_| rejected())?;", 1),
+    ("complete operation domain separation", "hasher.update(OPERATION_DOMAIN);", 1),
+    ("complete operation digest recomputation on read", "operation_id(&record.operation).map_err(|_| uncertain())? != record.operation_id", 1),
+    ("record/intended complete operation equality", "record.operation != record.intended_reference.operation", 1),
+    ("exact prior reference digest binding", "record.operation.prior_reference_sha256 != prior_bytes.as_deref().map(sha256)", 1),
+    ("complete exact object inventory", "if expected_objects != operation.objects", 1),
+    ("recovery retained all referenced objects", "let mut retained = verify_record_objects(state, operation)?;", 1),
+    ("recovery reverse manifest object digest", "sha256(&reverse_bytes) != operation.reverse_transfer_manifest.sha256", 1),
+    ("recovery reverse input binding", "manifest.input_transfer_sha256 != operation.input_transfer_sha256", 1),
+    ("recovery isolation original binding", "manifest.isolation_attestation.original_operation_mode\n            != operation.isolation_original_mode", 1),
+    ("recovery isolation completion binding", "manifest.isolation_attestation.mode != operation.isolation_completion_mode", 1),
+    ("recovery reverse no-extra inventory", "manifest.entries.len() != retained.len()", 1),
+    ("recovery release inventory", "verify_signed_release_inventory(&inventory, release_manifest)", 1),
+    ("recovery signed checksums and assets", "verify_release_bindings(&retained, release_manifest, &checksums_bytes)?;", 1),
+    ("recovery catalog payload digest", "encode_hex(catalog.payload_sha256()) != operation.catalog_payload_sha256", 1),
+    ("recovery catalog sequence", "catalog.payload().sequence().get() != operation.catalog_sequence", 1),
+    ("recovery catalog provider target release", "catalog_release_bindings(catalog.payload())? != operation.catalog_releases", 1),
+    ("recovery release tag", "release_manifest.tag().as_str() != operation.release_tag", 1),
+    ("recovery source commit", "release_manifest.source_commit().as_str() != operation.source_commit", 1),
+    ("recovery source tree", "release_manifest.source_tree_sha256().as_str() != operation.source_tree_sha256", 1),
+    ("recovery qualification", "release_manifest.qualification_sha256().as_str() != operation.qualification_sha256", 1),
+    ("recovery exact support assets", "actual_support_assets != operation.support_assets", 1),
+    ("recovery retained object identity", "FileIdentity::from_metadata(&rebound_metadata) != file.identity", 1),
+    ("completed reference named identity", "FileIdentity::from_metadata(&metadata) != reference.operation.latest_temporary_identity", 1),
+    ("completed reference exact bytes", "read_descriptor(&file, metadata.len())? != expected", 1),
+    ("completed no-marker signed verification", "verify_local_reference(state, &reference, policy).map_err(|_| uncertain())?;", 1),
 ]
 
 
@@ -1556,6 +1594,68 @@ def publisher_errors(local_source, lib_source, main_source, manifest_source, tes
     first_child_mkdir = prepare_state.find('ensure_state_child(&root, "objects")?;')
     if validation < 0 or first_child_mkdir < 0 or validation > first_child_mkdir:
         errors.append("pre-existing state validation no longer precedes fixed-child mkdir")
+    stage_region = local_source.split("fn stage_local_inner(", 1)[-1].split("fn revalidate_before_staged_success", 1)[0]
+    stage_order = [
+        "install_recovery_record(&state, &record_bytes)",
+        "link_latest_temporary(&state, &latest_temporary, &intended_bytes)",
+        "Checkpoint::AfterLatestTempDurable",
+        "crash_pause_after_latest_temp(&plan)?;",
+        "rename_latest_temporary(&state, &latest_temporary, &intended_bytes, prior.is_some())",
+        "readback.as_deref() != Some(intended_bytes.as_slice())",
+        "state.latest.sync_all().map_err(|_| uncertain())?;",
+        "verify_recovery_relation(&state, &record, &intended_bytes, bundle.policy)",
+        "cleanup_recovery_record(&state, &transaction)",
+    ]
+    stage_positions = [stage_region.find(item) for item in stage_order]
+    if any(position < 0 for position in stage_positions) or stage_positions != sorted(stage_positions):
+        errors.append("latest temp checkpoint/rename/readback/fsync/cleanup order changed")
+    recovery_region = local_source.split("fn recover_local_inner(", 1)[-1].split("fn revalidate_before_recovered_success", 1)[0]
+    temp_abort_region = recovery_region.split("if latest_temporary_exists {", 1)[-1].split("let outcome = if", 1)[0]
+    temp_abort_order = [
+        "verify_operation(&state, &record.operation, policy)",
+        "verify_exact_prior(&state, &record, &prior_bytes, policy)?;",
+        "unlink_bound_latest_temporary(",
+        "state.latest.sync_all().map_err(|_| uncertain())?;",
+        "verify_exact_prior(&state, &record, &prior_bytes, policy)?;",
+        "cleanup_recovery_record(&state, &transaction)",
+    ]
+    cursor = -1
+    for item in temp_abort_order:
+        cursor = temp_abort_region.find(item, cursor + 1)
+        if cursor < 0:
+            errors.append("temp abort verification/unlink/fsync/readback/record cleanup order changed")
+            break
+    mismatch = temp_abort_region.find("if current != prior_bytes")
+    first_destructive = temp_abort_region.find("unlink_bound_latest_temporary(")
+    if mismatch < 0 or first_destructive < 0 or mismatch > first_destructive:
+        errors.append("latest-temp mismatch can reach destructive cleanup")
+    cleanup_region = local_source.split("fn cleanup_recovery_record(", 1)[-1].split("fn parse_reference(", 1)[0]
+    cleanup_order = [
+        "unlink_name(&state.latest, RECOVERY_TEMP)?;",
+        "state.latest.sync_all().map_err(|_| rejected())?;",
+        "let marker = open_regular_at(&state.latest, RECOVERY_RECORD)?;",
+        "metadata.nlink() != 1",
+        "unlink_name(&state.latest, RECOVERY_RECORD)?;",
+        "state.latest.sync_all().map_err(|_| rejected())",
+    ]
+    cursor = -1
+    for item in cleanup_order:
+        cursor = cleanup_region.find(item, cursor + 1)
+        if cursor < 0:
+            errors.append("recovery temporary/record unlink, fsync, and readback order changed")
+            break
+    if "impl Drop for LatestTemporary" in local_source or "impl Drop for TransactionGuard" in local_source:
+        errors.append("transaction state gained destructive Drop cleanup")
+    for required in [
+        "stage_local_with_sigkill_checkpoint(",
+        "libc::kill(child.id() as i32, libc::SIGKILL)",
+        "status.signal(), Some(libc::SIGKILL)",
+        "run_sigkill_latest_temp_case(true)",
+        "run_sigkill_latest_temp_case(false)",
+        "exact durable pre-rename state",
+    ]:
+        if required not in test_source:
+            errors.append(f"external SIGKILL latest-temp test lost seam: {required}")
     production_sources = lib_source + "\n" + main_source + "\n" + local_source
     for forbidden in [
         "SigningKey", "DecodePrivateKey", "from_pkcs8", "PRIVATE KEY",
@@ -1606,6 +1706,41 @@ for label, snippet, _count in policies:
         sys.exit(1)
     if not publisher_errors(mutation, lib, main, manifest, tests):
         print(f"publisher scanner accepted removed enforcement: {label}", file=sys.stderr)
+        sys.exit(1)
+
+# These false-predicate mutations bypass the executable comparison while retaining all
+# neighboring identifiers/operators in a deliberately re-spaced comment. This prevents a broad
+# token search from satisfying the mutation and gives each recovery authority seam a diagnostic.
+semantic_mutations = [
+    ("latest temp exact bytes", "read_descriptor(&file, metadata.len())? != intended_bytes"),
+    ("latest temp exact hash", "hash_descriptor(&file, metadata.len())? != sha256(intended_bytes)"),
+    ("exact prior before cleanup", "current != *prior_bytes"),
+    ("unexpected temp alongside intended", "current.as_deref() == Some(intended_bytes.as_slice())"),
+    ("operation body digest recomputation", "operation_id(&record.operation).map_err(|_| uncertain())? != record.operation_id"),
+    ("complete immutable inventory", "expected_objects != operation.objects"),
+    ("reverse manifest digest", "sha256(&reverse_bytes) != operation.reverse_transfer_manifest.sha256"),
+    ("reverse input transfer", "manifest.input_transfer_sha256 != operation.input_transfer_sha256"),
+    ("isolation original mode", "manifest.isolation_attestation.original_operation_mode\n            != operation.isolation_original_mode"),
+    ("isolation completion mode", "manifest.isolation_attestation.mode != operation.isolation_completion_mode"),
+    ("catalog payload digest", "encode_hex(catalog.payload_sha256()) != operation.catalog_payload_sha256"),
+    ("catalog sequence", "catalog.payload().sequence().get() != operation.catalog_sequence"),
+    ("catalog provider target release", "catalog_release_bindings(catalog.payload())? != operation.catalog_releases"),
+    ("release tag", "release_manifest.tag().as_str() != operation.release_tag"),
+    ("source commit", "release_manifest.source_commit().as_str() != operation.source_commit"),
+    ("source tree", "release_manifest.source_tree_sha256().as_str() != operation.source_tree_sha256"),
+    ("qualification", "release_manifest.qualification_sha256().as_str() != operation.qualification_sha256"),
+    ("support assets", "actual_support_assets != operation.support_assets"),
+    ("completed reference identity", "FileIdentity::from_metadata(&metadata) != reference.operation.latest_temporary_identity"),
+    ("completed reference bytes", "read_descriptor(&file, metadata.len())? != expected"),
+]
+for label, predicate in semantic_mutations:
+    retained_tokens = predicate.replace(" ", "  ").replace("\n", " ")
+    mutation = local.replace(predicate, f"false /* {retained_tokens} */", 1)
+    if mutation == local:
+        print(f"publisher semantic mutation could not be applied: {label}", file=sys.stderr)
+        sys.exit(1)
+    if not publisher_errors(mutation, lib, main, manifest, tests):
+        print(f"publisher scanner accepted bypassed comparison: {label}", file=sys.stderr)
         sys.exit(1)
 
 initialization_order_mutation = local.replace(

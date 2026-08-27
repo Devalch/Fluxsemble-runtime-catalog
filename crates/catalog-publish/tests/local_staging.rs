@@ -21,7 +21,7 @@ fn reverse_transfer_and_both_signatures_are_verified_before_state_mutation() {
     let verified = local::verify_transferred_fixture_signed_bundle(&transfer).unwrap();
     assert_eq!(verified.sequence(), 42);
     assert_eq!(verified.tag(), "catalog-v1-sequence-42");
-    assert_eq!(verified.object_count(), 4);
+    assert_eq!(verified.object_count(), 5);
     assert!(!temp.path("state").exists());
 
     assert!(
@@ -53,7 +53,7 @@ fn digest_addressed_objects_and_latest_are_exact_immutable_and_reusable() {
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .collect::<Vec<_>>();
-    assert_eq!(objects.len(), 4);
+    assert_eq!(objects.len(), 5);
     for object in &objects {
         let name = object.file_name().unwrap().to_str().unwrap();
         assert_eq!(name.len(), 64);

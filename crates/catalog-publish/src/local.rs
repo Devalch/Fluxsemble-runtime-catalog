@@ -15,8 +15,9 @@ use std::{
 };
 
 use catalog_core::{
-    BundleInventoryV1, SignedReleaseBundleManifestV1, verify_signed_catalog,
-    verify_signed_release_bundle_manifest, verify_signed_release_inventory,
+    BundleInventoryV1, CatalogPayloadV1, SignedReleaseBundleManifestV1, VerifiedCatalogV1,
+    VerifiedReleaseBundleManifestV1, verify_signed_catalog, verify_signed_release_bundle_manifest,
+    verify_signed_release_inventory,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -35,8 +36,8 @@ const MAX_TRANSFER_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_ENTRY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_TRANSFER_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_TRANSFER_ENTRIES: usize = 64;
-const MAX_STATE_RECORD_BYTES: u64 = 64 * 1024;
-const MAX_REFERENCE_BYTES: u64 = 16 * 1024;
+const MAX_STATE_RECORD_BYTES: u64 = 256 * 1024;
+const MAX_REFERENCE_BYTES: u64 = 128 * 1024;
 const MAX_PERSISTENT_OBJECTS: u64 = 4_096;
 const MAX_PERSISTENT_OBJECT_BYTES: u64 = MAX_TRANSFER_BYTES;
 const MAX_PERSISTENT_CUMULATIVE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -155,7 +156,8 @@ struct ReverseTransferEntryV1 {
     sha256: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FileIdentity {
     device: u64,
     inode: u64,
@@ -189,15 +191,46 @@ struct LocalObjectV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct CatalogReleaseBindingV1 {
+    provider: String,
+    target: String,
+    version: String,
+}
+
+/// Canonical authority body hashed for `operation_id`. The prior reference is represented by the
+/// SHA-256 of its exact canonical bytes to avoid recursively embedding the full publication chain.
+/// Only the redundant operation ID and the recovery record's mutable phase live outside this body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OperationBodyV1 {
+    schema_version: u16,
+    reverse_transfer_manifest: LocalObjectV1,
+    input_transfer_sha256: String,
+    isolation_original_mode: IsolationMode,
+    isolation_completion_mode: IsolationMode,
+    catalog_envelope: LocalObjectV1,
+    catalog_payload_sha256: String,
+    catalog_sequence: u64,
+    catalog_releases: Vec<CatalogReleaseBindingV1>,
+    release_manifest: LocalObjectV1,
+    release_tag: String,
+    source_commit: String,
+    source_tree_sha256: String,
+    qualification_sha256: String,
+    qualification_reference: String,
+    checksums: LocalObjectV1,
+    support_assets: Vec<LocalObjectV1>,
+    objects: Vec<LocalObjectV1>,
+    prior_reference_sha256: Option<String>,
+    latest_temporary_identity: FileIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LocalCatalogReferenceV1 {
     schema_version: u16,
-    sequence: u64,
-    tag: String,
-    catalog_object: String,
-    catalog_size: u64,
-    catalog_envelope_sha256: String,
-    catalog_payload_sha256: String,
-    signed_transfer_sha256: String,
+    operation_id: String,
+    operation: OperationBodyV1,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -205,21 +238,10 @@ struct LocalCatalogReferenceV1 {
 struct RecoveryRecordV1 {
     schema_version: u16,
     operation_id: String,
-    candidate_signed_transfer_sha256: String,
-    input_transfer_sha256: String,
-    isolation_original_mode: IsolationMode,
-    isolation_completion_mode: IsolationMode,
-    sequence: u64,
-    tag: String,
-    catalog_envelope_sha256: String,
-    catalog_payload_sha256: String,
-    source_commit: String,
-    source_tree_sha256: String,
-    qualification_sha256: String,
+    operation: OperationBodyV1,
     intended_reference: LocalCatalogReferenceV1,
     prior_state: String,
     prior_reference: Option<LocalCatalogReferenceV1>,
-    objects: Vec<LocalObjectV1>,
     phase: String,
 }
 
@@ -238,7 +260,9 @@ pub struct VerifiedTransferredSignedBundle {
     release_manifest: SignedReleaseBundleManifestV1,
     signed_transfer_sha256: String,
     catalog_payload_sha256: String,
+    catalog_releases: Vec<CatalogReleaseBindingV1>,
     sequence: u64,
+    policy: VerificationPolicy,
 }
 
 impl fmt::Debug for VerifiedTransferredSignedBundle {
@@ -275,32 +299,74 @@ impl VerifiedTransferredSignedBundle {
 
     #[must_use]
     pub fn object_count(&self) -> usize {
-        self.files.len()
+        self.files.len() + 1
+    }
+
+    fn object_from_retained(file: &RetainedFile) -> LocalObjectV1 {
+        LocalObjectV1 {
+            name: file.name.clone(),
+            object: format!("objects/{}", file.sha256),
+            size: file.size,
+            sha256: file.sha256.clone(),
+        }
     }
 
     fn objects(&self) -> Vec<LocalObjectV1> {
-        self.files
-            .values()
-            .map(|file| LocalObjectV1 {
-                name: file.name.clone(),
-                object: format!("objects/{}", file.sha256),
-                size: file.size,
-                sha256: file.sha256.clone(),
-            })
-            .collect()
+        let mut objects = std::iter::once(Self::object_from_retained(&self.transfer_manifest))
+            .chain(self.files.values().map(Self::object_from_retained))
+            .collect::<Vec<_>>();
+        objects.sort_by(|left, right| left.name.cmp(&right.name));
+        objects
     }
 
-    fn intended_reference(&self) -> Result<LocalCatalogReferenceV1, PublishError> {
-        let catalog = self.files.get(CATALOG).ok_or_else(rejected)?;
-        Ok(LocalCatalogReferenceV1 {
+    fn operation_body(
+        &self,
+        prior_reference_sha256: Option<String>,
+        latest_temporary_identity: FileIdentity,
+    ) -> Result<OperationBodyV1, PublishError> {
+        let object = |name: &str| {
+            self.files
+                .get(name)
+                .map(Self::object_from_retained)
+                .ok_or_else(rejected)
+        };
+        let qualification_sha256 = self.release_manifest.qualification_sha256().as_str();
+        let qualification_reference = format!("qualification-{qualification_sha256}.json");
+        let support_assets = self
+            .release_manifest
+            .assets()
+            .iter()
+            .map(|asset| object(asset.name().as_str()))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(OperationBodyV1 {
             schema_version: 1,
-            sequence: self.sequence,
-            tag: self.tag().to_owned(),
-            catalog_object: format!("objects/{}", catalog.sha256),
-            catalog_size: catalog.size,
-            catalog_envelope_sha256: catalog.sha256.clone(),
+            reverse_transfer_manifest: Self::object_from_retained(&self.transfer_manifest),
+            input_transfer_sha256: self.manifest.input_transfer_sha256.clone(),
+            isolation_original_mode: self
+                .manifest
+                .isolation_attestation
+                .original_operation_mode
+                .clone(),
+            isolation_completion_mode: self.manifest.isolation_attestation.mode.clone(),
+            catalog_envelope: object(CATALOG)?,
             catalog_payload_sha256: self.catalog_payload_sha256.clone(),
-            signed_transfer_sha256: self.signed_transfer_sha256.clone(),
+            catalog_sequence: self.sequence,
+            catalog_releases: self.catalog_releases.clone(),
+            release_manifest: object(RELEASE_MANIFEST)?,
+            release_tag: self.tag().to_owned(),
+            source_commit: self.release_manifest.source_commit().as_str().to_owned(),
+            source_tree_sha256: self
+                .release_manifest
+                .source_tree_sha256()
+                .as_str()
+                .to_owned(),
+            qualification_sha256: qualification_sha256.to_owned(),
+            qualification_reference,
+            checksums: object(CHECKSUMS)?,
+            support_assets,
+            objects: self.objects(),
+            prior_reference_sha256,
+            latest_temporary_identity,
         })
     }
 
@@ -463,31 +529,12 @@ fn verify_transferred_signed_bundle_with(
     let release_bytes = read_descriptor(&release_file.file, release_file.size)?;
     let checksums_bytes = read_descriptor(&checksums_file.file, checksums_file.size)?;
 
-    let (sequence, catalog_payload_sha256, release_manifest) = match policy {
-        VerificationPolicy::Production => {
-            let catalog = verify_signed_catalog(&catalog_bytes).map_err(|_| rejected())?;
-            let release =
-                verify_signed_release_bundle_manifest(&release_bytes).map_err(|_| rejected())?;
-            (
-                catalog.payload().sequence().get(),
-                encode_hex(catalog.payload_sha256()),
-                release.manifest().clone(),
-            )
-        }
-        #[cfg(test)]
-        VerificationPolicy::Fixture => {
-            let catalog = catalog_core::verify_fixture_signed_catalog(&catalog_bytes)
-                .map_err(|_| rejected())?;
-            let release =
-                catalog_core::verify_fixture_signed_release_bundle_manifest(&release_bytes)
-                    .map_err(|_| rejected())?;
-            (
-                catalog.payload().sequence().get(),
-                encode_hex(catalog.payload_sha256()),
-                release.manifest().clone(),
-            )
-        }
-    };
+    let catalog = verify_catalog_with_policy(&catalog_bytes, policy)?;
+    let release = verify_release_manifest_with_policy(&release_bytes, policy)?;
+    let sequence = catalog.payload().sequence().get();
+    let catalog_payload_sha256 = encode_hex(catalog.payload_sha256());
+    let catalog_releases = catalog_release_bindings(catalog.payload())?;
+    let release_manifest = release.manifest().clone();
     if release_manifest.tag().as_str() != format!("catalog-v1-sequence-{sequence}") {
         return Err(rejected());
     }
@@ -528,10 +575,71 @@ fn verify_transferred_signed_bundle_with(
         release_manifest,
         signed_transfer_sha256,
         catalog_payload_sha256,
+        catalog_releases,
         sequence,
+        policy,
     };
     verified.reverify_all()?;
     Ok(verified)
+}
+
+fn verify_catalog_with_policy(
+    bytes: &[u8],
+    policy: VerificationPolicy,
+) -> Result<VerifiedCatalogV1, PublishError> {
+    match policy {
+        VerificationPolicy::Production => verify_signed_catalog(bytes).map_err(|_| rejected()),
+        #[cfg(test)]
+        VerificationPolicy::Fixture => {
+            catalog_core::verify_fixture_signed_catalog(bytes).map_err(|_| rejected())
+        }
+    }
+}
+
+fn verify_release_manifest_with_policy(
+    bytes: &[u8],
+    policy: VerificationPolicy,
+) -> Result<VerifiedReleaseBundleManifestV1, PublishError> {
+    match policy {
+        VerificationPolicy::Production => {
+            verify_signed_release_bundle_manifest(bytes).map_err(|_| rejected())
+        }
+        #[cfg(test)]
+        VerificationPolicy::Fixture => {
+            catalog_core::verify_fixture_signed_release_bundle_manifest(bytes)
+                .map_err(|_| rejected())
+        }
+    }
+}
+
+fn persistent_verification_policy() -> VerificationPolicy {
+    #[cfg(test)]
+    return VerificationPolicy::Fixture;
+    #[cfg(not(test))]
+    VerificationPolicy::Production
+}
+
+fn catalog_release_bindings(
+    payload: &CatalogPayloadV1,
+) -> Result<Vec<CatalogReleaseBindingV1>, PublishError> {
+    let bindings = payload
+        .providers()
+        .iter()
+        .flat_map(|provider| {
+            provider
+                .releases()
+                .iter()
+                .map(|release| CatalogReleaseBindingV1 {
+                    provider: provider.provider_id().to_owned(),
+                    target: release.target().as_str().to_owned(),
+                    version: release.version().as_str().to_owned(),
+                })
+        })
+        .collect::<Vec<_>>();
+    if bindings.is_empty() {
+        return Err(rejected());
+    }
+    Ok(bindings)
 }
 
 fn validate_reverse_manifest(manifest: &ReverseTransferManifestV1) -> Result<(), PublishError> {
@@ -919,6 +1027,7 @@ pub enum FaultPoint {
     AfterObjects,
     BeforeRecoveryRecord,
     AfterRecoveryRecord,
+    AfterLatestTempDurable,
     AfterLatestRename,
     AfterLatestReadback,
     BeforeLatestDirectorySync,
@@ -934,6 +1043,7 @@ impl FaultPoint {
             Self::AfterObjects => "after-objects",
             Self::BeforeRecoveryRecord => "before-recovery-record",
             Self::AfterRecoveryRecord => "after-recovery-record",
+            Self::AfterLatestTempDurable => "after-latest-temp-durable",
             Self::AfterLatestRename => "after-latest-rename",
             Self::AfterLatestReadback => "after-latest-readback",
             Self::BeforeLatestDirectorySync => "before-latest-directory-sync",
@@ -984,6 +1094,7 @@ struct TestPause {
 struct TestPlan {
     fault: Option<FaultPoint>,
     pause: Option<TestPause>,
+    crash_ready: Option<std::path::PathBuf>,
 }
 
 #[cfg(not(test))]
@@ -1002,6 +1113,7 @@ pub fn stage_local_with_fault(
         TestPlan {
             fault: Some(fault),
             pause: None,
+            crash_ready: None,
         },
         PERSISTENT_STATE_LIMITS,
     )
@@ -1026,6 +1138,7 @@ pub fn stage_local_with_checkpoint(
                 reached,
                 resume,
             }),
+            crash_ready: None,
         },
         PERSISTENT_STATE_LIMITS,
     )
@@ -1041,12 +1154,32 @@ pub fn stage_local_with_persistent_limits(
     stage_local_inner(bundle, state, TestPlan::default(), limits.into())
 }
 
+#[allow(dead_code)]
+#[cfg(test)]
+pub fn stage_local_with_sigkill_checkpoint(
+    bundle: &VerifiedTransferredSignedBundle,
+    state: &Path,
+    ready: &Path,
+) -> Result<PublishOutcome, PublishError> {
+    stage_local_inner(
+        bundle,
+        state,
+        TestPlan {
+            fault: None,
+            pause: None,
+            crash_ready: Some(ready.to_owned()),
+        },
+        PERSISTENT_STATE_LIMITS,
+    )
+}
+
 #[derive(Clone, Copy)]
 enum Checkpoint {
     BeforeObjectWrite,
     AfterObjects,
     BeforeRecoveryRecord,
     AfterRecoveryRecord,
+    AfterLatestTempDurable,
     AfterLatestRename,
     AfterLatestReadback,
     BeforeLatestDirectorySync,
@@ -1070,6 +1203,10 @@ fn fault_at(plan: &TestPlan, checkpoint: Checkpoint) -> bool {
                 Checkpoint::AfterRecoveryRecord
             )
             | (
+                Some(FaultPoint::AfterLatestTempDurable),
+                Checkpoint::AfterLatestTempDurable
+            )
+            | (
                 Some(FaultPoint::AfterLatestRename),
                 Checkpoint::AfterLatestRename
             )
@@ -1091,6 +1228,24 @@ fn fault_at(plan: &TestPlan, checkpoint: Checkpoint) -> bool {
 #[cfg(not(test))]
 const fn fault_at(_plan: &TestPlan, _checkpoint: Checkpoint) -> bool {
     false
+}
+
+#[cfg(test)]
+fn crash_pause_after_latest_temp(plan: &TestPlan) -> Result<(), PublishError> {
+    if let Some(ready) = &plan.crash_ready {
+        let file = fs::File::create(ready).map_err(|_| recovery_required())?;
+        file.sync_all().map_err(|_| recovery_required())?;
+        loop {
+            // SAFETY: pause blocks until a signal; the SIGKILL test never returns through cleanup.
+            unsafe { libc::pause() };
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+const fn crash_pause_after_latest_temp(_plan: &TestPlan) -> Result<(), PublishError> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1136,16 +1291,14 @@ fn stage_local_inner(
         .transpose()
         .map_err(|_| prior_preserved())?;
     if let Some(reference) = &prior {
-        verify_reference_object(&state, reference).map_err(|_| prior_preserved())?;
+        verify_local_reference(&state, reference, bundle.policy).map_err(|_| prior_preserved())?;
     }
-    let intended = bundle.intended_reference().map_err(|_| prior_preserved())?;
-    let intended_bytes = serde_jcs::to_vec(&intended).map_err(|_| prior_preserved())?;
-    if intended_bytes.len() as u64 > MAX_REFERENCE_BYTES {
-        return Err(prior_preserved());
-    }
+    let existing_candidate = prior
+        .as_ref()
+        .is_some_and(|reference| operation_matches_bundle(&reference.operation, bundle));
     if prior.as_ref().is_some_and(|current| {
-        current.sequence > intended.sequence
-            || (current.sequence == intended.sequence && current != &intended)
+        current.operation.catalog_sequence > bundle.sequence
+            || (current.operation.catalog_sequence == bundle.sequence && !existing_candidate)
     }) {
         return Err(prior_preserved());
     }
@@ -1156,6 +1309,8 @@ fn stage_local_inner(
     pause_at(&plan, StateBoundary::BeforeMutation).map_err(|_| prior_preserved())?;
     state.revalidate().map_err(|_| prior_preserved())?;
     validate_staging_inventory(bundle, state.limits).map_err(|_| prior_preserved())?;
+    publish_or_reuse_object(&state.objects, &bundle.transfer_manifest)
+        .map_err(|_| prior_preserved())?;
     for source in bundle.files.values() {
         publish_or_reuse_object(&state.objects, source).map_err(|_| prior_preserved())?;
     }
@@ -1164,17 +1319,32 @@ fn stage_local_inner(
     if fault_at(&plan, Checkpoint::AfterObjects) {
         return Err(prior_preserved());
     }
-    if prior.as_ref() == Some(&intended) {
+    if existing_candidate {
         pause_at(&plan, StateBoundary::BeforeSuccess).map_err(|_| prior_preserved())?;
         revalidate_before_staged_success(&state).map_err(|_| prior_preserved())?;
         return Ok(PublishOutcome::Staged);
     }
+
+    let latest_temporary = open_latest_temporary(&state).map_err(|_| prior_preserved())?;
+    let prior_reference_sha256 = prior_bytes.as_deref().map(sha256);
+    let operation = bundle.operation_body(prior_reference_sha256, latest_temporary.identity)?;
+    let operation_id = operation_id(&operation).map_err(|_| prior_preserved())?;
+    let intended = LocalCatalogReferenceV1 {
+        schema_version: 1,
+        operation_id: operation_id.clone(),
+        operation: operation.clone(),
+    };
+    let intended_bytes = serde_jcs::to_vec(&intended).map_err(|_| prior_preserved())?;
+    if intended_bytes.len() as u64 > MAX_REFERENCE_BYTES {
+        return Err(prior_preserved());
+    }
+    finalize_latest_temporary(&latest_temporary, &intended_bytes).map_err(|_| prior_preserved())?;
     if fault_at(&plan, Checkpoint::BeforeRecoveryRecord) {
         return Err(prior_preserved());
     }
 
-    let record = build_recovery_record(bundle, intended.clone(), prior.clone())?;
-    validate_recovery_inventory(&record, state.limits).map_err(|_| prior_preserved())?;
+    let record = build_recovery_record(operation_id, operation, intended.clone(), prior.clone())?;
+    validate_recovery_inventory(&record.operation, state.limits).map_err(|_| prior_preserved())?;
     let record_bytes = serde_jcs::to_vec(&record).map_err(|_| prior_preserved())?;
     if record_bytes.len() as u64 > MAX_STATE_RECORD_BYTES {
         return Err(prior_preserved());
@@ -1198,7 +1368,13 @@ fn stage_local_inner(
     if gated != prior_bytes {
         return Err(uncertain());
     }
-    install_latest(&state, &intended_bytes, prior.is_some()).map_err(|_| uncertain())?;
+    link_latest_temporary(&state, &latest_temporary, &intended_bytes).map_err(|_| uncertain())?;
+    if fault_at(&plan, Checkpoint::AfterLatestTempDurable) {
+        return Err(recovery_required());
+    }
+    crash_pause_after_latest_temp(&plan)?;
+    rename_latest_temporary(&state, &latest_temporary, &intended_bytes, prior.is_some())
+        .map_err(|_| uncertain())?;
     if fault_at(&plan, Checkpoint::AfterLatestRename) {
         return Err(uncertain());
     }
@@ -1217,7 +1393,8 @@ fn stage_local_inner(
     if fault_at(&plan, Checkpoint::AfterLatestDirectorySync) {
         return Err(uncertain());
     }
-    verify_recovery_relation(&state, &record, &intended_bytes).map_err(|_| uncertain())?;
+    verify_recovery_relation(&state, &record, &intended_bytes, bundle.policy)
+        .map_err(|_| uncertain())?;
     cleanup_recovery_record(&state, &transaction).map_err(|_| uncertain())?;
     pause_at(&plan, StateBoundary::BeforeSuccess).map_err(|_| uncertain())?;
     revalidate_before_staged_success(&state).map_err(|_| uncertain())?;
@@ -1232,12 +1409,12 @@ fn validate_staging_inventory(
     bundle: &VerifiedTransferredSignedBundle,
     limits: PersistentStateLimits,
 ) -> Result<(), PublishError> {
-    let count = u64::try_from(bundle.files.len()).map_err(|_| rejected())?;
+    let count = u64::try_from(bundle.files.len() + 1).map_err(|_| rejected())?;
     if count == 0 || count > limits.maximum_object_count {
         return Err(rejected());
     }
     let mut cumulative_bytes = 0_u64;
-    for source in bundle.files.values() {
+    for source in std::iter::once(&bundle.transfer_manifest).chain(bundle.files.values()) {
         if source.sha256.len() as u64 > limits.maximum_name_bytes
             || source.size == 0
             || source.size > limits.maximum_object_bytes
@@ -1254,15 +1431,15 @@ fn validate_staging_inventory(
 }
 
 fn validate_recovery_inventory(
-    record: &RecoveryRecordV1,
+    operation: &OperationBodyV1,
     limits: PersistentStateLimits,
 ) -> Result<(), PublishError> {
-    let count = u64::try_from(record.objects.len()).map_err(|_| rejected())?;
+    let count = u64::try_from(operation.objects.len()).map_err(|_| rejected())?;
     if count == 0 || count > limits.maximum_object_count {
         return Err(rejected());
     }
     let mut cumulative_bytes = 0_u64;
-    for object in &record.objects {
+    for object in &operation.objects {
         if object.sha256.len() as u64 > limits.maximum_name_bytes
             || object.size == 0
             || object.size > limits.maximum_object_bytes
@@ -1279,40 +1456,23 @@ fn validate_recovery_inventory(
 }
 
 fn build_recovery_record(
-    bundle: &VerifiedTransferredSignedBundle,
+    operation_id: String,
+    operation: OperationBodyV1,
     intended: LocalCatalogReferenceV1,
     prior: Option<LocalCatalogReferenceV1>,
 ) -> Result<RecoveryRecordV1, PublishError> {
-    let mut operation_hasher = Sha256::new();
-    operation_hasher.update(OPERATION_DOMAIN);
-    operation_hasher.update(bundle.signed_transfer_sha256.as_bytes());
-    operation_hasher.update(serde_jcs::to_vec(&intended).map_err(|_| rejected())?);
+    let prior_bytes = prior
+        .as_ref()
+        .map(serde_jcs::to_vec)
+        .transpose()
+        .map_err(|_| rejected())?;
+    if operation.prior_reference_sha256 != prior_bytes.as_deref().map(sha256) {
+        return Err(rejected());
+    }
     Ok(RecoveryRecordV1 {
         schema_version: 1,
-        operation_id: format!("{:x}", operation_hasher.finalize()),
-        candidate_signed_transfer_sha256: bundle.signed_transfer_sha256.clone(),
-        input_transfer_sha256: bundle.manifest.input_transfer_sha256.clone(),
-        isolation_original_mode: bundle
-            .manifest
-            .isolation_attestation
-            .original_operation_mode
-            .clone(),
-        isolation_completion_mode: bundle.manifest.isolation_attestation.mode.clone(),
-        sequence: bundle.sequence,
-        tag: bundle.tag().to_owned(),
-        catalog_envelope_sha256: intended.catalog_envelope_sha256.clone(),
-        catalog_payload_sha256: intended.catalog_payload_sha256.clone(),
-        source_commit: bundle.release_manifest.source_commit().as_str().to_owned(),
-        source_tree_sha256: bundle
-            .release_manifest
-            .source_tree_sha256()
-            .as_str()
-            .to_owned(),
-        qualification_sha256: bundle
-            .release_manifest
-            .qualification_sha256()
-            .as_str()
-            .to_owned(),
+        operation_id,
+        operation,
         intended_reference: intended,
         prior_state: if prior.is_some() {
             "prior_reference".to_owned()
@@ -1320,9 +1480,29 @@ fn build_recovery_record(
             "no_rollback_candidate".to_owned()
         },
         prior_reference: prior,
-        objects: bundle.objects(),
         phase: "prepared".to_owned(),
     })
+}
+
+fn operation_id(operation: &OperationBodyV1) -> Result<String, PublishError> {
+    let canonical = serde_jcs::to_vec(operation).map_err(|_| rejected())?;
+    let mut hasher = Sha256::new();
+    hasher.update(OPERATION_DOMAIN);
+    hasher.update(canonical);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn operation_matches_bundle(
+    operation: &OperationBodyV1,
+    bundle: &VerifiedTransferredSignedBundle,
+) -> bool {
+    let Ok(expected) = bundle.operation_body(
+        operation.prior_reference_sha256.clone(),
+        operation.latest_temporary_identity,
+    ) else {
+        return false;
+    };
+    expected == *operation
 }
 
 struct TransactionGuard {
@@ -1353,17 +1533,70 @@ fn install_recovery_record(
     Ok(TransactionGuard { file, identity })
 }
 
-fn install_latest(
-    state: &StateCapabilities,
-    bytes: &[u8],
-    prior_exists: bool,
-) -> Result<(), PublishError> {
+struct LatestTemporary {
+    file: fs::File,
+    identity: FileIdentity,
+}
+
+fn open_latest_temporary(state: &StateCapabilities) -> Result<LatestTemporary, PublishError> {
     if name_exists(&state.latest, LATEST_TEMP)? {
         return Err(recovery_required());
     }
-    let temporary = write_unnamed_and_link(&state.latest, LATEST_TEMP, bytes, 0o400)?;
-    let temporary_identity =
-        FileIdentity::from_metadata(&temporary.metadata().map_err(|_| rejected())?);
+    let file = open_unnamed(&state.latest, 0o600)?;
+    let identity = FileIdentity::from_metadata(&file.metadata().map_err(|_| rejected())?);
+    Ok(LatestTemporary { file, identity })
+}
+
+fn finalize_latest_temporary(
+    temporary: &LatestTemporary,
+    bytes: &[u8],
+) -> Result<(), PublishError> {
+    if bytes.is_empty() || bytes.len() as u64 > MAX_REFERENCE_BYTES {
+        return Err(rejected());
+    }
+    let mut file = temporary.file.try_clone().map_err(|_| rejected())?;
+    file.write_all(bytes).map_err(|_| rejected())?;
+    file.flush().map_err(|_| rejected())?;
+    file.set_permissions(fs::Permissions::from_mode(0o400))
+        .map_err(|_| rejected())?;
+    file.sync_all().map_err(|_| rejected())?;
+    let metadata = temporary.file.metadata().map_err(|_| rejected())?;
+    if FileIdentity::from_metadata(&metadata) != temporary.identity
+        || !secure_file_allow_links(&metadata, 0)
+        || metadata.len() != bytes.len() as u64
+        || read_descriptor(&temporary.file, metadata.len())? != bytes
+    {
+        return Err(rejected());
+    }
+    Ok(())
+}
+
+fn link_latest_temporary(
+    state: &StateCapabilities,
+    temporary: &LatestTemporary,
+    bytes: &[u8],
+) -> Result<(), PublishError> {
+    link_unnamed(&temporary.file, &state.latest, LATEST_TEMP)?;
+    state.latest.sync_all().map_err(|_| recovery_required())?;
+    let rebound = open_regular_at(&state.latest, LATEST_TEMP)?;
+    let metadata = rebound.metadata().map_err(|_| recovery_required())?;
+    if FileIdentity::from_metadata(&metadata) != temporary.identity
+        || !secure_file(&metadata)
+        || metadata.len() != bytes.len() as u64
+        || read_descriptor(&rebound, metadata.len())? != bytes
+        || hash_descriptor(&rebound, metadata.len())? != sha256(bytes)
+    {
+        return Err(recovery_required());
+    }
+    Ok(())
+}
+
+fn rename_latest_temporary(
+    state: &StateCapabilities,
+    temporary: &LatestTemporary,
+    bytes: &[u8],
+    prior_exists: bool,
+) -> Result<(), PublishError> {
     let old = CString::new(LATEST_TEMP).expect("fixed latest temporary");
     let new = CString::new(LATEST_REFERENCE).expect("fixed latest reference");
     let flags = if prior_exists {
@@ -1387,7 +1620,7 @@ fn install_latest(
     }
     let rebound = open_regular_at(&state.latest, LATEST_REFERENCE)?;
     let metadata = rebound.metadata().map_err(|_| rejected())?;
-    if FileIdentity::from_metadata(&metadata) != temporary_identity
+    if FileIdentity::from_metadata(&metadata) != temporary.identity
         || !secure_file(&metadata)
         || read_descriptor(&rebound, metadata.len())? != bytes
     {
@@ -1421,24 +1654,26 @@ pub fn recover_local_with_checkpoint(
                 reached,
                 resume,
             }),
+            crash_ready: None,
         },
     )
 }
 
 fn recover_local_inner(state_path: &Path, plan: TestPlan) -> Result<PublishOutcome, PublishError> {
     let state = open_existing_state(state_path).map_err(|_| uncertain())?;
+    let policy = persistent_verification_policy();
     pause_at(&plan, StateBoundary::AfterOpen).map_err(|_| uncertain())?;
     state.revalidate().map_err(|_| uncertain())?;
-    if name_exists(&state.latest, LATEST_TEMP).map_err(|_| uncertain())? {
-        return Err(recovery_required());
-    }
+    let latest_temporary_exists =
+        name_exists(&state.latest, LATEST_TEMP).map_err(|_| uncertain())?;
     let marker_exists = name_exists(&state.latest, RECOVERY_RECORD).map_err(|_| uncertain())?;
-    let temporary_exists = name_exists(&state.latest, RECOVERY_TEMP).map_err(|_| uncertain())?;
+    let recovery_temporary_exists =
+        name_exists(&state.latest, RECOVERY_TEMP).map_err(|_| uncertain())?;
     if !marker_exists {
-        if temporary_exists {
+        if recovery_temporary_exists || latest_temporary_exists {
             return Err(recovery_required());
         }
-        let outcome = clean_recovery_outcome(&state)?;
+        let outcome = clean_recovery_outcome(&state, policy)?;
         pause_at(&plan, StateBoundary::BeforeSuccess).map_err(|_| uncertain())?;
         revalidate_before_recovered_success(&state).map_err(|_| uncertain())?;
         return Ok(outcome);
@@ -1447,15 +1682,17 @@ fn recover_local_inner(state_path: &Path, plan: TestPlan) -> Result<PublishOutco
     let marker = open_regular_at(&state.latest, RECOVERY_RECORD).map_err(|_| uncertain())?;
     acquire_lock(&marker)?;
     let marker_metadata = marker.metadata().map_err(|_| uncertain())?;
-    if !secure_file_allow_links(&marker_metadata, if temporary_exists { 2 } else { 1 })
-        || marker_metadata.len() == 0
+    if !secure_file_allow_links(
+        &marker_metadata,
+        if recovery_temporary_exists { 2 } else { 1 },
+    ) || marker_metadata.len() == 0
         || marker_metadata.len() > MAX_STATE_RECORD_BYTES
     {
         return Err(uncertain());
     }
     let identity = FileIdentity::from_metadata(&marker_metadata);
     let bytes = read_descriptor(&marker, marker_metadata.len()).map_err(|_| uncertain())?;
-    if temporary_exists {
+    if recovery_temporary_exists {
         let temporary = open_regular_at(&state.latest, RECOVERY_TEMP).map_err(|_| uncertain())?;
         let metadata = temporary.metadata().map_err(|_| uncertain())?;
         if FileIdentity::from_metadata(&metadata) != identity
@@ -1466,11 +1703,10 @@ fn recover_local_inner(state_path: &Path, plan: TestPlan) -> Result<PublishOutco
         }
     }
     let record = parse_recovery_record(&bytes, state.limits)?;
-    verify_record_objects(&state, &record)?;
+    verify_operation(&state, &record.operation, policy).map_err(|_| uncertain())?;
     if let Some(prior) = &record.prior_reference {
-        verify_reference_object(&state, prior)?;
+        verify_operation(&state, &prior.operation, policy).map_err(|_| uncertain())?;
     }
-    verify_reference_object(&state, &record.intended_reference)?;
     let intended_bytes = serde_jcs::to_vec(&record.intended_reference).map_err(|_| uncertain())?;
     let prior_bytes = record
         .prior_reference
@@ -1481,6 +1717,39 @@ fn recover_local_inner(state_path: &Path, plan: TestPlan) -> Result<PublishOutco
     let current =
         read_optional_state_file(&state.latest, LATEST_REFERENCE, MAX_REFERENCE_BYTES, false)
             .map_err(|_| uncertain())?;
+    let transaction = TransactionGuard {
+        file: marker,
+        identity,
+    };
+
+    if latest_temporary_exists {
+        let latest_temporary =
+            verify_bound_latest_temporary(&state, &record.operation, &intended_bytes)
+                .map_err(|_| recovery_required())?;
+        if current.as_deref() == Some(intended_bytes.as_slice()) {
+            return Err(recovery_required());
+        }
+        if current != prior_bytes {
+            return Err(recovery_required());
+        }
+        pause_at(&plan, StateBoundary::BeforeMutation).map_err(|_| uncertain())?;
+        state.revalidate().map_err(|_| uncertain())?;
+        verify_operation(&state, &record.operation, policy).map_err(|_| uncertain())?;
+        verify_exact_prior(&state, &record, &prior_bytes, policy)?;
+        unlink_bound_latest_temporary(
+            &state,
+            &latest_temporary,
+            &record.operation,
+            &intended_bytes,
+        )?;
+        state.latest.sync_all().map_err(|_| uncertain())?;
+        verify_exact_prior(&state, &record, &prior_bytes, policy)?;
+        cleanup_recovery_record(&state, &transaction).map_err(|_| uncertain())?;
+        pause_at(&plan, StateBoundary::BeforeSuccess).map_err(|_| uncertain())?;
+        revalidate_before_recovered_success(&state).map_err(|_| uncertain())?;
+        return Ok(PublishOutcome::RecoveryAborted);
+    }
+
     let outcome = if current.as_deref() == Some(intended_bytes.as_slice()) {
         PublishOutcome::RecoveryCommitted
     } else if current == prior_bytes {
@@ -1489,12 +1758,29 @@ fn recover_local_inner(state_path: &Path, plan: TestPlan) -> Result<PublishOutco
         return Err(uncertain());
     };
     state.latest.sync_all().map_err(|_| uncertain())?;
-    let transaction = TransactionGuard {
-        file: marker,
-        identity,
-    };
     pause_at(&plan, StateBoundary::BeforeMutation).map_err(|_| uncertain())?;
     state.revalidate().map_err(|_| uncertain())?;
+    verify_operation(&state, &record.operation, policy).map_err(|_| uncertain())?;
+    match outcome {
+        PublishOutcome::RecoveryCommitted => {
+            let rebound = read_optional_state_file(
+                &state.latest,
+                LATEST_REFERENCE,
+                MAX_REFERENCE_BYTES,
+                false,
+            )
+            .map_err(|_| uncertain())?;
+            if rebound.as_deref() != Some(intended_bytes.as_slice()) {
+                return Err(uncertain());
+            }
+            verify_local_reference(&state, &record.intended_reference, policy)
+                .map_err(|_| uncertain())?;
+        }
+        PublishOutcome::RecoveryAborted => {
+            verify_exact_prior(&state, &record, &prior_bytes, policy)?;
+        }
+        PublishOutcome::Staged => return Err(uncertain()),
+    }
     cleanup_recovery_record(&state, &transaction).map_err(|_| uncertain())?;
     pause_at(&plan, StateBoundary::BeforeSuccess).map_err(|_| uncertain())?;
     revalidate_before_recovered_success(&state).map_err(|_| uncertain())?;
@@ -1505,15 +1791,18 @@ fn revalidate_before_recovered_success(state: &StateCapabilities) -> Result<(), 
     state.revalidate()
 }
 
-fn clean_recovery_outcome(state: &StateCapabilities) -> Result<PublishOutcome, PublishError> {
+fn clean_recovery_outcome(
+    state: &StateCapabilities,
+    policy: VerificationPolicy,
+) -> Result<PublishOutcome, PublishError> {
     let current =
         read_optional_state_file(&state.latest, LATEST_REFERENCE, MAX_REFERENCE_BYTES, false)
             .map_err(|_| uncertain())?;
     match current {
         None => Ok(PublishOutcome::RecoveryAborted),
         Some(bytes) => {
-            let reference = parse_reference(&bytes)?;
-            verify_reference_object(state, &reference)?;
+            let reference = parse_reference(&bytes).map_err(|_| uncertain())?;
+            verify_local_reference(state, &reference, policy).map_err(|_| uncertain())?;
             Ok(PublishOutcome::RecoveryCommitted)
         }
     }
@@ -1529,100 +1818,288 @@ fn parse_recovery_record(
     let record: RecoveryRecordV1 = serde_json::from_slice(bytes).map_err(|_| uncertain())?;
     if serde_jcs::to_vec(&record).map_err(|_| uncertain())? != bytes
         || record.schema_version != 1
-        || !valid_sha256(&record.operation_id)
-        || !valid_sha256(&record.candidate_signed_transfer_sha256)
-        || !valid_sha256(&record.input_transfer_sha256)
-        || record.isolation_original_mode != IsolationMode::Sign
-        || !matches!(
-            record.isolation_completion_mode,
-            IsolationMode::Sign | IsolationMode::RecoverSign
-        )
-        || record.sequence == 0
-        || record.tag != format!("catalog-v1-sequence-{}", record.sequence)
-        || !valid_sha256(&record.catalog_envelope_sha256)
-        || !valid_sha256(&record.catalog_payload_sha256)
-        || !valid_commit(&record.source_commit)
-        || !valid_sha256(&record.source_tree_sha256)
-        || !valid_sha256(&record.qualification_sha256)
         || record.phase != "prepared"
         || !matches!(
             (record.prior_state.as_str(), record.prior_reference.as_ref()),
             ("no_rollback_candidate", None) | ("prior_reference", Some(_))
         )
-        || record.intended_reference.sequence != record.sequence
-        || record.intended_reference.tag != record.tag
-        || record.intended_reference.catalog_envelope_sha256 != record.catalog_envelope_sha256
-        || record.intended_reference.catalog_payload_sha256 != record.catalog_payload_sha256
-        || record.intended_reference.signed_transfer_sha256
-            != record.candidate_signed_transfer_sha256
-        || record.objects.is_empty()
-        || record.objects.len() > MAX_TRANSFER_ENTRIES
-        || record
-            .objects
-            .windows(2)
-            .any(|pair| pair[0].name >= pair[1].name)
+        || record.operation_id != record.intended_reference.operation_id
+        || record.operation != record.intended_reference.operation
     {
         return Err(uncertain());
     }
-    validate_reference(&record.intended_reference)?;
+    validate_reference(&record.intended_reference).map_err(|_| uncertain())?;
     if let Some(prior) = &record.prior_reference {
-        validate_reference(prior)?;
+        validate_reference(prior).map_err(|_| uncertain())?;
     }
-    for object in &record.objects {
-        if !safe_asset_name(&object.name)
-            || !valid_sha256(&object.sha256)
-            || object.object != format!("objects/{}", object.sha256)
-            || object.size == 0
-            || object.size > MAX_ENTRY_BYTES
-        {
-            return Err(uncertain());
-        }
-    }
-    validate_recovery_inventory(&record, limits).map_err(|_| uncertain())?;
-    let catalog = record
-        .objects
-        .iter()
-        .find(|object| object.name == CATALOG)
-        .ok_or_else(uncertain)?;
-    if catalog.sha256 != record.catalog_envelope_sha256
-        || catalog.object != record.intended_reference.catalog_object
-        || catalog.size != record.intended_reference.catalog_size
+    validate_recovery_inventory(&record.operation, limits).map_err(|_| uncertain())?;
+    let prior_bytes = record
+        .prior_reference
+        .as_ref()
+        .map(serde_jcs::to_vec)
+        .transpose()
+        .map_err(|_| uncertain())?;
+    if record.operation.prior_reference_sha256 != prior_bytes.as_deref().map(sha256)
+        || operation_id(&record.operation).map_err(|_| uncertain())? != record.operation_id
     {
-        return Err(uncertain());
-    }
-    let mut operation_hasher = Sha256::new();
-    operation_hasher.update(OPERATION_DOMAIN);
-    operation_hasher.update(record.candidate_signed_transfer_sha256.as_bytes());
-    operation_hasher
-        .update(serde_jcs::to_vec(&record.intended_reference).map_err(|_| uncertain())?);
-    if format!("{:x}", operation_hasher.finalize()) != record.operation_id {
         return Err(uncertain());
     }
     Ok(record)
 }
 
+fn validate_local_object(object: &LocalObjectV1) -> Result<(), PublishError> {
+    if !safe_asset_name(&object.name)
+        || !valid_sha256(&object.sha256)
+        || object.object != format!("objects/{}", object.sha256)
+        || object.size == 0
+        || object.size > MAX_ENTRY_BYTES
+    {
+        return Err(rejected());
+    }
+    Ok(())
+}
+
+fn validate_operation(operation: &OperationBodyV1) -> Result<(), PublishError> {
+    if operation.schema_version != 1
+        || operation.reverse_transfer_manifest.name != TRANSFER_MANIFEST
+        || !valid_sha256(&operation.input_transfer_sha256)
+        || operation.isolation_original_mode != IsolationMode::Sign
+        || !matches!(
+            operation.isolation_completion_mode,
+            IsolationMode::Sign | IsolationMode::RecoverSign
+        )
+        || operation.catalog_envelope.name != CATALOG
+        || !valid_sha256(&operation.catalog_payload_sha256)
+        || operation.catalog_sequence == 0
+        || operation.catalog_releases.is_empty()
+        || operation.release_manifest.name != RELEASE_MANIFEST
+        || operation.release_tag != format!("catalog-v1-sequence-{}", operation.catalog_sequence)
+        || !valid_commit(&operation.source_commit)
+        || !valid_sha256(&operation.source_tree_sha256)
+        || !valid_sha256(&operation.qualification_sha256)
+        || operation.qualification_reference
+            != format!("qualification-{}.json", operation.qualification_sha256)
+        || operation.checksums.name != CHECKSUMS
+        || operation.support_assets.is_empty()
+        || operation
+            .support_assets
+            .windows(2)
+            .any(|pair| pair[0].name >= pair[1].name)
+        || operation.objects.is_empty()
+        || operation.objects.len() > MAX_TRANSFER_ENTRIES + 1
+        || operation
+            .objects
+            .windows(2)
+            .any(|pair| pair[0].name >= pair[1].name)
+        || operation
+            .prior_reference_sha256
+            .as_ref()
+            .is_some_and(|digest| !valid_sha256(digest))
+    {
+        return Err(rejected());
+    }
+    for release in &operation.catalog_releases {
+        if release.provider.is_empty()
+            || release.provider.len() > 255
+            || !release.provider.is_ascii()
+            || release.target != "linux_x86_64"
+            || release.version.is_empty()
+            || release.version.len() > 255
+            || !release.version.is_ascii()
+        {
+            return Err(rejected());
+        }
+    }
+    for object in std::iter::once(&operation.reverse_transfer_manifest)
+        .chain([
+            &operation.catalog_envelope,
+            &operation.release_manifest,
+            &operation.checksums,
+        ])
+        .chain(operation.support_assets.iter())
+        .chain(operation.objects.iter())
+    {
+        validate_local_object(object)?;
+    }
+    let mut expected_objects = std::iter::once(operation.reverse_transfer_manifest.clone())
+        .chain([
+            operation.catalog_envelope.clone(),
+            operation.release_manifest.clone(),
+            operation.checksums.clone(),
+        ])
+        .chain(operation.support_assets.iter().cloned())
+        .collect::<Vec<_>>();
+    expected_objects.sort_by(|left, right| left.name.cmp(&right.name));
+    if expected_objects != operation.objects
+        || !operation
+            .support_assets
+            .iter()
+            .any(|asset| asset.name == operation.qualification_reference)
+    {
+        return Err(rejected());
+    }
+    Ok(())
+}
+
 fn verify_record_objects(
     state: &StateCapabilities,
-    record: &RecoveryRecordV1,
-) -> Result<(), PublishError> {
-    validate_recovery_inventory(record, state.limits).map_err(|_| uncertain())?;
+    operation: &OperationBodyV1,
+) -> Result<BTreeMap<String, RetainedFile>, PublishError> {
+    validate_recovery_inventory(operation, state.limits)?;
     let mut cumulative_bytes = 0_u64;
-    for object in &record.objects {
-        let file = open_regular_at(&state.objects, &object.sha256).map_err(|_| uncertain())?;
-        let metadata = file.metadata().map_err(|_| uncertain())?;
+    let mut retained = BTreeMap::new();
+    for object in &operation.objects {
+        let file = open_regular_at(&state.objects, &object.sha256)?;
+        let metadata = file.metadata().map_err(|_| rejected())?;
         if !secure_file(&metadata) || metadata.len() != object.size {
-            return Err(uncertain());
+            return Err(rejected());
         }
         cumulative_bytes = bounded_add(
             cumulative_bytes,
             metadata.len(),
             state.limits.maximum_cumulative_bytes,
-        )
-        .map_err(|_| uncertain())?;
-        if hash_descriptor(&file, object.size).map_err(|_| uncertain())? != object.sha256 {
-            return Err(uncertain());
+        )?;
+        if hash_descriptor(&file, object.size)? != object.sha256 {
+            return Err(rejected());
+        }
+        if retained
+            .insert(
+                object.name.clone(),
+                RetainedFile {
+                    name: object.name.clone(),
+                    identity: FileIdentity::from_metadata(&metadata),
+                    size: object.size,
+                    sha256: object.sha256.clone(),
+                    file,
+                },
+            )
+            .is_some()
+        {
+            return Err(rejected());
         }
     }
+    Ok(retained)
+}
+
+fn verify_persisted_retained(
+    state: &StateCapabilities,
+    retained: &BTreeMap<String, RetainedFile>,
+) -> Result<(), PublishError> {
+    for file in retained.values() {
+        let before = file.file.metadata().map_err(|_| rejected())?;
+        let rebound = open_regular_at(&state.objects, &file.sha256)?;
+        let rebound_metadata = rebound.metadata().map_err(|_| rejected())?;
+        if !secure_file(&before)
+            || !secure_file(&rebound_metadata)
+            || FileIdentity::from_metadata(&before) != file.identity
+            || FileIdentity::from_metadata(&rebound_metadata) != file.identity
+            || before.len() != file.size
+            || hash_descriptor(&rebound, file.size)? != file.sha256
+        {
+            return Err(rejected());
+        }
+    }
+    Ok(())
+}
+
+fn verify_operation(
+    state: &StateCapabilities,
+    operation: &OperationBodyV1,
+    policy: VerificationPolicy,
+) -> Result<(), PublishError> {
+    validate_operation(operation)?;
+    let mut retained = verify_record_objects(state, operation)?;
+    let reverse = retained.remove(TRANSFER_MANIFEST).ok_or_else(rejected)?;
+    let reverse_bytes = read_descriptor(&reverse.file, reverse.size)?;
+    if sha256(&reverse_bytes) != operation.reverse_transfer_manifest.sha256 {
+        return Err(rejected());
+    }
+    let manifest: ReverseTransferManifestV1 =
+        serde_json::from_slice(&reverse_bytes).map_err(|_| rejected())?;
+    if serde_jcs::to_vec(&manifest).map_err(|_| rejected())? != reverse_bytes {
+        return Err(rejected());
+    }
+    validate_reverse_manifest(&manifest)?;
+    if manifest.input_transfer_sha256 != operation.input_transfer_sha256
+        || manifest.isolation_attestation.original_operation_mode
+            != operation.isolation_original_mode
+        || manifest.isolation_attestation.mode != operation.isolation_completion_mode
+        || manifest.entries.len() != retained.len()
+    {
+        return Err(rejected());
+    }
+    for (entry, object) in manifest.entries.iter().zip(retained.values()) {
+        if entry.relative_path != format!("signed-release-bundle/{}", object.name)
+            || entry.mode != "0400"
+            || entry.size != object.size
+            || entry.sha256 != object.sha256
+        {
+            return Err(rejected());
+        }
+    }
+
+    let catalog_file = retained.get(CATALOG).ok_or_else(rejected)?;
+    let release_file = retained.get(RELEASE_MANIFEST).ok_or_else(rejected)?;
+    let checksums_file = retained.get(CHECKSUMS).ok_or_else(rejected)?;
+    let catalog_bytes = read_descriptor(&catalog_file.file, catalog_file.size)?;
+    let release_bytes = read_descriptor(&release_file.file, release_file.size)?;
+    let checksums_bytes = read_descriptor(&checksums_file.file, checksums_file.size)?;
+    let catalog = verify_catalog_with_policy(&catalog_bytes, policy)?;
+    let release = verify_release_manifest_with_policy(&release_bytes, policy)?;
+    let release_manifest = release.manifest();
+    let inventory_entries = retained
+        .values()
+        .map(|file| {
+            serde_json::json!({
+                "relative_path": file.name,
+                "mode": "0400",
+                "size": file.size,
+                "sha256": file.sha256,
+            })
+        })
+        .collect::<Vec<_>>();
+    let inventory = BundleInventoryV1::from_json(
+        &serde_jcs::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "kind": "signed_release",
+            "entries": inventory_entries,
+        }))
+        .map_err(|_| rejected())?,
+    )
+    .map_err(|_| rejected())?;
+    verify_signed_release_inventory(&inventory, release_manifest).map_err(|_| rejected())?;
+    verify_release_bindings(&retained, release_manifest, &checksums_bytes)?;
+
+    let actual_support_assets = release_manifest
+        .assets()
+        .iter()
+        .map(|asset| {
+            retained
+                .get(asset.name().as_str())
+                .map(VerifiedTransferredSignedBundle::object_from_retained)
+                .ok_or_else(rejected)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if encode_hex(catalog.payload_sha256()) != operation.catalog_payload_sha256
+        || catalog.payload().sequence().get() != operation.catalog_sequence
+        || catalog_release_bindings(catalog.payload())? != operation.catalog_releases
+        || operation.catalog_envelope
+            != VerifiedTransferredSignedBundle::object_from_retained(catalog_file)
+        || operation.release_manifest
+            != VerifiedTransferredSignedBundle::object_from_retained(release_file)
+        || operation.checksums
+            != VerifiedTransferredSignedBundle::object_from_retained(checksums_file)
+        || release_manifest.tag().as_str() != operation.release_tag
+        || release_manifest.source_commit().as_str() != operation.source_commit
+        || release_manifest.source_tree_sha256().as_str() != operation.source_tree_sha256
+        || release_manifest.qualification_sha256().as_str() != operation.qualification_sha256
+        || actual_support_assets != operation.support_assets
+    {
+        return Err(rejected());
+    }
+    retained.insert(TRANSFER_MANIFEST.to_owned(), reverse);
+    verify_persisted_retained(state, &retained)?;
+    state.revalidate()?;
     Ok(())
 }
 
@@ -1630,6 +2107,7 @@ fn verify_recovery_relation(
     state: &StateCapabilities,
     record: &RecoveryRecordV1,
     intended_bytes: &[u8],
+    policy: VerificationPolicy,
 ) -> Result<(), PublishError> {
     let record_bytes =
         read_optional_state_file(&state.latest, RECOVERY_RECORD, MAX_STATE_RECORD_BYTES, true)?
@@ -1643,8 +2121,70 @@ fn verify_recovery_relation(
     if latest != intended_bytes {
         return Err(rejected());
     }
-    verify_record_objects(state, record)?;
-    verify_reference_object(state, &record.intended_reference)
+    verify_operation(state, &record.operation, policy)?;
+    verify_local_reference(state, &record.intended_reference, policy)
+}
+
+fn verify_exact_prior(
+    state: &StateCapabilities,
+    record: &RecoveryRecordV1,
+    prior_bytes: &Option<Vec<u8>>,
+    policy: VerificationPolicy,
+) -> Result<(), PublishError> {
+    let current =
+        read_optional_state_file(&state.latest, LATEST_REFERENCE, MAX_REFERENCE_BYTES, false)
+            .map_err(|_| uncertain())?;
+    if current != *prior_bytes {
+        return Err(uncertain());
+    }
+    if let Some(prior) = &record.prior_reference {
+        verify_local_reference(state, prior, policy).map_err(|_| uncertain())?;
+    }
+    Ok(())
+}
+
+fn verify_bound_latest_temporary(
+    state: &StateCapabilities,
+    operation: &OperationBodyV1,
+    intended_bytes: &[u8],
+) -> Result<fs::File, PublishError> {
+    let file = open_regular_at(&state.latest, LATEST_TEMP)?;
+    let metadata = file.metadata().map_err(|_| rejected())?;
+    if !secure_file(&metadata)
+        || FileIdentity::from_metadata(&metadata) != operation.latest_temporary_identity
+        || metadata.len() != intended_bytes.len() as u64
+        || read_descriptor(&file, metadata.len())? != intended_bytes
+        || hash_descriptor(&file, metadata.len())? != sha256(intended_bytes)
+    {
+        return Err(rejected());
+    }
+    let rebound = open_regular_at(&state.latest, LATEST_TEMP)?;
+    let rebound_metadata = rebound.metadata().map_err(|_| rejected())?;
+    if !secure_file(&rebound_metadata)
+        || FileIdentity::from_metadata(&rebound_metadata) != operation.latest_temporary_identity
+        || FileIdentity::from_metadata(&rebound_metadata) != FileIdentity::from_metadata(&metadata)
+    {
+        return Err(rejected());
+    }
+    Ok(file)
+}
+
+fn unlink_bound_latest_temporary(
+    state: &StateCapabilities,
+    retained: &fs::File,
+    operation: &OperationBodyV1,
+    intended_bytes: &[u8],
+) -> Result<(), PublishError> {
+    let rebound = verify_bound_latest_temporary(state, operation, intended_bytes)
+        .map_err(|_| recovery_required())?;
+    let retained_metadata = retained.metadata().map_err(|_| recovery_required())?;
+    let rebound_metadata = rebound.metadata().map_err(|_| recovery_required())?;
+    if FileIdentity::from_metadata(&retained_metadata) != operation.latest_temporary_identity
+        || FileIdentity::from_metadata(&rebound_metadata) != operation.latest_temporary_identity
+    {
+        return Err(recovery_required());
+    }
+    unlink_name(&state.latest, LATEST_TEMP).map_err(|_| recovery_required())
 }
 
 fn cleanup_recovery_record(
@@ -1692,34 +2232,31 @@ fn parse_reference(bytes: &[u8]) -> Result<LocalCatalogReferenceV1, PublishError
 
 fn validate_reference(reference: &LocalCatalogReferenceV1) -> Result<(), PublishError> {
     if reference.schema_version != 1
-        || reference.sequence == 0
-        || reference.tag != format!("catalog-v1-sequence-{}", reference.sequence)
-        || reference.catalog_size == 0
-        || reference.catalog_size > MAX_ENTRY_BYTES
-        || !valid_sha256(&reference.catalog_envelope_sha256)
-        || reference.catalog_object != format!("objects/{}", reference.catalog_envelope_sha256)
-        || !valid_sha256(&reference.catalog_payload_sha256)
-        || !valid_sha256(&reference.signed_transfer_sha256)
+        || !valid_sha256(&reference.operation_id)
+        || operation_id(&reference.operation)? != reference.operation_id
     {
         return Err(rejected());
     }
-    Ok(())
+    validate_operation(&reference.operation)
 }
 
-fn verify_reference_object(
+fn verify_local_reference(
     state: &StateCapabilities,
     reference: &LocalCatalogReferenceV1,
+    policy: VerificationPolicy,
 ) -> Result<(), PublishError> {
     validate_reference(reference)?;
-    let file = open_regular_at(&state.objects, &reference.catalog_envelope_sha256)?;
+    let expected = serde_jcs::to_vec(reference).map_err(|_| rejected())?;
+    let file = open_regular_at(&state.latest, LATEST_REFERENCE)?;
     let metadata = file.metadata().map_err(|_| rejected())?;
     if !secure_file(&metadata)
-        || metadata.len() != reference.catalog_size
-        || hash_descriptor(&file, metadata.len())? != reference.catalog_envelope_sha256
+        || FileIdentity::from_metadata(&metadata) != reference.operation.latest_temporary_identity
+        || metadata.len() != expected.len() as u64
+        || read_descriptor(&file, metadata.len())? != expected
     {
         return Err(rejected());
     }
-    Ok(())
+    verify_operation(state, &reference.operation, policy)
 }
 
 fn publish_or_reuse_object(objects: &fs::File, source: &RetainedFile) -> Result<(), PublishError> {

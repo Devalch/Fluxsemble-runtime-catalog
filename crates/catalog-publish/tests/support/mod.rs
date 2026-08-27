@@ -72,12 +72,13 @@ pub fn fixture_transfer(root: &Path, sequence: u64, support: &[u8]) {
     }))
     .unwrap();
 
-    let support_name = format!("support-{}.bin", sha256(support));
+    let qualification_sha256 = sha256(support);
+    let support_name = format!("qualification-{qualification_sha256}.json");
     let unsigned_value = json!({
         "schema_version": 1,
         "source_commit": "0123456789abcdef0123456789abcdef01234567",
         "source_tree_sha256": "11".repeat(32),
-        "qualification_sha256": "22".repeat(32),
+        "qualification_sha256": qualification_sha256,
         "tag": format!("catalog-v1-sequence-{sequence}"),
         "catalog_envelope": {
             "name": "catalog-v1.json",
