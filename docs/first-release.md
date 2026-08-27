@@ -39,7 +39,7 @@ The production static `catalog-sign 0.1.0` executable used for keyless assembly 
 - Independent oracle, production isolated assembly, new `catalog-core 0.1.0`, and retained old producer all returned the same accepted sequence and payload digest.
 - Retained old producer source: commit `5e021e8e4353a7993017dfaf0c0e9fa9e145b53f`; externally built `runtime-catalog` SHA-256 `7f62899a728ab1ebd751fa7f87a878da6c31bbf2e016ea7d1ccc8ed38644392f`.
 - New producer predecessor: commit `fe038f59654fc6f11c7cbf8b2af357a3cde9bfc1`; the enclosing source commit contains the Task 11 inputs and vectors.
-- Accept/reject matrix: accepted candidate plus schema, canonical, provider, target, version, closure, artifact, and unknown-field failures; canonical matrix is 593 bytes with SHA-256 `5e36894da626292cdacdaaae650d1af5d2f12873f950f925487b1b5467c22ad4`.
+- Accept/reject matrix: the accepted candidate plus exact single-pointer schema, canonical-decimal, provider, target, version, closure-reference, artifact-size, and unknown-field failures; the canonical case/category/pointer/before/after/old/new matrix is 1,428 bytes with SHA-256 `2cd34eaba1a2e609719a69ddf1a628f7cadba9e76512132750e1559284ba18f8`.
 
 ## Fixture vectors and support assets
 

@@ -2555,10 +2555,13 @@ for source, label, old, new in semantic_mutations:
 PY
 
 python3 - <<'PY'
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+import ast
 import copy
 import hashlib
 import json
+import os
+import stat
 import subprocess
 import sys
 
@@ -2573,11 +2576,45 @@ paths = {
     "acquire": Path("crates/catalog-acquire/src/lib.rs"),
     "writer": Path("crates/catalog-acquire/src/bundle_writer.rs"),
     "vector_test": Path("crates/catalog-core/tests/initial_exact_candidate.rs"),
+    "parity": Path("scripts/check-catalog-parity.py"),
+    "parity_test": Path("scripts/test_catalog_parity_cases.py"),
 }
 current = {name: path.read_bytes() for name, path in paths.items()}
 tracked = subprocess.check_output(
     ["git", "ls-files", "--cached", "--others", "--exclude-standard"], text=True
 ).splitlines()
+
+SUPPORT_BASENAMES = {
+    "pi-package-e02deae1cec07035807436c1864c88342e2f7d49050d03b858a3719f0c7aedbf.json",
+    "pi-shrinkwrap-9a17a6b9ba0a57b37773644f7945b1bf0bc10aa8923b87233fee6f75af1e1772.json",
+}
+SUPPORT_IDENTITIES = {
+    (3560, "e02deae1cec07035807436c1864c88342e2f7d49050d03b858a3719f0c7aedbf"),
+    (61540, "9a17a6b9ba0a57b37773644f7945b1bf0bc10aa8923b87233fee6f75af1e1772"),
+}
+
+
+def tracked_regular_identities():
+    identities = {}
+    names = subprocess.check_output(["git", "ls-files", "--cached", "-z"]).split(b"\0")
+    for encoded in names:
+        if not encoded:
+            continue
+        name = os.fsdecode(encoded)
+        metadata = os.lstat(name)
+        if not stat.S_ISREG(metadata.st_mode):
+            continue
+        digest = hashlib.sha256()
+        size = 0
+        with open(name, "rb") as source:
+            while chunk := source.read(64 * 1024):
+                size += len(chunk)
+                digest.update(chunk)
+        identities[name] = (size, digest.hexdigest())
+    return identities
+
+
+tracked_identities = tracked_regular_identities()
 
 
 def canonical(value):
@@ -2599,8 +2636,89 @@ def unique(data):
     return json.loads(data, object_pairs_hook=pairs)
 
 
-def task11_errors(source, names):
+EXPECTED_PARITY_CASES = (
+    {
+        "case": "schema-version",
+        "category": "schema",
+        "pointer": "/schema_version",
+        "before": 1,
+        "after": 2,
+    },
+    {
+        "case": "canonical-decimal",
+        "category": "canonical",
+        "pointer": "/sequence",
+        "before": "1",
+        "after": "01",
+    },
+    {
+        "case": "provider-id",
+        "category": "provider",
+        "pointer": "/providers/0/provider_id",
+        "before": "builtin:pi",
+        "after": "Builtin:pi",
+    },
+    {
+        "case": "target",
+        "category": "target",
+        "pointer": "/providers/0/releases/0/target",
+        "before": "linux_x86_64",
+        "after": "windows_x86_64",
+    },
+    {
+        "case": "release-version",
+        "category": "version",
+        "pointer": "/providers/0/releases/0/version",
+        "before": "0.83.0",
+        "after": "00.83.0",
+    },
+    {
+        "case": "closure-reference",
+        "category": "closure",
+        "pointer": "/providers/0/releases/0/provider_extension/metadata/package_artifact_id",
+        "before": "artifact:pi-coding-agent",
+        "after": "artifact:missing",
+    },
+    {
+        "case": "artifact-size",
+        "category": "artifact",
+        "pointer": "/providers/0/releases/0/components/0/artifacts/0/size_bytes",
+        "before": "30479988",
+        "after": "0",
+    },
+    {
+        "case": "unknown-field",
+        "category": "unknown",
+        "pointer": "/unknown_field",
+        "before": "<absent>",
+        "after": "forbidden",
+    },
+)
+
+
+def parity_case_manifest(source):
+    try:
+        tree = ast.parse(source.decode("utf-8"))
+        assignments = [
+            node.value
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "CASE_MANIFEST" for target in node.targets)
+        ]
+        if len(assignments) != 1:
+            return None
+        return ast.literal_eval(assignments[0])
+    except (SyntaxError, UnicodeDecodeError, ValueError):
+        return None
+
+
+def task11_errors(source, names, regular_identities):
     errors = []
+    if any(PurePosixPath(name).name in SUPPORT_BASENAMES for name in names):
+        errors.append("tracked deterministic support basename")
+    for identity in regular_identities.values():
+        if identity in SUPPORT_IDENTITIES:
+            errors.append("tracked exact support bytes")
     forbidden_paths = [
         name for name in names
         if name == "catalog-v1.json"
@@ -2690,8 +2808,30 @@ def task11_errors(source, names):
             errors.append(f"fixture/production vector evidence missing: {token}")
     if vector_test.count("assert!(verify_signed_catalog(ENVELOPE).is_err())") != 2:
         errors.append("exact production-verifier vector rejection evidence changed")
+    parity = source["parity"].decode()
+    if parity_case_manifest(source["parity"]) != EXPECTED_PARITY_CASES:
+        errors.append("exact single-pointer parity case manifest changed")
+    for token in [
+        'if pointer_value(mutated, case["pointer"]) != case["after"]:',
+        "if json_differences(candidate, mutated) != expected_difference:",
+        "if json_differences(candidate, reparsed) != expected_difference:",
+        "old = old_accepts(old_tool, case_path)",
+        "new = new_accepts(new_tool, case_path)",
+        "if old or new:",
+        "require_old_canonical(old_tool, accepted_path, root)",
+    ]:
+        if token not in parity:
+            errors.append(f"single-pointer parity enforcement missing: {token}")
+    parity_test = source["parity_test"].decode()
+    for token in [
+        "test_every_rejection_is_one_exact_pointer_change_from_the_candidate",
+        "test_driver_emits_the_frozen_matrix_with_runtime_supplied_tools",
+        "2cd34eaba1a2e609719a69ddf1a628f7cadba9e76512132750e1559284ba18f8",
+    ]:
+        if token not in parity_test:
+            errors.append(f"single-pointer parity test evidence missing: {token}")
     docs = source["docs"].decode()
-    for token in ["5e36894da626292cdacdaaae650d1af5d2f12873f950f925487b1b5467c22ad4", "902d26005b161dc18b0247d9eca100e73b9fded21cd4e11f7d7c4de710b5dcbf", "No production key, credential, SSH state, remote mutation"]:
+    for token in ["2cd34eaba1a2e609719a69ddf1a628f7cadba9e76512132750e1559284ba18f8", "902d26005b161dc18b0247d9eca100e73b9fded21cd4e11f7d7c4de710b5dcbf", "No production key, credential, SSH state, remote mutation"]:
         if token not in docs:
             errors.append(f"first-release evidence missing: {token}")
     if ".release-work/" not in source["ignore"].decode().splitlines():
@@ -2703,7 +2843,7 @@ def task11_errors(source, names):
     return errors
 
 
-errors = task11_errors(dict(current), list(tracked))
+errors = task11_errors(dict(current), list(tracked), dict(tracked_identities))
 if errors:
     print(errors[0], file=sys.stderr)
     sys.exit(1)
@@ -2720,18 +2860,53 @@ json_mutation("payload", lambda value: value.update(sequence="2"))
 json_mutation("envelope", lambda value: value.update(key_id="runtime-catalog-ed25519-forbidden"))
 json_mutation("manifest", lambda value: value["entries"].pop(0))
 for name, old, new in [
-    ("docs", b"5e36894da626292cdacdaaae650d1af5d2f12873f950f925487b1b5467c22ad4", b"0" * 64),
+    ("docs", b"2cd34eaba1a2e609719a69ddf1a628f7cadba9e76512132750e1559284ba18f8", b"0" * 64),
     ("ignore", b".release-work/", b"removed-release-work/"),
     ("acquire", b"InputSourceKind::ReleaseIntent => SupportAcquisition::ExtractFromVerifiedRoot", b"InputSourceKind::ReleaseIntent => SupportAcquisition::FetchPublishedObjects"),
     ("writer", b"bytes.len() as u64 != size || sha256_bytes(bytes) != sha256", b"false"),
     ("vector_test", b"assert!(verify_signed_catalog(ENVELOPE).is_err())", b"assert!(true)"),
+    ("parity", b'if pointer_value(mutated, case["pointer"]) != case["after"]:', b"if False:"),
+    ("parity", b"if json_differences(candidate, mutated) != expected_difference:", b"if False:"),
+    ("parity", b"old = old_accepts(old_tool, case_path)", b"old = False"),
 ]:
-    changed = dict(current); changed[name] = changed[name].replace(old, new, 1); mutations.append(changed)
+    changed = dict(current)
+    changed[name] = changed[name].replace(old, new, 1)
+    if changed[name] == current[name]:
+        print(f"Task 11 boundary mutation could not be applied: {name}", file=sys.stderr)
+        sys.exit(1)
+    mutations.append(changed)
+for case in EXPECTED_PARITY_CASES:
+    old = f'"pointer": "{case["pointer"]}"'.encode()
+    new = f'"pointer": "{case["pointer"]}/removed"'.encode()
+    changed = dict(current)
+    changed["parity"] = changed["parity"].replace(old, new, 1)
+    if changed["parity"] == current["parity"]:
+        print(f"Task 11 parity pointer mutation could not be applied: {case['case']}", file=sys.stderr)
+        sys.exit(1)
+    mutations.append(changed)
 for index, changed in enumerate(mutations):
-    if not task11_errors(dict(changed), list(tracked)):
+    if not task11_errors(dict(changed), list(tracked), dict(tracked_identities)):
         print(f"Task 11 boundary mutation {index} was accepted", file=sys.stderr)
         sys.exit(1)
-if not task11_errors(dict(current), list(tracked) + ["catalog-v1.json"]):
+if not task11_errors(
+    dict(current), list(tracked) + ["catalog-v1.json"], dict(tracked_identities)
+):
     print("tracked production catalog mutation was accepted", file=sys.stderr)
     sys.exit(1)
+for index, identity in enumerate(sorted(SUPPORT_IDENTITIES)):
+    virtual_path = f"innocent/exact-support-copy-{index}.bin"
+    virtual_identities = dict(tracked_identities)
+    virtual_identities[virtual_path] = identity
+    if not task11_errors(
+        dict(current), list(tracked) + [virtual_path], virtual_identities
+    ):
+        print(f"tracked exact support-byte mutation {index} was accepted", file=sys.stderr)
+        sys.exit(1)
+for basename in sorted(SUPPORT_BASENAMES):
+    virtual_path = f"innocent/{basename}"
+    if not task11_errors(
+        dict(current), list(tracked) + [virtual_path], dict(tracked_identities)
+    ):
+        print(f"tracked deterministic support-basename mutation was accepted: {basename}", file=sys.stderr)
+        sys.exit(1)
 PY
