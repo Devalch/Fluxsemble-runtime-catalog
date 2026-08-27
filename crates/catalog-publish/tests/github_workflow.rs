@@ -538,9 +538,10 @@ fn approval_publish_and_latest_are_separate_exact_durable_transitions() {
 
 #[test]
 fn fixed_transport_fixture_is_support_only_prerelease_and_uses_same_verification_flow() {
+    let (_temp, state) = staged_fixture("transport-fixture");
     let mut fake = FakeBroker::default();
     assert_eq!(
-        workflow::publish_transport_fixture_with(&mut fake, COMMIT).unwrap(),
+        workflow::publish_transport_fixture_with(&state, &mut fake, COMMIT).unwrap(),
         workflow::RemoteWorkflowOutcome::TransportFixturePublished
     );
     let release = fake.release("transport-v1").unwrap();

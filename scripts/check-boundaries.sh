@@ -1508,7 +1508,7 @@ policies = [
     ("single-link file", "metadata.nlink() == links", 1),
     ("owner-only file mode", "metadata.permissions().mode() & 0o7777 == 0o400", 1),
     ("owner-only directory mode", "metadata.permissions().mode() & 0o7777 == 0o700", 1),
-    ("component no-symlink resolution", "0x02 | 0x04 | 0x08,", 2),
+    ("component no-symlink resolution", "0x02 | 0x04 | 0x08,", 3),
     ("retained root identity", "FileIdentity::from_metadata(&root_metadata) != self.root_identity", 1),
     ("canonical state root rebind", "FileIdentity::from_metadata(&rebound_root_metadata) != self.root_identity", 1),
     ("canonical state objects rebind", "FileIdentity::from_metadata(&rebound_objects_metadata) != self.objects_identity", 1),
@@ -1545,16 +1545,16 @@ policies = [
     ("atomic latest and remote-operation rename", "libc::SYS_renameat2,", 2),
     ("no-replace absent latest", "libc::RENAME_NOREPLACE", 1),
     ("latest exact readback", "readback.as_deref() != Some(intended_bytes.as_slice())", 1),
-    ("latest and remote-record parent fsync", "state.latest.sync_all().map_err(|_| uncertain())?;", 5),
+    ("latest and remote-record parent fsync", "state.latest.sync_all().map_err(|_| uncertain())?;", 7),
     ("recovery relation before cleanup", "verify_recovery_relation(&state, &record, &intended_bytes, bundle.policy)", 1),
     ("transaction lock", "libc::LOCK_EX | libc::LOCK_NB", 1),
     ("exact recovery commit", "current.as_deref() == Some(intended_bytes.as_slice())", 2),
     ("exact recovery abort", "current == prior_bytes", 1),
     ("staged before-success revalidation", "revalidate_before_staged_success(&state)", 2),
     ("recovered before-success revalidation", "revalidate_before_recovered_success(&state)", 3),
-    ("uncertain no guessing", "return Err(uncertain());", 18),
+    ("uncertain no guessing", "return Err(uncertain());", 24),
     ("previsibility prior preserved", "return Err(prior_preserved());", 6),
-    ("record and remote-state visibility recovery required", "return Err(recovery_required());", 19),
+    ("record and remote-state visibility recovery required", "return Err(recovery_required());", 21),
     ("uncertainty record retention", "FaultPoint::AfterLatestDirectorySync", 1),
     ("latest temp unnamed preparation", "let latest_temporary = open_latest_temporary(&state)", 1),
     ("latest temp durable link and readback", "link_latest_temporary(&state, &latest_temporary, &intended_bytes)", 1),
@@ -2203,6 +2203,29 @@ policies = [
     ("workflow", "fixed repository", 'const REPOSITORY: &str = "Devalch/Fluxsemble-runtime-catalog";', 1),
     ("workflow", "remote operation before first mutation", '.write_record_no_clobber(RemoteRecordKind::Operation, &initial_bytes)', 1),
     ("workflow", "atomic remote operation phase replacement", '.replace_operation_record(&handle.bytes, &bytes)', 1),
+    ("local", "fixed workflow lock", 'const REMOTE_WORKFLOW_LOCK: &str = ".remote-workflow-v1.lock";', 1),
+    ("local", "exclusive workflow flock", 'libc::LOCK_EX | libc::LOCK_NB', 1),
+    ("local", "workflow lock exact mode", 'retained_metadata.permissions().mode() & 0o7777 != 0o600', 1),
+    ("local", "workflow lock one link", 'retained_metadata.nlink() != 1', 1),
+    ("local", "operation pre-rename checkpoint", 'remote_operation_checkpoint("durable-pre-rename")?;', 1),
+    ("local", "operation post-rename checkpoint", 'remote_operation_checkpoint("post-rename-pre-fsync")?;', 1),
+    ("local", "operation final-readback checkpoint", 'remote_operation_checkpoint("final-readback")?;', 1),
+    ("local", "temporary descriptor rebind", 'FileIdentity::from_metadata(&rebound.metadata().map_err(|_| uncertain())?)\n            != temporary_identity', 1),
+    ("local", "visible promoted phase fsync/readback", 'pub(crate) fn settle_visible_operation(', 1),
+    ("workflow", "visible promoted phase settlement", '.settle_visible_operation(lock, main_bytes)', 1),
+    ("workflow", "settle before remote operation", 'settle_pending_operation(state, &lock, Some(&body))?;', 1),
+    ("workflow", "settle schema-authorized next phase", 'schema_authorized_next(main, &temporary)', 1),
+    ("workflow", "settle exact prior phase", 'schema_authorized_next(&temporary, main)', 1),
+    ("workflow", "retained workflow lock spans", 'let lock = state.acquire_workflow_lock().map_err(local_error)?;', 6),
+    ("workflow", "lock rebind before tag mutation", 'lock.revalidate().map_err(local_error)?;\n    let _create_result = broker.create_tag(', 2),
+    ("workflow", "lock rebind before draft mutation", 'lock.revalidate().map_err(local_error)?;\n        let _create_result = broker.create_draft(', 2),
+    ("workflow", "lock rebind before publish mutation", 'lock.revalidate().map_err(local_error)?;\n        let _publish_result = broker.publish_draft(', 2),
+    ("workflow", "no duplicate publish after receipt", 'if existing_publication.is_none() && before.draft {', 1),
+    ("workflow", "exact existing upload resume", 'let remote_asset = if before.assets.len() > index {', 1),
+    ("workflow", "transport operation durable before mutation", 'RemoteRecordKind::TransportOperation,', 1),
+    ("workflow", "transport exact receipt retry", '.read_record(RemoteRecordKind::TransportReceipt)', 1),
+    ("workflow", "transport receipt durable", '.write_record_no_clobber(RemoteRecordKind::TransportReceipt, &canonical(&receipt)?)', 1),
+    ("workflow", "transport state operation binding", 'local_operation_id: state.local_operation_id().to_owned()', 2),
     ("workflow", "commit object tag", 'actual.object_type != crate::broker::BrokerTagObjectTypeV1::Commit', 1),
     ("workflow", "exact tag commit", 'actual.commit_sha != expected_commit', 1),
     ("workflow", "exact release target", 'release.target_commitish != operation.source_commit', 1),
@@ -2286,7 +2309,11 @@ test_policies = [
     ("github_tests", "pre-post upload call order", 'assert_eq!(fake.calls[index - 1], "read_draft");', 1),
     ("github_tests", "catalog-last evidence", 'assert_eq!(uploads.last(), Some(&"catalog-v1.json"));', 1),
     ("github_tests", "scratch parent swap evidence", 'scratch_directory_swap_is_rejected_for_test', 1),
-    ("recovery_tests", "all mutation timing evidence", 'failures_before_and_after_each_remote_mutation_resume_only_exact_state', 1),
+    ("recovery_tests", "complete per-asset timing evidence", 'complete_per_asset_before_after_retry_matrix_resumes_only_exact_state', 1),
+    ("recovery_tests", "every asset/release drift evidence", 'every_asset_and_release_identity_drift_is_rejected_without_new_mutation', 1),
+    ("recovery_tests", "real remote SIGKILL evidence", 'real_sigkill_operation_and_all_local_receipt_checkpoints_settle_on_exact_retry', 1),
+    ("recovery_tests", "exclusive contention evidence", 'exclusive_workflow_lock_serializes_publish_stage_and_transport_mutations', 1),
+    ("recovery_tests", "publish both timings evidence", 'publish_before_and_after_failure_settles_receipt_without_duplicate_publication', 1),
     ("recovery_tests", "transport recovery evidence", 'transport_fixture_before_and_after_mutation_failures_resume_exact_prerelease', 1),
     ("recovery_tests", "transport concurrent ID evidence", 'transport_fixture_rejects_concurrent_release_id_drift_before_publication', 1),
     ("recovery_tests", "latest retry without broker", 'latest_mismatch_keeps_publication_receipt_and_credential_free_retry_needs_no_broker', 1),
@@ -2304,14 +2331,62 @@ def task10_errors(current):
         if actual != expected:
             errors.append(f"missing exact Task 10 policy {label}: expected {expected}, got {actual}")
 
+    recovery = current["recovery_tests"]
+    expected_assets = [
+        "checksums-sha256.txt",
+        "qualification-1dbf39600b5761d58378447f494a50c8b9c01b559b6ef420720f99f4e45717c9.json",
+        "signed-release-bundle-manifest-v1.json",
+        "catalog-v1.json",
+    ]
+    asset_region = recovery.split("const PRODUCTION_ASSETS", 1)[-1].split("const STAGE_MUTATION_RETRY_CASES", 1)[0]
+    if re.findall(r'"([^"]+)"', asset_region) != expected_assets:
+        errors.append("explicit production asset matrix is not support-first/catalog-last")
+
+    def retry_cases(name, following):
+        region = recovery.split(f"const {name}", 1)[-1].split(f"const {following}", 1)[0]
+        return re.findall(r'\(\s*"([^"]+)",\s*Failure::(Before|After),?\s*\)', region)
+
+    expected_stage_mutations = [
+        ("create_tag", "Before"), ("create_tag", "After"),
+        ("create_draft", "Before"), ("create_draft", "After"),
+    ]
+    for asset in expected_assets:
+        expected_stage_mutations += [(f"upload:{asset}", "Before"), (f"upload:{asset}", "After")]
+    if retry_cases("STAGE_MUTATION_RETRY_CASES", "STAGE_OBSERVATION_RETRY_CASES") != expected_stage_mutations:
+        errors.append("explicit stage mutation retry matrix is incomplete")
+    expected_observations = [("read_tag", "Before"), ("read_draft", "Before")]
+    expected_observations += [(f"download:{asset}", "Before") for asset in expected_assets]
+    if retry_cases("STAGE_OBSERVATION_RETRY_CASES", "PUBLISH_RETRY_CASES") != expected_observations:
+        errors.append("explicit per-asset observation retry matrix is incomplete")
+    if retry_cases("PUBLISH_RETRY_CASES", "ASSET_DRIFT_CASES") != [
+        ("publish_draft", "Before"), ("publish_draft", "After")
+    ]:
+        errors.append("explicit publish before/after retry matrix is incomplete")
+    asset_drift_region = recovery.split("const ASSET_DRIFT_CASES", 1)[-1].split("const RELEASE_DRIFT_CASES", 1)[0]
+    if re.findall(r'"([^"]+)"', asset_drift_region) != ["id", "name", "size", "bytes", "duplicate", "extra"]:
+        errors.append("explicit per-asset identity/bytes drift matrix is incomplete")
+    release_drift_region = recovery.split("const RELEASE_DRIFT_CASES", 1)[-1].split("const TRANSPORT_RETRY_CASES", 1)[0]
+    if re.findall(r'"([^"]+)"', release_drift_region) != ["release_id", "target", "title", "notes", "draft", "prerelease"]:
+        errors.append("explicit release identity/state drift matrix is incomplete")
+    transport_region = recovery.split("const TRANSPORT_RETRY_CASES", 1)[-1].split("#[derive", 1)[0]
+    transport_cases = re.findall(r'\(\s*"([^"]+)",\s*Failure::(Before|After),?\s*\)', transport_region)
+    if transport_cases != [
+        ("create_tag", "Before"), ("create_tag", "After"),
+        ("create_draft", "Before"), ("create_draft", "After"),
+        ("upload:github-release-asset-v1.txt", "Before"),
+        ("upload:github-release-asset-v1.txt", "After"),
+        ("publish_draft", "Before"), ("publish_draft", "After"),
+    ]:
+        errors.append("explicit transport before/after retry matrix is incomplete")
+
     workflow = current["workflow"]
     operation_region = workflow.split("fn stage_remote_inner(", 1)[-1].split("pub fn approve_remote", 1)[0]
     operation_order = [
         "begin_operation(state, initial)?",
         "broker.create_tag(",
         ".read_tag(REPOSITORY, &operation.record.operation.tag)",
-        "ensure_exact_draft(state, broker, &mut operation, false)?",
-        "verify_and_upload_all(state, broker, &mut operation, &release_id)?",
+        "ensure_exact_draft(state, &lock, broker, &mut operation, false)?",
+        "verify_and_upload_all(state, &lock, broker, &mut operation, &release_id)?",
         "RemoteRecordKind::DraftReceipt",
     ]
     positions = [operation_region.find(item) for item in operation_order]
@@ -2452,6 +2527,14 @@ for source, label, snippet, expected in policies + test_policies:
             sys.exit(1)
 
 semantic_mutations = [
+    ("local", "workflow lock mode bypass", "retained_metadata.permissions().mode() & 0o7777 != 0o600", "false /* retained workflow lock mode */"),
+    ("local", "temporary identity bypass", "FileIdentity::from_metadata(&rebound.metadata().map_err(|_| uncertain())?)\n            != temporary_identity", "false /* temporary descriptor identity */"),
+    ("workflow", "operation promotion phase bypass", "schema_authorized_next(main, &temporary)", "true /* bypass operation phase relation */"),
+    ("workflow", "visible promotion settlement bypass", ".settle_visible_operation(lock, main_bytes)", ".read_operation_candidates(lock) /* visible settlement bypass */"),
+    ("workflow", "duplicate publish bypass", "existing_publication.is_none() && before.draft", "before.draft /* duplicate publication bypass */"),
+    ("workflow", "duplicate upload bypass", "before.assets.len() > index", "false /* existing upload resume bypass */"),
+    ("workflow", "transport receipt retry bypass", ".read_record(RemoteRecordKind::TransportReceipt)", ".read_record(RemoteRecordKind::LatestReceipt) /* transport retry bypass */"),
+    ("recovery_tests", "per-asset catalog-after case removal", '("upload:catalog-v1.json", Failure::After)', '("upload:catalog-v1.json", Failure::Before)'),
     ("workflow", "tag commit bypass", "actual.commit_sha != expected_commit", "false /* actual.commit_sha expected_commit */"),
     ("workflow", "release ID bypass", "release_id.is_some_and(|expected| release.release_id != expected)", "false /* release_id release.release_id expected */"),
     ("workflow", "prior asset-set bypass", "after[..before.len()] != *before", "false /* after before asset set */"),

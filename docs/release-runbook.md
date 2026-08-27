@@ -59,10 +59,10 @@ The committed manifest is exactly `conformance/transport/manifest-v1.json`. It f
 The owner first reviews the manifest and asset bytes/digest, all three broker client/executable/inner-config digests, and exact reviewed 40-character source commit. Then stop separately before tag, draft, upload, and publication. Only after those exact mutations are authorized, run:
 
 ```text
-catalog-publish publish-transport-fixture --source-commit FULL_REVIEWED_COMMIT_SHA --broker-config /ABSOLUTE/OWNER-PRIVATE/BROKER_CONFIG
+catalog-publish publish-transport-fixture --state /ABSOLUTE/OWNER-PRIVATE/STATE --source-commit FULL_REVIEWED_COMMIT_SHA --broker-config /ABSOLUTE/OWNER-PRIVATE/BROKER_CONFIG
 ```
 
-Expected safe output after all exact readbacks is `transport fixture prerelease published`. The command creates no replacement and refuses any nonexact existing tag, release metadata, asset set, ID, size, or downloaded bytes. A failure may have left an exact tag, draft, or asset; preserve it and rerun only after owner review. Never infer that the fixture exists from this runbook.
+Expected safe output after all exact readbacks is `transport fixture prerelease published`. The command validates the canonical Task 8 state capability and holds its retained owner-private `latest/.remote-workflow-v1.lock` across every remote decision, mutation, readback, and completion. The command creates no replacement and refuses any nonexact existing tag, release metadata, asset set, ID, size, or downloaded bytes. A failure may have left an exact tag, draft, or asset; preserve it and rerun only after owner review. Never infer that the fixture exists from this runbook.
 
 ## 3. Stage the production draft
 
@@ -72,7 +72,7 @@ The owner reviews and explicitly authorizes the exact production tag mutation, t
 catalog-publish stage-remote --state /ABSOLUTE/OWNER-PRIVATE/STATE --broker-config /ABSOLUTE/OWNER-PRIVATE/BROKER_CONFIG
 ```
 
-Before its first mutation the tool writes owner-private canonical `latest/remote-operation-v1.json`, binding the local operation, broker-client config digest, retained broker executable digest, inner Task 9 config digest, repository, source, sequence/tag, release metadata, and ordered inventory. It creates or exact-resumes the lightweight tag, verifies the commit object, exact-resumes or creates one draft non-prerelease release, uploads support assets first and `catalog-v1.json` last, and reads the same draft immediately before and after every tag-authorized upload. Every asset is downloaded and hash-verified.
+Before its first mutation the tool acquires and rebinds the fixed mode-`0600`, one-link `latest/.remote-workflow-v1.lock`, then writes owner-private canonical `latest/remote-operation-v1.json`, binding the local operation, broker-client config digest, retained broker executable digest, inner Task 9 config digest, repository, source, sequence/tag, release metadata, and ordered inventory. Exact retries validate and settle only a canonical same-operation temporary record at its authorized next phase; malformed, replaced, skipped, backward, or conflicting temporaries are preserved as uncertain. It creates or exact-resumes the lightweight tag, verifies the commit object, exact-resumes or creates one draft non-prerelease release, uploads support assets first and `catalog-v1.json` last, and reads the same draft immediately before and after every tag-authorized upload. Every asset is downloaded and hash-verified.
 
 Expected safe completion is:
 

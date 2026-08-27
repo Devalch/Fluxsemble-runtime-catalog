@@ -33,6 +33,9 @@ const LATEST_REFERENCE: &str = "catalog-v1.ref";
 const LATEST_TEMP: &str = ".catalog-v1.ref.tmp";
 const REMOTE_OPERATION: &str = "remote-operation-v1.json";
 const REMOTE_OPERATION_TEMP: &str = ".remote-operation-v1.tmp";
+const REMOTE_WORKFLOW_LOCK: &str = ".remote-workflow-v1.lock";
+const TRANSPORT_OPERATION: &str = "transport-operation-v1.json";
+const TRANSPORT_RECEIPT: &str = "transport-receipt-v1.json";
 const DRAFT_RECEIPT: &str = "draft-receipt-v1.json";
 const RELEASE_APPROVAL: &str = "release-approval-v1.json";
 const PUBLICATION_RECEIPT: &str = "publication-receipt-v1.json";
@@ -1000,6 +1003,9 @@ impl StateCapabilities {
             RECOVERY_TEMP.to_owned(),
             REMOTE_OPERATION.to_owned(),
             REMOTE_OPERATION_TEMP.to_owned(),
+            REMOTE_WORKFLOW_LOCK.to_owned(),
+            TRANSPORT_OPERATION.to_owned(),
+            TRANSPORT_RECEIPT.to_owned(),
             DRAFT_RECEIPT.to_owned(),
             RELEASE_APPROVAL.to_owned(),
             PUBLICATION_RECEIPT.to_owned(),
@@ -1038,6 +1044,8 @@ impl RemoteLocalAsset {
     }
 }
 
+type OperationCandidates = (Option<Vec<u8>>, Option<Vec<u8>>);
+
 pub(crate) struct RemoteWorkflowState {
     state: StateCapabilities,
     policy: VerificationPolicy,
@@ -1051,6 +1059,8 @@ pub(crate) struct RemoteWorkflowState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RemoteRecordKind {
     Operation,
+    TransportOperation,
+    TransportReceipt,
     DraftReceipt,
     Approval,
     PublicationReceipt,
@@ -1061,11 +1071,27 @@ impl RemoteRecordKind {
     const fn name(self) -> &'static str {
         match self {
             Self::Operation => REMOTE_OPERATION,
+            Self::TransportOperation => TRANSPORT_OPERATION,
+            Self::TransportReceipt => TRANSPORT_RECEIPT,
             Self::DraftReceipt => DRAFT_RECEIPT,
             Self::Approval => RELEASE_APPROVAL,
             Self::PublicationReceipt => PUBLICATION_RECEIPT,
             Self::LatestReceipt => LATEST_RECEIPT,
         }
+    }
+}
+
+pub(crate) struct RemoteWorkflowLock<'a> {
+    state: &'a RemoteWorkflowState,
+    file: fs::File,
+    identity: FileIdentity,
+}
+
+impl RemoteWorkflowLock<'_> {
+    /// Rebinds both the canonical state capability and the retained fixed lock before authority.
+    pub(crate) fn revalidate(&self) -> Result<(), PublishError> {
+        self.state.revalidate_allow_operation_temp()?;
+        validate_workflow_lock(&self.state.state.latest, &self.file, self.identity)
     }
 }
 
@@ -1113,15 +1139,19 @@ impl RemoteWorkflowState {
             .ok_or_else(rejected)
     }
 
-    pub(crate) fn revalidate(&self) -> Result<(), PublishError> {
+    fn revalidate_allow_operation_temp(&self) -> Result<(), PublishError> {
         self.state.revalidate()?;
         let names = enumerate_names(&self.state.latest, STATE_LATEST_ENUMERATION_LIMITS)?;
         if names.contains(RECOVERY_RECORD)
             || names.contains(RECOVERY_TEMP)
             || names.contains(LATEST_TEMP)
-            || names.contains(REMOTE_OPERATION_TEMP)
         {
             return Err(recovery_required());
+        }
+        if names.contains(REMOTE_WORKFLOW_LOCK) {
+            let lock = open_workflow_lock(&self.state.latest)?;
+            let identity = FileIdentity::from_metadata(&lock.metadata().map_err(|_| rejected())?);
+            validate_workflow_lock(&self.state.latest, &lock, identity)?;
         }
         let current = read_optional_state_file(
             &self.state.latest,
@@ -1150,6 +1180,130 @@ impl RemoteWorkflowState {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn revalidate(&self) -> Result<(), PublishError> {
+        self.revalidate_allow_operation_temp()?;
+        if name_exists(&self.state.latest, REMOTE_OPERATION_TEMP)? {
+            return Err(recovery_required());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn acquire_workflow_lock(&self) -> Result<RemoteWorkflowLock<'_>, PublishError> {
+        self.revalidate_allow_operation_temp()?;
+        let file = create_or_open_workflow_lock(&self.state.latest)?;
+        let metadata = file.metadata().map_err(|_| rejected())?;
+        let identity = FileIdentity::from_metadata(&metadata);
+        validate_workflow_lock(&self.state.latest, &file, identity)?;
+        acquire_lock(&file)?;
+        validate_workflow_lock(&self.state.latest, &file, identity)?;
+        Ok(RemoteWorkflowLock {
+            state: self,
+            file,
+            identity,
+        })
+    }
+
+    /// Reads the exact main/temporary operation pair while the caller holds the workflow lock.
+    pub(crate) fn read_operation_candidates(
+        &self,
+        lock: &RemoteWorkflowLock<'_>,
+    ) -> Result<OperationCandidates, PublishError> {
+        lock.revalidate()?;
+        let main = read_optional_state_file(
+            &self.state.latest,
+            REMOTE_OPERATION,
+            MAX_STATE_RECORD_BYTES,
+            false,
+        )?;
+        let temporary = read_optional_state_file(
+            &self.state.latest,
+            REMOTE_OPERATION_TEMP,
+            MAX_STATE_RECORD_BYTES,
+            false,
+        )?;
+        lock.revalidate()?;
+        Ok((main, temporary))
+    }
+
+    /// Settles an already-visible exact promoted phase after a crash before parent fsync.
+    pub(crate) fn settle_visible_operation(
+        &self,
+        lock: &RemoteWorkflowLock<'_>,
+        expected: &[u8],
+    ) -> Result<(), PublishError> {
+        lock.revalidate()?;
+        self.state.latest.sync_all().map_err(|_| uncertain())?;
+        let readback = read_optional_state_file(
+            &self.state.latest,
+            REMOTE_OPERATION,
+            MAX_STATE_RECORD_BYTES,
+            false,
+        )
+        .map_err(|_| uncertain())?;
+        if readback.as_deref() != Some(expected) {
+            return Err(uncertain());
+        }
+        lock.revalidate()
+    }
+
+    /// Promotes or removes only the exact descriptor-rebound temporary operation candidate.
+    pub(crate) fn settle_operation_candidate(
+        &self,
+        lock: &RemoteWorkflowLock<'_>,
+        expected_main: Option<&[u8]>,
+        expected_temporary: &[u8],
+        promote: bool,
+    ) -> Result<(), PublishError> {
+        lock.revalidate()?;
+        let (main, temporary) = self.read_operation_candidates(lock)?;
+        if main.as_deref() != expected_main || temporary.as_deref() != Some(expected_temporary) {
+            return Err(uncertain());
+        }
+        let temporary_file =
+            open_regular_at(&self.state.latest, REMOTE_OPERATION_TEMP).map_err(|_| uncertain())?;
+        let temporary_metadata = temporary_file.metadata().map_err(|_| uncertain())?;
+        let temporary_identity = FileIdentity::from_metadata(&temporary_metadata);
+        if !secure_file(&temporary_metadata)
+            || read_descriptor(&temporary_file, temporary_metadata.len())
+                .map_err(|_| uncertain())?
+                != expected_temporary
+        {
+            return Err(uncertain());
+        }
+        let rebound =
+            open_regular_at(&self.state.latest, REMOTE_OPERATION_TEMP).map_err(|_| uncertain())?;
+        if FileIdentity::from_metadata(&rebound.metadata().map_err(|_| uncertain())?)
+            != temporary_identity
+        {
+            return Err(uncertain());
+        }
+        if promote {
+            rename_operation_temporary(&self.state.latest).map_err(|_| uncertain())?;
+        } else {
+            unlink_name(&self.state.latest, REMOTE_OPERATION_TEMP).map_err(|_| uncertain())?;
+        }
+        self.state.latest.sync_all().map_err(|_| uncertain())?;
+        if name_exists(&self.state.latest, REMOTE_OPERATION_TEMP).map_err(|_| uncertain())? {
+            return Err(uncertain());
+        }
+        let settled = read_optional_state_file(
+            &self.state.latest,
+            REMOTE_OPERATION,
+            MAX_STATE_RECORD_BYTES,
+            false,
+        )
+        .map_err(|_| uncertain())?;
+        let expected_settled = if promote {
+            Some(expected_temporary)
+        } else {
+            expected_main
+        };
+        if settled.as_deref() != expected_settled {
+            return Err(uncertain());
+        }
+        lock.revalidate()
     }
 
     pub(crate) fn read_record(
@@ -1182,6 +1336,7 @@ impl RemoteWorkflowState {
                 .ok_or_else(recovery_required);
         }
         write_unnamed_and_link(&self.state.latest, kind.name(), bytes, 0o400)?;
+        remote_record_checkpoint(kind.name())?;
         self.state.latest.sync_all().map_err(|_| uncertain())?;
         let readback = read_optional_state_file(
             &self.state.latest,
@@ -1221,6 +1376,7 @@ impl RemoteWorkflowState {
             replacement,
             0o400,
         )?;
+        remote_operation_checkpoint("durable-pre-rename")?;
         let gated = read_optional_state_file(
             &self.state.latest,
             REMOTE_OPERATION,
@@ -1231,22 +1387,8 @@ impl RemoteWorkflowState {
         if gated != expected {
             return Err(uncertain());
         }
-        let old = CString::new(REMOTE_OPERATION_TEMP).expect("fixed remote operation temporary");
-        let new = CString::new(REMOTE_OPERATION).expect("fixed remote operation record");
-        // SAFETY: both fixed names are within the retained owner-private latest directory.
-        if unsafe {
-            libc::syscall(
-                libc::SYS_renameat2,
-                self.state.latest.as_raw_fd(),
-                old.as_ptr(),
-                self.state.latest.as_raw_fd(),
-                new.as_ptr(),
-                0,
-            )
-        } != 0
-        {
-            return Err(uncertain());
-        }
+        rename_operation_temporary(&self.state.latest).map_err(|_| uncertain())?;
+        remote_operation_checkpoint("post-rename-pre-fsync")?;
         self.state.latest.sync_all().map_err(|_| uncertain())?;
         let readback = read_optional_state_file(
             &self.state.latest,
@@ -1258,6 +1400,7 @@ impl RemoteWorkflowState {
         if readback != replacement {
             return Err(uncertain());
         }
+        remote_operation_checkpoint("final-readback")?;
         self.revalidate()
     }
 }
@@ -1286,7 +1429,6 @@ fn open_remote_workflow_state_with(
     if names.contains(RECOVERY_RECORD)
         || names.contains(RECOVERY_TEMP)
         || names.contains(LATEST_TEMP)
-        || names.contains(REMOTE_OPERATION_TEMP)
     {
         return Err(recovery_required());
     }
@@ -1339,7 +1481,7 @@ fn open_remote_workflow_state_with(
         notes,
         assets,
     };
-    remote.revalidate()?;
+    remote.revalidate_allow_operation_temp()?;
     Ok(remote)
 }
 
@@ -2862,6 +3004,68 @@ fn open_regular_at(parent: &fs::File, name: &str) -> Result<fs::File, PublishErr
     )
 }
 
+fn open_workflow_lock(parent: &fs::File) -> Result<fs::File, PublishError> {
+    let name = CString::new(REMOTE_WORKFLOW_LOCK).expect("fixed workflow lock name");
+    openat2(
+        parent.as_raw_fd(),
+        &name,
+        libc::O_RDWR | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        0x02 | 0x04 | 0x08,
+    )
+}
+
+fn create_or_open_workflow_lock(parent: &fs::File) -> Result<fs::File, PublishError> {
+    let name = CString::new(REMOTE_WORKFLOW_LOCK).expect("fixed workflow lock name");
+    // SAFETY: the retained owner-private directory and fixed no-follow component are valid.
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_CREAT | libc::O_EXCL,
+            0o600,
+        )
+    };
+    if descriptor >= 0 {
+        // SAFETY: successful openat returned one owned descriptor.
+        let file = unsafe { fs::File::from_raw_fd(descriptor) };
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|_| rejected())?;
+        file.sync_all().map_err(|_| rejected())?;
+        parent.sync_all().map_err(|_| rejected())?;
+        return Ok(file);
+    }
+    if std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
+        return Err(rejected());
+    }
+    open_workflow_lock(parent)
+}
+
+fn validate_workflow_lock(
+    parent: &fs::File,
+    retained: &fs::File,
+    identity: FileIdentity,
+) -> Result<(), PublishError> {
+    let retained_metadata = retained.metadata().map_err(|_| rejected())?;
+    let rebound = open_workflow_lock(parent)?;
+    let rebound_metadata = rebound.metadata().map_err(|_| rejected())?;
+    if !retained_metadata.is_file()
+        || retained_metadata.file_type().is_symlink()
+        || retained_metadata.uid() != current_euid()
+        || retained_metadata.permissions().mode() & 0o7777 != 0o600
+        || retained_metadata.nlink() != 1
+        || retained_metadata.len() != 0
+        || FileIdentity::from_metadata(&retained_metadata) != identity
+        || FileIdentity::from_metadata(&rebound_metadata) != identity
+        || rebound_metadata.uid() != current_euid()
+        || rebound_metadata.permissions().mode() & 0o7777 != 0o600
+        || rebound_metadata.nlink() != 1
+        || rebound_metadata.len() != 0
+    {
+        return Err(recovery_required());
+    }
+    Ok(())
+}
+
 fn openat2(
     directory: i32,
     name: &CString,
@@ -3159,6 +3363,95 @@ fn link_exact(parent: &fs::File, existing: &str, new: &str) -> Result<(), Publis
     {
         return Err(recovery_required());
     }
+    Ok(())
+}
+
+fn rename_operation_temporary(parent: &fs::File) -> Result<(), PublishError> {
+    let old = CString::new(REMOTE_OPERATION_TEMP).expect("fixed remote operation temporary");
+    let new = CString::new(REMOTE_OPERATION).expect("fixed remote operation record");
+    // SAFETY: both fixed names are within the retained owner-private latest directory.
+    if unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            parent.as_raw_fd(),
+            old.as_ptr(),
+            parent.as_raw_fd(),
+            new.as_ptr(),
+            0,
+        )
+    } != 0
+    {
+        return Err(uncertain());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct RemoteSigkillPlan {
+    operation_checkpoint: Option<String>,
+    record_checkpoint: Option<String>,
+    ready: std::path::PathBuf,
+}
+
+#[cfg(test)]
+static REMOTE_SIGKILL_PLAN: std::sync::OnceLock<std::sync::Mutex<Option<RemoteSigkillPlan>>> =
+    std::sync::OnceLock::new();
+
+#[allow(dead_code)]
+#[cfg(test)]
+pub(crate) fn configure_remote_sigkill_checkpoint(
+    operation_checkpoint: Option<&str>,
+    record_checkpoint: Option<&str>,
+    ready: &Path,
+) {
+    *REMOTE_SIGKILL_PLAN
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("remote SIGKILL plan lock") = Some(RemoteSigkillPlan {
+        operation_checkpoint: operation_checkpoint.map(str::to_owned),
+        record_checkpoint: record_checkpoint.map(str::to_owned),
+        ready: ready.to_owned(),
+    });
+}
+
+#[cfg(test)]
+fn remote_operation_checkpoint(label: &str) -> Result<(), PublishError> {
+    remote_sigkill_checkpoint(|plan| plan.operation_checkpoint.as_deref() == Some(label))
+}
+
+#[cfg(not(test))]
+const fn remote_operation_checkpoint(_label: &str) -> Result<(), PublishError> {
+    Ok(())
+}
+
+#[cfg(test)]
+fn remote_record_checkpoint(name: &str) -> Result<(), PublishError> {
+    remote_sigkill_checkpoint(|plan| plan.record_checkpoint.as_deref() == Some(name))
+}
+
+#[cfg(test)]
+fn remote_sigkill_checkpoint(
+    selected: impl FnOnce(&RemoteSigkillPlan) -> bool,
+) -> Result<(), PublishError> {
+    let plan = REMOTE_SIGKILL_PLAN
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .map_err(|_| recovery_required())?
+        .clone();
+    if let Some(plan) = plan.filter(selected) {
+        let file = fs::File::create(&plan.ready).map_err(|_| recovery_required())?;
+        file.sync_all().map_err(|_| recovery_required())?;
+        loop {
+            // SAFETY: the SIGKILL test terminates this dedicated child at the checkpoint.
+            unsafe { libc::pause() };
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+const fn remote_record_checkpoint(_name: &str) -> Result<(), PublishError> {
     Ok(())
 }
 

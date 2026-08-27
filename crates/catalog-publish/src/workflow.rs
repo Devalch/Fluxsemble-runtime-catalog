@@ -16,7 +16,7 @@ use crate::{
         RemoteBoundaryError, RemoteRelease, RemoteReleaseAsset, RemoteTag, UploadSource,
     },
     local::{
-        FailureOutcome, PublishError, RemoteRecordKind, RemoteWorkflowState,
+        FailureOutcome, PublishError, RemoteRecordKind, RemoteWorkflowLock, RemoteWorkflowState,
         open_remote_workflow_state,
     },
 };
@@ -30,6 +30,8 @@ const DRAFT_RECEIPT_DOMAIN: &[u8] = b"fluxsemble:runtime-catalog-draft-receipt:v
 const APPROVAL_DOMAIN: &[u8] = b"fluxsemble:runtime-catalog-release-approval:v1\0";
 const PUBLICATION_DOMAIN: &[u8] = b"fluxsemble:runtime-catalog-publication-receipt:v1\0";
 const LATEST_DOMAIN: &[u8] = b"fluxsemble:runtime-catalog-latest-receipt:v1\0";
+const TRANSPORT_OPERATION_DOMAIN: &[u8] = b"fluxsemble:runtime-catalog-transport-operation:v1\0";
+const TRANSPORT_RECEIPT_DOMAIN: &[u8] = b"fluxsemble:runtime-catalog-transport-receipt:v1\0";
 const MAX_RECORD_BYTES: usize = 256 * 1024;
 const TRANSPORT_MANIFEST: &[u8] = include_bytes!("../../../conformance/transport/manifest-v1.json");
 const TRANSPORT_ASSET: &[u8] =
@@ -218,6 +220,35 @@ struct TransportManifestV1 {
     assets: Vec<RemoteAsset>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TransportOperationV1 {
+    schema_version: u16,
+    transport_operation_id: String,
+    repository: String,
+    local_operation_id: String,
+    signed_transfer_sha256: String,
+    source_commit: String,
+    manifest_sha256: String,
+    broker_client_config_sha256: String,
+    broker_executable_sha256: String,
+    publisher_broker_config_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TransportReceiptV1 {
+    schema_version: u16,
+    transport_receipt_id: String,
+    transport_operation_id: String,
+    repository: String,
+    source_commit: String,
+    release_id: String,
+    tag: String,
+    asset: RemoteReceiptAssetV1,
+    phase: String,
+}
+
 struct OperationHandle {
     record: RemoteOperationV1,
     bytes: Vec<u8>,
@@ -248,37 +279,12 @@ fn stage_remote_inner(
     state: &RemoteWorkflowState,
     broker: &mut dyn BrokerTransport,
 ) -> Result<RemoteWorkflowOutcome, RemoteWorkflowError> {
-    state.revalidate().map_err(local_error)?;
+    let lock = state.acquire_workflow_lock().map_err(local_error)?;
+    lock.revalidate().map_err(local_error)?;
     let broker_identity = broker.identity_digests().map_err(|_| recovery_required())?;
-    require_sha256(&broker_identity.broker_client_config_sha256)?;
-    require_sha256(&broker_identity.broker_executable_sha256)?;
-    require_sha256(&broker_identity.publisher_broker_config_sha256)?;
-    let assets = state
-        .assets()
-        .iter()
-        .map(|asset| RemoteAsset {
-            name: asset.name().to_owned(),
-            size: asset.size(),
-            sha256: asset.sha256().to_owned(),
-        })
-        .collect::<Vec<_>>();
-    require_asset_inventory(&assets, true)?;
-    let body = RemoteOperationBodyV1 {
-        repository: REPOSITORY.to_owned(),
-        local_operation_id: state.local_operation_id().to_owned(),
-        signed_transfer_sha256: state.signed_transfer_sha256().to_owned(),
-        broker_client_config_sha256: broker_identity.broker_client_config_sha256,
-        broker_executable_sha256: broker_identity.broker_executable_sha256,
-        publisher_broker_config_sha256: broker_identity.publisher_broker_config_sha256,
-        source_commit: state.source_commit().to_owned(),
-        source_tree_sha256: state.source_tree_sha256().to_owned(),
-        sequence: state.sequence(),
-        tag: state.tag().to_owned(),
-        title: state.title().to_owned(),
-        notes: state.notes().to_owned(),
-        assets,
-    };
-    validate_operation_body(&body)?;
+    let body = operation_body(state, broker_identity)?;
+    settle_pending_operation(state, &lock, Some(&body))?;
+    lock.revalidate().map_err(local_error)?;
     let remote_operation_id = domain_digest(OPERATION_DOMAIN, &body)?;
     let initial = RemoteOperationV1 {
         schema_version: 1,
@@ -292,7 +298,7 @@ fn stage_remote_inner(
 
     // Create is intentionally attempted on every pre-receipt retry. A failure is resolved only by
     // the immediately following exact readback; tags are never replaced.
-    state.revalidate().map_err(local_error)?;
+    lock.revalidate().map_err(local_error)?;
     let _create_result = broker.create_tag(
         REPOSITORY,
         &operation.record.operation.tag,
@@ -318,7 +324,7 @@ fn stage_remote_inner(
         RemoteOperationPhaseV1::TagVerified,
     )?;
 
-    let release = ensure_exact_draft(state, broker, &mut operation, false)?;
+    let release = ensure_exact_draft(state, &lock, broker, &mut operation, false)?;
     let release_id = release.release_id.clone();
     let verified_assets = operation.record.verified_assets;
     update_operation(
@@ -329,7 +335,7 @@ fn stage_remote_inner(
         RemoteOperationPhaseV1::DraftBound,
     )?;
 
-    let receipt_assets = verify_and_upload_all(state, broker, &mut operation, &release_id)?;
+    let receipt_assets = verify_and_upload_all(state, &lock, broker, &mut operation, &release_id)?;
     update_operation(
         state,
         &mut operation,
@@ -338,7 +344,7 @@ fn stage_remote_inner(
         RemoteOperationPhaseV1::AssetsVerified,
     )?;
 
-    state.revalidate().map_err(local_error)?;
+    lock.revalidate().map_err(local_error)?;
     let final_tag = broker
         .read_tag(REPOSITORY, &operation.record.operation.tag)
         .map_err(|_| mark_uncertain(state, &mut operation))?;
@@ -405,7 +411,7 @@ fn stage_remote_inner(
     state
         .write_record_no_clobber(RemoteRecordKind::DraftReceipt, &bytes)
         .map_err(local_error)?;
-    state.revalidate().map_err(local_error)?;
+    lock.revalidate().map_err(local_error)?;
     Ok(RemoteWorkflowOutcome::DraftStaged)
 }
 
@@ -433,6 +439,9 @@ fn approve_inner(
     state: &RemoteWorkflowState,
     supplied_sha256: &str,
 ) -> Result<RemoteWorkflowOutcome, RemoteWorkflowError> {
+    let lock = state.acquire_workflow_lock().map_err(local_error)?;
+    settle_pending_operation(state, &lock, None)?;
+    lock.revalidate().map_err(local_error)?;
     require_sha256(supplied_sha256)?;
     let receipt_bytes = state
         .read_record(RemoteRecordKind::DraftReceipt)
@@ -511,7 +520,12 @@ fn publish_broker_inner(
     state: &RemoteWorkflowState,
     broker: &mut dyn BrokerTransport,
 ) -> Result<(), RemoteWorkflowError> {
-    state.revalidate().map_err(local_error)?;
+    let lock = state.acquire_workflow_lock().map_err(local_error)?;
+    lock.revalidate().map_err(local_error)?;
+    let broker_identity = broker.identity_digests().map_err(|_| recovery_required())?;
+    let expected_operation = operation_body(state, broker_identity.clone())?;
+    settle_pending_operation(state, &lock, Some(&expected_operation))?;
+    lock.revalidate().map_err(local_error)?;
     let receipt_bytes = state
         .read_record(RemoteRecordKind::DraftReceipt)
         .map_err(local_error)?
@@ -524,7 +538,6 @@ fn publish_broker_inner(
         .ok_or_else(recovery_required)?;
     let approval: ReleaseApprovalV1 = parse_canonical(&approval_bytes)?;
     validate_approval(&approval, &receipt, state)?;
-    let broker_identity = broker.identity_digests().map_err(|_| recovery_required())?;
     if broker_identity.broker_client_config_sha256 != receipt.body.broker_client_config_sha256
         || broker_identity.broker_executable_sha256 != receipt.body.broker_executable_sha256
         || broker_identity.publisher_broker_config_sha256
@@ -533,7 +546,7 @@ fn publish_broker_inner(
         return Err(recovery_required());
     }
 
-    state.revalidate().map_err(local_error)?;
+    lock.revalidate().map_err(local_error)?;
     let tag = broker
         .read_tag(REPOSITORY, &receipt.body.tag)
         .map_err(|_| recovery_required())?;
@@ -549,7 +562,7 @@ fn publish_broker_inner(
         .read_record(RemoteRecordKind::PublicationReceipt)
         .map_err(local_error)?;
     if existing_publication.is_none() && before.draft {
-        state.revalidate().map_err(local_error)?;
+        lock.revalidate().map_err(local_error)?;
         let _publish_result = broker.publish_draft(REPOSITORY, &receipt.body.release_id);
     }
     let after = broker
@@ -592,6 +605,7 @@ fn publish_broker_inner(
             .write_record_no_clobber(RemoteRecordKind::PublicationReceipt, &publication_bytes)
             .map_err(local_error)?;
     }
+    lock.revalidate().map_err(local_error)?;
     Ok(())
 }
 
@@ -606,6 +620,9 @@ pub async fn verify_latest_remote(
 async fn verify_latest_production_inner(
     state: &RemoteWorkflowState,
 ) -> Result<RemoteWorkflowOutcome, RemoteWorkflowError> {
+    let lock = state.acquire_workflow_lock().map_err(local_error)?;
+    settle_pending_operation(state, &lock, None)?;
+    lock.revalidate().map_err(local_error)?;
     let verification = prepare_latest(state)?;
     let bytes = CredentialFreeLatest::fetch_catalog(&verification.expected)
         .await
@@ -629,6 +646,9 @@ fn verify_latest_inner(
     state: &RemoteWorkflowState,
     latest: &mut dyn LatestTransport,
 ) -> Result<RemoteWorkflowOutcome, RemoteWorkflowError> {
+    let lock = state.acquire_workflow_lock().map_err(local_error)?;
+    settle_pending_operation(state, &lock, None)?;
+    lock.revalidate().map_err(local_error)?;
     let verification = prepare_latest(state)?;
     let bytes = latest
         .fetch_catalog(&verification.expected)
@@ -717,21 +737,76 @@ fn complete_latest(
 
 /// Publishes only the committed support-only transport prerelease fixture.
 pub fn publish_transport_fixture(
+    state_path: &Path,
     broker_config: &Path,
     source_commit: &str,
 ) -> Result<RemoteWorkflowOutcome, RemoteWorkflowError> {
+    let state = open_remote_workflow_state(state_path).map_err(local_error)?;
     let mut broker = GitHubBroker::new(broker_config).map_err(|_| recovery_required())?;
-    publish_transport_fixture_with(&mut broker, source_commit)
+    publish_transport_fixture_inner(&state, &mut broker, source_commit)
 }
 
+#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn publish_transport_fixture_with(
+    state_path: &Path,
     broker: &mut dyn BrokerTransport,
     source_commit: &str,
 ) -> Result<RemoteWorkflowOutcome, RemoteWorkflowError> {
+    let state =
+        crate::local::open_fixture_remote_workflow_state(state_path).map_err(local_error)?;
+    publish_transport_fixture_inner(&state, broker, source_commit)
+}
+
+fn publish_transport_fixture_inner(
+    state: &RemoteWorkflowState,
+    broker: &mut dyn BrokerTransport,
+    source_commit: &str,
+) -> Result<RemoteWorkflowOutcome, RemoteWorkflowError> {
+    let lock = state.acquire_workflow_lock().map_err(local_error)?;
+    settle_pending_operation(state, &lock, None)?;
+    lock.revalidate().map_err(local_error)?;
     require_commit(source_commit)?;
     let manifest: TransportManifestV1 = parse_canonical(TRANSPORT_MANIFEST)?;
     validate_transport_manifest(&manifest)?;
-    let _broker_identity = broker.identity_digests().map_err(|_| recovery_required())?;
+    let broker_identity = broker.identity_digests().map_err(|_| recovery_required())?;
+    let transport_operation = transport_operation(state, source_commit, broker_identity)?;
+    let transport_operation_bytes = canonical(&transport_operation)?;
+    state
+        .write_record_no_clobber(
+            RemoteRecordKind::TransportOperation,
+            &transport_operation_bytes,
+        )
+        .map_err(local_error)?;
+    if let Some(receipt_bytes) = state
+        .read_record(RemoteRecordKind::TransportReceipt)
+        .map_err(local_error)?
+    {
+        let receipt: TransportReceiptV1 = parse_canonical(&receipt_bytes)?;
+        validate_transport_receipt(&receipt, &transport_operation, &manifest)?;
+        let tag = broker
+            .read_tag(REPOSITORY, &manifest.tag)
+            .map_err(|_| uncertain())?;
+        require_exact_tag(&tag, &manifest.tag, source_commit)?;
+        let release = broker
+            .read_draft(REPOSITORY, &manifest.tag)
+            .map_err(|_| uncertain())?
+            .ok_or_else(uncertain)?;
+        require_transport_release(&release, &manifest, source_commit, Some(false))?;
+        if release.release_id != receipt.release_id {
+            return Err(uncertain());
+        }
+        let [asset] = release.assets.as_slice() else {
+            return Err(recovery_required());
+        };
+        if asset.asset_id != receipt.asset.asset_id {
+            return Err(recovery_required());
+        }
+        verify_download(broker, REPOSITORY, asset, &manifest.assets[0])?;
+        lock.revalidate().map_err(local_error)?;
+        return Ok(RemoteWorkflowOutcome::TransportFixturePublished);
+    }
+    lock.revalidate().map_err(local_error)?;
     let _create_result = broker.create_tag(REPOSITORY, &manifest.tag, source_commit);
     let tag = broker
         .read_tag(REPOSITORY, &manifest.tag)
@@ -741,6 +816,7 @@ pub(crate) fn publish_transport_fixture_with(
         .read_draft(REPOSITORY, &manifest.tag)
         .map_err(|_| uncertain())?;
     if release.is_none() {
+        lock.revalidate().map_err(local_error)?;
         let _create_result = broker.create_draft(
             REPOSITORY,
             &manifest.tag,
@@ -763,6 +839,7 @@ pub(crate) fn publish_transport_fixture_with(
             .ok_or_else(uncertain)?;
         require_transport_release(&before, &manifest, source_commit, Some(true))?;
         let source = UploadSource::new(&manifest.assets[0], &file);
+        lock.revalidate().map_err(local_error)?;
         let _upload_result = broker.upload_asset(REPOSITORY, &manifest.tag, &source);
         let after = broker
             .read_draft(REPOSITORY, &manifest.tag)
@@ -784,6 +861,7 @@ pub(crate) fn publish_transport_fixture_with(
         .map_err(|_| uncertain())?;
     require_exact_tag(&verified_tag, &manifest.tag, source_commit)?;
     if release.draft {
+        lock.revalidate().map_err(local_error)?;
         let _publish_result = broker.publish_draft(REPOSITORY, &release.release_id);
     }
     let published = broker
@@ -802,7 +880,272 @@ pub(crate) fn publish_transport_fixture_with(
         return Err(recovery_required());
     };
     verify_download(broker, REPOSITORY, published_asset, &manifest.assets[0])?;
+    let receipt_body = (
+        &transport_operation.transport_operation_id,
+        REPOSITORY,
+        source_commit,
+        &published.release_id,
+        &manifest.tag,
+        &published_asset.asset_id,
+        &manifest.assets[0],
+        "published_verified",
+    );
+    let receipt = TransportReceiptV1 {
+        schema_version: 1,
+        transport_receipt_id: domain_digest(TRANSPORT_RECEIPT_DOMAIN, &receipt_body)?,
+        transport_operation_id: transport_operation.transport_operation_id.clone(),
+        repository: REPOSITORY.to_owned(),
+        source_commit: source_commit.to_owned(),
+        release_id: published.release_id,
+        tag: manifest.tag.clone(),
+        asset: RemoteReceiptAssetV1 {
+            asset_id: published_asset.asset_id.clone(),
+            name: manifest.assets[0].name.clone(),
+            size: manifest.assets[0].size,
+            sha256: manifest.assets[0].sha256.clone(),
+        },
+        phase: "published_verified".to_owned(),
+    };
+    validate_transport_receipt(&receipt, &transport_operation, &manifest)?;
+    state
+        .write_record_no_clobber(RemoteRecordKind::TransportReceipt, &canonical(&receipt)?)
+        .map_err(local_error)?;
+    lock.revalidate().map_err(local_error)?;
     Ok(RemoteWorkflowOutcome::TransportFixturePublished)
+}
+
+fn transport_operation(
+    state: &RemoteWorkflowState,
+    source_commit: &str,
+    broker_identity: crate::broker_client::BrokerIdentityDigests,
+) -> Result<TransportOperationV1, RemoteWorkflowError> {
+    require_sha256(&broker_identity.broker_client_config_sha256)?;
+    require_sha256(&broker_identity.broker_executable_sha256)?;
+    require_sha256(&broker_identity.publisher_broker_config_sha256)?;
+    let body = (
+        REPOSITORY,
+        state.local_operation_id(),
+        state.signed_transfer_sha256(),
+        source_commit,
+        sha256(TRANSPORT_MANIFEST),
+        &broker_identity.broker_client_config_sha256,
+        &broker_identity.broker_executable_sha256,
+        &broker_identity.publisher_broker_config_sha256,
+    );
+    Ok(TransportOperationV1 {
+        schema_version: 1,
+        transport_operation_id: domain_digest(TRANSPORT_OPERATION_DOMAIN, &body)?,
+        repository: REPOSITORY.to_owned(),
+        local_operation_id: state.local_operation_id().to_owned(),
+        signed_transfer_sha256: state.signed_transfer_sha256().to_owned(),
+        source_commit: source_commit.to_owned(),
+        manifest_sha256: sha256(TRANSPORT_MANIFEST),
+        broker_client_config_sha256: broker_identity.broker_client_config_sha256,
+        broker_executable_sha256: broker_identity.broker_executable_sha256,
+        publisher_broker_config_sha256: broker_identity.publisher_broker_config_sha256,
+    })
+}
+
+fn validate_transport_receipt(
+    receipt: &TransportReceiptV1,
+    operation: &TransportOperationV1,
+    manifest: &TransportManifestV1,
+) -> Result<(), RemoteWorkflowError> {
+    let body = (
+        &receipt.transport_operation_id,
+        receipt.repository.as_str(),
+        receipt.source_commit.as_str(),
+        &receipt.release_id,
+        &receipt.tag,
+        &receipt.asset.asset_id,
+        &manifest.assets[0],
+        receipt.phase.as_str(),
+    );
+    if receipt.schema_version != 1
+        || receipt.transport_receipt_id != domain_digest(TRANSPORT_RECEIPT_DOMAIN, &body)?
+        || receipt.transport_operation_id != operation.transport_operation_id
+        || receipt.repository != REPOSITORY
+        || receipt.source_commit != operation.source_commit
+        || receipt.tag != manifest.tag
+        || receipt.phase != "published_verified"
+        || !valid_decimal_id(&receipt.release_id)
+        || !valid_decimal_id(&receipt.asset.asset_id)
+        || receipt.asset.name != manifest.assets[0].name
+        || receipt.asset.size != manifest.assets[0].size
+        || receipt.asset.sha256 != manifest.assets[0].sha256
+    {
+        return Err(recovery_required());
+    }
+    Ok(())
+}
+
+fn operation_body(
+    state: &RemoteWorkflowState,
+    broker_identity: crate::broker_client::BrokerIdentityDigests,
+) -> Result<RemoteOperationBodyV1, RemoteWorkflowError> {
+    require_sha256(&broker_identity.broker_client_config_sha256)?;
+    require_sha256(&broker_identity.broker_executable_sha256)?;
+    require_sha256(&broker_identity.publisher_broker_config_sha256)?;
+    let assets = state
+        .assets()
+        .iter()
+        .map(|asset| RemoteAsset {
+            name: asset.name().to_owned(),
+            size: asset.size(),
+            sha256: asset.sha256().to_owned(),
+        })
+        .collect::<Vec<_>>();
+    require_asset_inventory(&assets, true)?;
+    let body = RemoteOperationBodyV1 {
+        repository: REPOSITORY.to_owned(),
+        local_operation_id: state.local_operation_id().to_owned(),
+        signed_transfer_sha256: state.signed_transfer_sha256().to_owned(),
+        broker_client_config_sha256: broker_identity.broker_client_config_sha256,
+        broker_executable_sha256: broker_identity.broker_executable_sha256,
+        publisher_broker_config_sha256: broker_identity.publisher_broker_config_sha256,
+        source_commit: state.source_commit().to_owned(),
+        source_tree_sha256: state.source_tree_sha256().to_owned(),
+        sequence: state.sequence(),
+        tag: state.tag().to_owned(),
+        title: state.title().to_owned(),
+        notes: state.notes().to_owned(),
+        assets,
+    };
+    validate_operation_body(&body)?;
+    Ok(body)
+}
+
+fn settle_pending_operation(
+    state: &RemoteWorkflowState,
+    lock: &RemoteWorkflowLock<'_>,
+    expected_body: Option<&RemoteOperationBodyV1>,
+) -> Result<(), RemoteWorkflowError> {
+    let (main_bytes, temporary_bytes) = state
+        .read_operation_candidates(lock)
+        .map_err(|_| uncertain())?;
+    let main = main_bytes
+        .as_deref()
+        .map(parse_canonical::<RemoteOperationV1>)
+        .transpose()
+        .map_err(|_| uncertain())?;
+    let temporary = temporary_bytes
+        .as_deref()
+        .map(parse_canonical::<RemoteOperationV1>)
+        .transpose()
+        .map_err(|_| uncertain())?;
+    if let Some(operation) = &main {
+        validate_operation_binding(operation, state, expected_body).map_err(|_| uncertain())?;
+    }
+    let Some(temporary) = temporary else {
+        if let Some(main_bytes) = main_bytes.as_deref() {
+            state
+                .settle_visible_operation(lock, main_bytes)
+                .map_err(|_| uncertain())?;
+        }
+        return Ok(());
+    };
+    validate_operation_binding(&temporary, state, expected_body).map_err(|_| uncertain())?;
+
+    let (promote, permitted) = match &main {
+        None => (
+            true,
+            temporary.phase == RemoteOperationPhaseV1::Prepared
+                && temporary.release_id.is_none()
+                && temporary.verified_assets == 0
+                && expected_body.is_some(),
+        ),
+        Some(main) if main == &temporary => (false, true),
+        Some(main) if schema_authorized_next(main, &temporary) => (true, true),
+        Some(main) if schema_authorized_next(&temporary, main) => (false, true),
+        Some(_) => (false, false),
+    };
+    if !permitted {
+        return Err(uncertain());
+    }
+    state
+        .settle_operation_candidate(
+            lock,
+            main_bytes.as_deref(),
+            temporary_bytes.as_deref().ok_or_else(uncertain)?,
+            promote,
+        )
+        .map_err(|_| uncertain())
+}
+
+fn schema_authorized_next(current: &RemoteOperationV1, next: &RemoteOperationV1) -> bool {
+    if current.schema_version != next.schema_version
+        || current.remote_operation_id != next.remote_operation_id
+        || current.operation != next.operation
+        || next.verified_assets < current.verified_assets
+        || next.verified_assets > current.verified_assets.saturating_add(1)
+        || current.release_id.is_some() && current.release_id != next.release_id
+    {
+        return false;
+    }
+    if next.phase == RemoteOperationPhaseV1::Uncertain {
+        return next.release_id == current.release_id
+            && next.verified_assets == current.verified_assets;
+    }
+    match current.phase {
+        RemoteOperationPhaseV1::Prepared => {
+            next.phase == RemoteOperationPhaseV1::TagVerified
+                && next.release_id.is_none()
+                && next.verified_assets == 0
+        }
+        RemoteOperationPhaseV1::TagVerified => {
+            next.phase == RemoteOperationPhaseV1::DraftBound
+                && next.release_id.is_some()
+                && next.verified_assets == 0
+        }
+        RemoteOperationPhaseV1::DraftBound => {
+            next.phase == RemoteOperationPhaseV1::Uploading
+                && next.release_id == current.release_id
+                && next.verified_assets == 1
+        }
+        RemoteOperationPhaseV1::Uploading => {
+            (next.phase == RemoteOperationPhaseV1::Uploading
+                && next.release_id == current.release_id
+                && next.verified_assets == current.verified_assets + 1)
+                || (next.phase == RemoteOperationPhaseV1::AssetsVerified
+                    && next.release_id == current.release_id
+                    && next.verified_assets == current.operation.assets.len() as u16
+                    && current.verified_assets == next.verified_assets)
+        }
+        RemoteOperationPhaseV1::AssetsVerified => false,
+        RemoteOperationPhaseV1::Uncertain => operation_phase_shape(next),
+    }
+}
+
+fn validate_operation_binding(
+    operation: &RemoteOperationV1,
+    state: &RemoteWorkflowState,
+    expected_body: Option<&RemoteOperationBodyV1>,
+) -> Result<(), RemoteWorkflowError> {
+    validate_operation(operation)?;
+    if expected_body.is_some_and(|expected| &operation.operation != expected)
+        || operation.operation.local_operation_id != state.local_operation_id()
+        || operation.operation.signed_transfer_sha256 != state.signed_transfer_sha256()
+        || operation.operation.source_commit != state.source_commit()
+        || operation.operation.source_tree_sha256 != state.source_tree_sha256()
+        || operation.operation.sequence != state.sequence()
+        || operation.operation.tag != state.tag()
+        || operation.operation.title != state.title()
+        || operation.operation.notes != state.notes()
+        || operation.operation.assets.len() != state.assets().len()
+        || operation
+            .operation
+            .assets
+            .iter()
+            .zip(state.assets())
+            .any(|(operated, local)| {
+                operated.name != local.name()
+                    || operated.size != local.size()
+                    || operated.sha256 != local.sha256()
+            })
+    {
+        return Err(recovery_required());
+    }
+    Ok(())
 }
 
 fn begin_operation(
@@ -850,7 +1193,7 @@ fn update_operation(
     let mut next = handle.record.clone();
     next.release_id = release_id.or_else(|| next.release_id.clone());
     next.verified_assets = next.verified_assets.max(verified_assets);
-    next.phase = phase;
+    next.phase = monotonic_phase(&handle.record, phase, next.verified_assets);
     validate_operation(&next)?;
     let bytes = canonical(&next)?;
     if bytes != handle.bytes {
@@ -861,6 +1204,55 @@ fn update_operation(
         handle.bytes = bytes;
     }
     Ok(())
+}
+
+fn monotonic_phase(
+    current: &RemoteOperationV1,
+    requested: RemoteOperationPhaseV1,
+    verified_assets: u16,
+) -> RemoteOperationPhaseV1 {
+    if requested == RemoteOperationPhaseV1::Uncertain {
+        return requested;
+    }
+    if current.phase == RemoteOperationPhaseV1::Uncertain {
+        if verified_assets > 0 {
+            return if requested == RemoteOperationPhaseV1::AssetsVerified {
+                requested
+            } else {
+                RemoteOperationPhaseV1::Uploading
+            };
+        }
+        if current.release_id.is_some() {
+            return if matches!(
+                requested,
+                RemoteOperationPhaseV1::DraftBound
+                    | RemoteOperationPhaseV1::Uploading
+                    | RemoteOperationPhaseV1::AssetsVerified
+            ) {
+                RemoteOperationPhaseV1::DraftBound
+            } else {
+                RemoteOperationPhaseV1::Uncertain
+            };
+        }
+        return if requested == RemoteOperationPhaseV1::TagVerified {
+            requested
+        } else {
+            RemoteOperationPhaseV1::Uncertain
+        };
+    }
+    let rank = |phase| match phase {
+        RemoteOperationPhaseV1::Prepared => 0,
+        RemoteOperationPhaseV1::TagVerified => 1,
+        RemoteOperationPhaseV1::DraftBound => 2,
+        RemoteOperationPhaseV1::Uploading => 3,
+        RemoteOperationPhaseV1::AssetsVerified => 4,
+        RemoteOperationPhaseV1::Uncertain => 5,
+    };
+    if rank(requested) < rank(current.phase) {
+        current.phase
+    } else {
+        requested
+    }
 }
 
 fn mark_operation_uncertain(
@@ -888,6 +1280,7 @@ fn mark_uncertain(
 
 fn ensure_exact_draft(
     state: &RemoteWorkflowState,
+    lock: &RemoteWorkflowLock<'_>,
     broker: &mut dyn BrokerTransport,
     operation: &mut OperationHandle,
     prerelease: bool,
@@ -896,7 +1289,7 @@ fn ensure_exact_draft(
         .read_draft(REPOSITORY, &operation.record.operation.tag)
         .map_err(|_| mark_uncertain(state, operation))?;
     if release.is_none() {
-        state.revalidate().map_err(local_error)?;
+        lock.revalidate().map_err(local_error)?;
         let _create_result = broker.create_draft(
             REPOSITORY,
             &operation.record.operation.tag,
@@ -925,6 +1318,7 @@ fn ensure_exact_draft(
 
 fn verify_and_upload_all(
     state: &RemoteWorkflowState,
+    lock: &RemoteWorkflowLock<'_>,
     broker: &mut dyn BrokerTransport,
     operation: &mut OperationHandle,
     release_id: &str,
@@ -950,7 +1344,7 @@ fn verify_and_upload_all(
             if before.assets.len() != index {
                 return Err(mark_uncertain(state, operation));
             }
-            state.revalidate().map_err(local_error)?;
+            lock.revalidate().map_err(local_error)?;
             let local = state
                 .assets()
                 .get(index)
@@ -1167,10 +1561,34 @@ fn validate_operation(operation: &RemoteOperationV1) -> Result<(), RemoteWorkflo
             .release_id
             .as_ref()
             .is_some_and(|release_id| !valid_decimal_id(release_id))
+        || !operation_phase_shape(operation)
     {
         return Err(recovery_required());
     }
     Ok(())
+}
+
+fn operation_phase_shape(operation: &RemoteOperationV1) -> bool {
+    match operation.phase {
+        RemoteOperationPhaseV1::Prepared | RemoteOperationPhaseV1::TagVerified => {
+            operation.release_id.is_none() && operation.verified_assets == 0
+        }
+        RemoteOperationPhaseV1::DraftBound => {
+            operation.release_id.is_some() && operation.verified_assets == 0
+        }
+        RemoteOperationPhaseV1::Uploading => {
+            operation.release_id.is_some()
+                && operation.verified_assets > 0
+                && (operation.verified_assets as usize) <= operation.operation.assets.len()
+        }
+        RemoteOperationPhaseV1::AssetsVerified => {
+            operation.release_id.is_some()
+                && operation.verified_assets as usize == operation.operation.assets.len()
+        }
+        RemoteOperationPhaseV1::Uncertain => {
+            operation.release_id.is_some() || operation.verified_assets == 0
+        }
+    }
 }
 
 fn validate_operation_body(body: &RemoteOperationBodyV1) -> Result<(), RemoteWorkflowError> {

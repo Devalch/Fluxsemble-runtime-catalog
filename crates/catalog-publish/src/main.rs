@@ -121,13 +121,24 @@ fn run() -> Result<String, FailureOutcome> {
                 _ => Err(FailureOutcome::Normal),
             }
         }
-        [command, commit_flag, commit, config_flag, config]
-            if command == "publish-transport-fixture" =>
-        {
+        [
+            command,
+            state_flag,
+            state,
+            commit_flag,
+            commit,
+            config_flag,
+            config,
+        ] if command == "publish-transport-fixture" => {
+            require_flag(state_flag, "--state")?;
             require_flag(commit_flag, "--source-commit")?;
             require_flag(config_flag, "--broker-config")?;
-            match catalog_publish::publish_transport_fixture(Path::new(config), commit)
-                .map_err(|error| error.outcome())?
+            match catalog_publish::publish_transport_fixture(
+                Path::new(state),
+                Path::new(config),
+                commit,
+            )
+            .map_err(|error| error.outcome())?
             {
                 catalog_publish::RemoteWorkflowOutcome::TransportFixturePublished => {
                     Ok("transport fixture prerelease published".to_owned())
