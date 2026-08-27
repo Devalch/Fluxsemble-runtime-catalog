@@ -526,6 +526,7 @@ impl DownloadCapability {
         streamed_size: u64,
         streamed_sha256: &str,
         block_after_first_write: bool,
+        #[cfg(test)] checkpoints: &mut dyn BrokerTestCheckpoints,
     ) -> Result<(u64, String), BrokerError> {
         if streamed_size == 0 || streamed_size > MAX_ASSET_BYTES {
             return Err(rejected());
@@ -545,8 +546,15 @@ impl DownloadCapability {
             );
         }
         supervise_raw_helper(pid, Instant::now() + DOWNLOAD_SETTLEMENT_TIMEOUT)?;
-        self.identity.size = streamed_size;
-        self.identity.mode = 0o400;
+        #[cfg(test)]
+        checkpoints.after_download_settlement_helper();
+        let final_identity = Identity {
+            size: streamed_size,
+            mode: 0o400,
+            ..self.identity
+        };
+        verify_download_after_settlement(self, spool, final_identity, streamed_sha256)?;
+        self.identity = final_identity;
         self.settled = true;
         Ok((streamed_size, streamed_sha256.to_owned()))
     }
@@ -580,6 +588,7 @@ pub(crate) trait BrokerTestCheckpoints {
     fn after_executable_hash(&mut self) {}
     fn before_spawn(&mut self) {}
     fn after_final_rebind(&mut self) {}
+    fn after_download_settlement_helper(&mut self) {}
     fn block_download_settlement_after_first_write(&mut self) -> bool {
         false
     }
@@ -720,6 +729,8 @@ fn execute_impl(
             stream.size,
             &stream.sha256,
             block_after_first_write,
+            #[cfg(test)]
+            checkpoints,
         )?;
         let BrokerRequestV1::DownloadAsset { asset_id, name, .. } = request else {
             return Err(rejected());
@@ -1283,6 +1294,77 @@ fn verify_download_before_spawn(capability: &DownloadCapability) -> Result<(), B
         return Err(rejected());
     }
     Ok(())
+}
+
+fn verify_download_after_settlement(
+    capability: &DownloadCapability,
+    spool: &DownloadSpool,
+    final_identity: Identity,
+    expected_sha256: &str,
+) -> Result<(), BrokerError> {
+    let retained_parent_metadata = capability.parent.metadata().map_err(|_| rejected())?;
+    let canonical_parent = open_absolute_no_links(
+        &capability.parent_path,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+    )?;
+    let canonical_parent_metadata = canonical_parent.metadata().map_err(|_| rejected())?;
+    if !exact_download_parent_identity(
+        Identity::from_metadata(&retained_parent_metadata),
+        capability.parent_identity,
+    ) || !exact_download_parent_identity(
+        Identity::from_metadata(&canonical_parent_metadata),
+        capability.parent_identity,
+    ) || !secure_private_directory(&retained_parent_metadata)
+        || !secure_private_directory(&canonical_parent_metadata)
+    {
+        return Err(rejected());
+    }
+
+    let retained_metadata = capability.file.metadata().map_err(|_| rejected())?;
+    let canonical_leaf = openat_regular(&canonical_parent, &capability.name, libc::O_RDONLY)?;
+    let canonical_leaf_metadata = canonical_leaf.metadata().map_err(|_| rejected())?;
+    if Identity::from_metadata(&retained_metadata) != final_identity
+        || Identity::from_metadata(&canonical_leaf_metadata) != final_identity
+        || !secure_download_file(&retained_metadata, final_identity, 0o400)
+        || !secure_download_file(&canonical_leaf_metadata, final_identity, 0o400)
+        || hash_descriptor(&spool.file, final_identity.size)? != expected_sha256
+        || hash_descriptor(&capability.file, final_identity.size)? != expected_sha256
+        || hash_descriptor(&canonical_leaf, final_identity.size)? != expected_sha256
+        || !descriptor_readback_matches(&spool.file, &capability.file, final_identity.size)?
+        || !descriptor_readback_matches(&spool.file, &canonical_leaf, final_identity.size)?
+    {
+        return Err(rejected());
+    }
+    Ok(())
+}
+
+fn exact_download_parent_identity(actual: Identity, expected: Identity) -> bool {
+    actual.device == expected.device
+        && actual.inode == expected.inode
+        && actual.owner == expected.owner
+        && actual.mode == expected.mode
+        && actual.links == expected.links
+}
+
+fn descriptor_readback_matches(
+    expected: &fs::File,
+    actual: &fs::File,
+    size: u64,
+) -> Result<bool, BrokerError> {
+    let mut offset = 0_u64;
+    let mut expected_bytes = [0_u8; IO_CHUNK_BYTES];
+    let mut actual_bytes = [0_u8; IO_CHUNK_BYTES];
+    while offset < size {
+        let count =
+            usize::try_from((size - offset).min(IO_CHUNK_BYTES as u64)).map_err(|_| rejected())?;
+        read_descriptor_at(expected, offset, &mut expected_bytes[..count])?;
+        read_descriptor_at(actual, offset, &mut actual_bytes[..count])?;
+        if expected_bytes[..count] != actual_bytes[..count] {
+            return Ok(false);
+        }
+        offset = offset.checked_add(count as u64).ok_or_else(rejected)?;
+    }
+    Ok(true)
 }
 
 fn create_download_spool() -> Result<DownloadSpool, BrokerError> {
@@ -1926,20 +2008,29 @@ fn process_containment_filter() -> Vec<libc::sock_filter> {
     const BPF_LD_W_ABS: u16 = 0x20;
     const BPF_JMP_JEQ_K: u16 = 0x15;
     const BPF_JMP_JGE_K: u16 = 0x35;
+    const BPF_ALU_AND_K: u16 = 0x54;
     const BPF_RET_K: u16 = 0x06;
     const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
     const X32_SYSCALL_BIT: u32 = 0x4000_0000;
     const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
     const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
     const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
-    // Go's Linux runtime creates only thread-group members with shared address space, files,
-    // handlers, and System V semaphore adjustments. No optional process-form flag is accepted.
-    const GO_RUNTIME_THREAD_CLONE_FLAGS: u32 = (libc::CLONE_VM
+    // Offline compatibility evidence for the pinned /usr/bin/gh is Fedora gh 2.97.0-2.fc44,
+    // SHA-256 16fdbf30d6f97bc5b0fb94745e00fa06ae68beb6c6653d7f584b32602800397d,
+    // built with Go 1.26.5. go1.26.5/src/runtime/os_linux.go uses this base thread set;
+    // runtime/sys_linux_amd64.s adds CLONE_SETTLS for normal newosproc, while newosproc0 can use
+    // the bare set. TID-address metadata changes bookkeeping only and cannot create a process.
+    const GO_RUNTIME_THREAD_CLONE_REQUIRED: u32 = (libc::CLONE_VM
         | libc::CLONE_FS
         | libc::CLONE_FILES
         | libc::CLONE_SIGHAND
         | libc::CLONE_SYSVSEM
         | libc::CLONE_THREAD) as u32;
+    const GO_RUNTIME_THREAD_CLONE_ALLOWED: u32 = GO_RUNTIME_THREAD_CLONE_REQUIRED
+        | libc::CLONE_SETTLS as u32
+        | libc::CLONE_PARENT_SETTID as u32
+        | libc::CLONE_CHILD_SETTID as u32
+        | libc::CLONE_CHILD_CLEARTID as u32;
 
     let statement = |code, k| libc::sock_filter {
         code,
@@ -1956,13 +2047,17 @@ fn process_containment_filter() -> Vec<libc::sock_filter> {
         statement(BPF_LD_W_ABS, 0),
         jump(BPF_JMP_JGE_K, X32_SYSCALL_BIT, 0, 1),
         statement(BPF_RET_K, SECCOMP_RET_KILL_PROCESS),
-        // clone is allowed only for the one exact Go thread-only flag set. The high flag word
-        // must be zero, so no hidden future flag can turn this into process creation.
-        jump(BPF_JMP_JEQ_K, libc::SYS_clone as u32, 0, 6),
+        // clone is admitted only when every thread-sharing bit is present and no bit outside the
+        // bounded runtime metadata allowlist is present. The high flag word must also be zero.
+        jump(BPF_JMP_JEQ_K, libc::SYS_clone as u32, 0, 10),
         statement(BPF_LD_W_ABS, 20),
-        jump(BPF_JMP_JEQ_K, 0, 0, 2),
+        jump(BPF_JMP_JEQ_K, 0, 0, 6),
         statement(BPF_LD_W_ABS, 16),
-        jump(BPF_JMP_JEQ_K, GO_RUNTIME_THREAD_CLONE_FLAGS, 1, 0),
+        statement(BPF_ALU_AND_K, GO_RUNTIME_THREAD_CLONE_REQUIRED),
+        jump(BPF_JMP_JEQ_K, GO_RUNTIME_THREAD_CLONE_REQUIRED, 0, 3),
+        statement(BPF_LD_W_ABS, 16),
+        statement(BPF_ALU_AND_K, !GO_RUNTIME_THREAD_CLONE_ALLOWED),
+        jump(BPF_JMP_JEQ_K, 0, 1, 0),
         statement(BPF_RET_K, errno),
         statement(BPF_RET_K, SECCOMP_RET_ALLOW),
         statement(BPF_LD_W_ABS, 0),

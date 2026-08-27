@@ -4,7 +4,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     io::Write,
-    os::unix::fs::{DirBuilderExt, PermissionsExt, symlink},
+    os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt, symlink},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -77,6 +77,7 @@ fn make_tree_writable(path: &Path) -> std::io::Result<()> {
 
 const FAKE_C: &str = r#"
 #define _GNU_SOURCE
+#include <asm/prctl.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -148,11 +149,40 @@ static int syscall_errno(long result) {
 
 static volatile int thread_clone_ran;
 static unsigned char thread_stack[64 * 1024];
+static unsigned char probe_thread_stacks[32][64 * 1024];
 
 static int thread_clone_main(void *unused) {
     (void)unused;
     thread_clone_ran = 1;
     return 0;
+}
+
+static int raw_clone_errno(unsigned long flags) {
+    errno = 0;
+    return syscall_errno(syscall(SYS_clone, flags, NULL, NULL, NULL, 0));
+}
+
+static int controlled_thread_clone_errno(unsigned long flags, size_t stack_index, void *tls) {
+    int parent_tid = 0;
+    volatile int child_tid = 1;
+    thread_clone_ran = 0;
+    errno = 0;
+    int result = clone(
+        thread_clone_main,
+        probe_thread_stacks[stack_index] + sizeof(probe_thread_stacks[stack_index]),
+        (int)flags,
+        NULL,
+        &parent_tid,
+        tls,
+        &child_tid
+    );
+    int result_errno = syscall_errno(result);
+    for (int attempt = 0; result >= 0 && !thread_clone_ran && attempt < 1000; attempt++) sleep_ms(1);
+    for (int attempt = 0;
+         result >= 0 && (flags & CLONE_CHILD_CLEARTID) != 0 && child_tid != 0 && attempt < 1000;
+         attempt++) sleep_ms(1);
+    if (result >= 0 && (flags & CLONE_CHILD_CLEARTID) == 0) sleep_ms(2);
+    return result_errno;
 }
 
 static void append_containment_probe(void) {
@@ -178,8 +208,72 @@ static void append_containment_probe(void) {
     errno = 0; int setns_errno = syscall_errno(syscall(SYS_setns, -1, 0));
     errno = 0; int mount_errno = syscall_errno(syscall(SYS_mount, NULL, NULL, NULL, 0, NULL));
 
-    const int thread_flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
+    const unsigned long thread_flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
         CLONE_SYSVSEM | CLONE_THREAD;
+    void *current_tls = NULL;
+    if (syscall(SYS_arch_prctl, ARCH_GET_FS, &current_tls) != 0) _exit(86);
+    int settls_errno = controlled_thread_clone_errno(thread_flags | CLONE_SETTLS, 0, current_tls);
+    int tid_parent_errno = controlled_thread_clone_errno(
+        thread_flags | CLONE_PARENT_SETTID, 1, NULL
+    );
+    int tid_child_errno = controlled_thread_clone_errno(
+        thread_flags | CLONE_PARENT_SETTID | CLONE_CHILD_SETTID, 2, NULL
+    );
+    int tid_clear_errno = controlled_thread_clone_errno(
+        thread_flags | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID, 3, NULL
+    );
+    int tid_all_errno = controlled_thread_clone_errno(
+        thread_flags | CLONE_PARENT_SETTID | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID, 4, NULL
+    );
+
+    int missing_vm_errno = controlled_thread_clone_errno(
+        (thread_flags & ~CLONE_VM) | CLONE_PARENT_SETTID, 5, NULL
+    );
+    int missing_fs_errno = controlled_thread_clone_errno(
+        (thread_flags & ~CLONE_FS) | CLONE_PARENT_SETTID, 6, NULL
+    );
+    int missing_files_errno = controlled_thread_clone_errno(
+        (thread_flags & ~CLONE_FILES) | CLONE_PARENT_SETTID, 7, NULL
+    );
+    int missing_sighand_errno = controlled_thread_clone_errno(
+        (thread_flags & ~CLONE_SIGHAND) | CLONE_PARENT_SETTID, 8, NULL
+    );
+    int missing_sysvsem_errno = controlled_thread_clone_errno(
+        (thread_flags & ~CLONE_SYSVSEM) | CLONE_PARENT_SETTID, 9, NULL
+    );
+    int missing_thread_errno = controlled_thread_clone_errno(
+        (thread_flags & ~CLONE_THREAD) | CLONE_PARENT_SETTID, 10, NULL
+    );
+
+    int extra_signal_errno = controlled_thread_clone_errno(
+        thread_flags | CLONE_PARENT_SETTID | SIGCHLD, 11, NULL
+    );
+    int extra_parent_errno = controlled_thread_clone_errno(
+        thread_flags | CLONE_PARENT_SETTID | CLONE_PARENT, 12, NULL
+    );
+    int extra_vfork_errno = controlled_thread_clone_errno(
+        thread_flags | CLONE_PARENT_SETTID | CLONE_VFORK, 13, NULL
+    );
+    int extra_ptrace_errno = controlled_thread_clone_errno(
+        thread_flags | CLONE_PARENT_SETTID | CLONE_PTRACE, 14, NULL
+    );
+    int extra_untraced_errno = controlled_thread_clone_errno(
+        thread_flags | CLONE_PARENT_SETTID | CLONE_UNTRACED, 15, NULL
+    );
+    int extra_newns_errno = controlled_thread_clone_errno(
+        thread_flags | CLONE_PARENT_SETTID | CLONE_NEWNS, 16, NULL
+    );
+    int extra_newuser_errno = controlled_thread_clone_errno(
+        thread_flags | CLONE_PARENT_SETTID | CLONE_NEWUSER, 17, NULL
+    );
+    int extra_newpid_errno = controlled_thread_clone_errno(
+        thread_flags | CLONE_PARENT_SETTID | CLONE_NEWPID, 18, NULL
+    );
+    int extra_newnet_errno = controlled_thread_clone_errno(
+        thread_flags | CLONE_PARENT_SETTID | CLONE_NEWNET, 19, NULL
+    );
+    int high_word_errno = raw_clone_errno(thread_flags | (1UL << 32));
+
     errno = 0;
     int thread_result = clone(thread_clone_main, thread_stack + sizeof(thread_stack), thread_flags, NULL);
     int thread_errno = syscall_errno(thread_result);
@@ -190,6 +284,18 @@ static void append_containment_probe(void) {
         "setsid=%d\nsetpgid=%d\nfork=%d\nvfork=%d\nprocess_clone=%d\nclone3=%d\nunshare=%d\nsetns=%d\nmount=%d\nthread_clone=%d\nthread_ran=%d\n",
         setsid_errno, setpgid_errno, fork_errno, vfork_errno, clone_errno, clone3_errno,
         unshare_errno, setns_errno, mount_errno, thread_errno, thread_clone_ran);
+    fprintf(snapshot,
+        "settls_clone=%d\ntid_parent=%d\ntid_child=%d\ntid_clear=%d\ntid_all=%d\n",
+        settls_errno, tid_parent_errno, tid_child_errno, tid_clear_errno, tid_all_errno);
+    fprintf(snapshot,
+        "missing_vm=%d\nmissing_fs=%d\nmissing_files=%d\nmissing_sighand=%d\nmissing_sysvsem=%d\nmissing_thread=%d\n",
+        missing_vm_errno, missing_fs_errno, missing_files_errno, missing_sighand_errno,
+        missing_sysvsem_errno, missing_thread_errno);
+    fprintf(snapshot,
+        "extra_signal=%d\nextra_parent=%d\nextra_vfork=%d\nextra_ptrace=%d\nextra_untraced=%d\nextra_newns=%d\nextra_newuser=%d\nextra_newpid=%d\nextra_newnet=%d\nhigh_word=%d\n",
+        extra_signal_errno, extra_parent_errno, extra_vfork_errno, extra_ptrace_errno,
+        extra_untraced_errno, extra_newns_errno, extra_newuser_errno, extra_newpid_errno,
+        extra_newnet_errno, high_word_errno);
     fputs("PROBE_END\n", snapshot);
     fclose(snapshot);
 }
@@ -954,6 +1060,53 @@ fn seccomp_denies_process_and_session_escape_but_allows_runtime_thread_clone() {
     }
     assert!(outcomes.lines().any(|line| line == "thread_clone=0"));
     assert!(outcomes.lines().any(|line| line == "thread_ran=1"));
+    let errno = |name: &str| {
+        outcomes
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}=")))
+            .and_then(|value| value.parse::<i32>().ok())
+            .unwrap_or_else(|| panic!("missing clone outcome for {name}: {outcomes}"))
+    };
+    assert_ne!(errno("settls_clone"), libc::EPERM);
+    for metadata_probe in ["tid_parent", "tid_child", "tid_clear", "tid_all"] {
+        assert_ne!(
+            errno(metadata_probe),
+            libc::EPERM,
+            "safe TID metadata was rejected: {metadata_probe}"
+        );
+    }
+    for missing_required in [
+        "missing_vm",
+        "missing_fs",
+        "missing_files",
+        "missing_sighand",
+        "missing_sysvsem",
+        "missing_thread",
+    ] {
+        assert_eq!(
+            errno(missing_required),
+            libc::EPERM,
+            "clone missing a required thread-sharing flag was admitted: {missing_required}"
+        );
+    }
+    for forbidden_extra in [
+        "extra_signal",
+        "extra_parent",
+        "extra_vfork",
+        "extra_ptrace",
+        "extra_untraced",
+        "extra_newns",
+        "extra_newuser",
+        "extra_newpid",
+        "extra_newnet",
+        "high_word",
+    ] {
+        assert_eq!(
+            errno(forbidden_extra),
+            libc::EPERM,
+            "clone with a forbidden process flag was admitted: {forbidden_extra}"
+        );
+    }
 
     let post_exec = Fixture::new(
         "containment-persists-across-later-exec",
@@ -1107,6 +1260,71 @@ fn download_is_broker_streamed_bounded_and_removes_partial_or_descendant_output(
         started.elapsed()
     );
     assert!(!output.exists(), "exact partial settlement inode survived");
+}
+
+#[test]
+fn download_rebinds_the_canonical_parent_and_leaf_after_settlement() {
+    struct SwapParentAfterSettlementHelper {
+        requested_parent: PathBuf,
+        retained_parent: PathBuf,
+        replacement_parent: PathBuf,
+    }
+    impl BrokerTestCheckpoints for SwapParentAfterSettlementHelper {
+        fn after_download_settlement_helper(&mut self) {
+            fs::rename(&self.requested_parent, &self.retained_parent).unwrap();
+            fs::rename(&self.replacement_parent, &self.requested_parent).unwrap();
+        }
+    }
+
+    let fixture = Fixture::new(
+        "download-post-settlement-parent-swap",
+        FakeBehavior::Success,
+        b"settled-download-canary",
+    );
+    let replacement = TempTree::new("download-canonical-parent-replacement");
+    let replacement_output = replacement.path("swapped.bin");
+    fs::write(&replacement_output, b"canonical-replacement-canary").unwrap();
+    fs::set_permissions(&replacement_output, fs::Permissions::from_mode(0o600)).unwrap();
+    let replacement_identity = fs::metadata(&replacement_output).unwrap();
+    let requested_parent = fixture.root.0.clone();
+    let retained_parent = requested_parent.with_extension("retained-parent");
+    let request = BrokerRequestV1::DownloadAsset {
+        schema_version: 1,
+        repository: REPOSITORY.to_owned(),
+        asset_id: "9".to_owned(),
+        name: "swapped.bin".to_owned(),
+        output_path: requested_parent
+            .join("swapped.bin")
+            .to_str()
+            .unwrap()
+            .to_owned(),
+    };
+    let mut checkpoint = SwapParentAfterSettlementHelper {
+        requested_parent: requested_parent.clone(),
+        retained_parent: retained_parent.clone(),
+        replacement_parent: replacement.0.clone(),
+    };
+
+    assert!(
+        broker::execute_with_test_checkpoints(&fixture.config, &request, &mut checkpoint).is_err(),
+        "download succeeded after its requested canonical parent was replaced"
+    );
+    let canonical_replacement = requested_parent.join("swapped.bin");
+    assert_eq!(
+        fs::read(&canonical_replacement).unwrap(),
+        b"canonical-replacement-canary"
+    );
+    let after_identity = fs::metadata(&canonical_replacement).unwrap();
+    assert_eq!(after_identity.dev(), replacement_identity.dev());
+    assert_eq!(after_identity.ino(), replacement_identity.ino());
+    assert_eq!(after_identity.permissions().mode() & 0o7777, 0o600);
+    assert!(
+        !retained_parent.join("swapped.bin").exists(),
+        "cleanup did not remove the exact settled inode from the retained old parent"
+    );
+
+    fs::rename(&requested_parent, &replacement.0).unwrap();
+    fs::rename(&retained_parent, &requested_parent).unwrap();
 }
 
 #[test]
