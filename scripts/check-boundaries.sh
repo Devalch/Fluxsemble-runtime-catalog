@@ -2561,9 +2561,9 @@ import copy
 import hashlib
 import json
 import os
-import stat
 import subprocess
 import sys
+import tempfile
 
 paths = {
     "ignore": Path(".gitignore"),
@@ -2580,9 +2580,6 @@ paths = {
     "parity_test": Path("scripts/test_catalog_parity_cases.py"),
 }
 current = {name: path.read_bytes() for name, path in paths.items()}
-tracked = subprocess.check_output(
-    ["git", "ls-files", "--cached", "--others", "--exclude-standard"], text=True
-).splitlines()
 
 SUPPORT_BASENAMES = {
     "pi-package-e02deae1cec07035807436c1864c88342e2f7d49050d03b858a3719f0c7aedbf.json",
@@ -2594,27 +2591,249 @@ SUPPORT_IDENTITIES = {
 }
 
 
-def tracked_regular_identities():
+def support_separation_errors(
+    regular_identities,
+    support_basenames=SUPPORT_BASENAMES,
+    support_identities=SUPPORT_IDENTITIES,
+):
+    errors = []
+    if any(PurePosixPath(name).name in support_basenames for name in regular_identities):
+        errors.append("tracked deterministic support basename")
+    if any(identity in support_identities for identity in regular_identities.values()):
+        errors.append("tracked exact support bytes")
+    return errors
+
+
+MAX_GIT_LISTING_BYTES = 8 * 1024 * 1024
+MAX_GIT_RECORD_BYTES = 16 * 1024
+MAX_TRACKED_ENTRIES = 4096
+MAX_TRACKED_BLOB_BYTES = 8 * 1024 * 1024
+MAX_TOTAL_TRACKED_BLOB_BYTES = 64 * 1024 * 1024
+EXPECTED_INDEX_MODES = frozenset((b"100644", b"100755"))
+HEX_BYTES = frozenset(b"0123456789abcdef")
+
+
+def bounded_nul_records(command, repository, maximum_records=MAX_TRACKED_ENTRIES):
+    process = subprocess.Popen(
+        command,
+        cwd=repository,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    if process.stdout is None:
+        raise RuntimeError("Git listing stdout unavailable")
+    records = []
+    pending = bytearray()
+    total = 0
+    try:
+        while chunk := process.stdout.read(64 * 1024):
+            total += len(chunk)
+            if total > MAX_GIT_LISTING_BYTES:
+                raise ValueError("Git listing exceeds byte bound")
+            pending.extend(chunk)
+            while True:
+                terminator = pending.find(0)
+                if terminator < 0:
+                    if len(pending) > MAX_GIT_RECORD_BYTES:
+                        raise ValueError("Git listing record exceeds byte bound")
+                    break
+                record = bytes(pending[:terminator])
+                del pending[:terminator + 1]
+                if not record or len(record) > MAX_GIT_RECORD_BYTES:
+                    raise ValueError("malformed Git listing record")
+                records.append(record)
+                if len(records) > maximum_records:
+                    raise ValueError("Git listing exceeds entry bound")
+        if pending:
+            raise ValueError("Git listing is not NUL terminated")
+        if process.wait(timeout=10) != 0:
+            raise RuntimeError("Git listing failed")
+    except BaseException:
+        process.kill()
+        process.wait()
+        raise
+    return records
+
+
+def decoded_git_path(encoded):
+    if not encoded or b"\0" in encoded:
+        raise ValueError("malformed indexed path")
+    decoded = os.fsdecode(encoded)
+    path = PurePosixPath(decoded)
+    if (
+        os.fsencode(decoded) != encoded
+        or decoded != str(path)
+        or path.is_absolute()
+        or any(part in ("", ".", "..") for part in path.parts)
+    ):
+        raise ValueError("ambiguous indexed path decoding")
+    return decoded
+
+
+def indexed_blob_identity(repository, encoded_object, declared_total):
+    if (
+        len(encoded_object) not in (40, 64)
+        or any(byte not in HEX_BYTES for byte in encoded_object)
+    ):
+        raise ValueError("malformed indexed object name")
+    object_name = encoded_object.decode("ascii")
+    metadata = subprocess.run(
+        ["git", "cat-file", "--batch-check=%(objecttype) %(objectsize)"],
+        cwd=repository,
+        input=encoded_object + b"\n",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=True,
+        timeout=10,
+    ).stdout
+    if len(metadata) > 96 or not metadata.endswith(b"\n"):
+        raise ValueError("malformed indexed object metadata")
+    fields = metadata[:-1].split(b" ")
+    if len(fields) != 2 or fields[0] != b"blob" or not fields[1].isdigit():
+        raise ValueError("indexed entry does not identify a blob")
+    size = int(fields[1])
+    if size > MAX_TRACKED_BLOB_BYTES:
+        raise ValueError("indexed blob exceeds byte bound")
+    if declared_total + size > MAX_TOTAL_TRACKED_BLOB_BYTES:
+        raise ValueError("indexed blobs exceed cumulative byte bound")
+
+    digest = hashlib.sha256()
+    remaining = size
+    process = subprocess.Popen(
+        ["git", "cat-file", "blob", object_name],
+        cwd=repository,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    if process.stdout is None:
+        raise RuntimeError("indexed blob stdout unavailable")
+    try:
+        while remaining:
+            chunk = process.stdout.read(min(64 * 1024, remaining))
+            if not chunk:
+                raise ValueError("indexed blob ended before declared size")
+            remaining -= len(chunk)
+            digest.update(chunk)
+        if process.stdout.read(1):
+            raise ValueError("indexed blob exceeds declared size")
+        if process.wait(timeout=10) != 0:
+            raise RuntimeError("indexed blob read failed")
+    except BaseException:
+        process.kill()
+        process.wait()
+        raise
+    return (size, digest.hexdigest())
+
+
+def tracked_regular_identities(repository=Path(".")):
     identities = {}
-    names = subprocess.check_output(["git", "ls-files", "--cached", "-z"]).split(b"\0")
-    for encoded in names:
-        if not encoded:
-            continue
-        name = os.fsdecode(encoded)
-        metadata = os.lstat(name)
-        if not stat.S_ISREG(metadata.st_mode):
-            continue
-        digest = hashlib.sha256()
-        size = 0
-        with open(name, "rb") as source:
-            while chunk := source.read(64 * 1024):
-                size += len(chunk)
-                digest.update(chunk)
-        identities[name] = (size, digest.hexdigest())
+    encoded_paths = set()
+    total_size = 0
+    records = bounded_nul_records(
+        ["git", "ls-files", "--stage", "-z"], repository
+    )
+    for record in records:
+        header, separator, encoded_path = record.partition(b"\t")
+        fields = header.split(b" ")
+        if separator != b"\t" or len(fields) != 3:
+            raise ValueError("malformed stage-0 index entry")
+        mode, encoded_object, stage = fields
+        if stage != b"0":
+            raise ValueError("unmerged index entry")
+        if mode not in EXPECTED_INDEX_MODES:
+            raise ValueError("unexpected tracked file mode")
+        if encoded_path in encoded_paths:
+            raise ValueError("duplicate stage-0 index path")
+        encoded_paths.add(encoded_path)
+        name = decoded_git_path(encoded_path)
+        identity = indexed_blob_identity(repository, encoded_object, total_size)
+        total_size += identity[0]
+        identities[name] = identity
+    if len(identities) != len(encoded_paths):
+        raise ValueError("ambiguous stage-0 index paths")
     return identities
 
 
+def index_authority_regression(reader):
+    staged_bytes = b"parameterized staged support identity for index authority\n"
+    benign_working_bytes = b"different benign working-tree bytes\n"
+    staged_identity = (len(staged_bytes), hashlib.sha256(staged_bytes).hexdigest())
+    working_identity = (
+        len(benign_working_bytes),
+        hashlib.sha256(benign_working_bytes).hexdigest(),
+    )
+    with tempfile.TemporaryDirectory(prefix="catalog-boundary-index-") as temporary:
+        repository = Path(temporary)
+        subprocess.run(
+            ["git", "init", "--quiet", os.fspath(repository)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+        )
+        innocent = repository / "innocent" / "renamed.json"
+        innocent.parent.mkdir()
+        innocent.write_bytes(staged_bytes)
+        subprocess.run(
+            ["git", "-C", os.fspath(repository), "add", "--", "innocent/renamed.json"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+        )
+        innocent.write_bytes(benign_working_bytes)
+        try:
+            identities = reader(repository)
+        except Exception:
+            return ["index reader consulted or failed on replaced working-tree bytes"]
+        innocent.unlink()
+        try:
+            missing_worktree_identities = reader(repository)
+        except Exception:
+            return ["index reader consulted or failed on a missing working-tree file"]
+    errors = []
+    if identities.get("innocent/renamed.json") != staged_identity:
+        errors.append("index reader did not hash the exact staged blob")
+    if missing_worktree_identities != identities:
+        errors.append("missing working-tree file changed indexed identities")
+    if working_identity in identities.values():
+        errors.append("index reader consulted benign working-tree bytes")
+    if not support_separation_errors(
+        identities, support_basenames=frozenset(), support_identities={staged_identity}
+    ):
+        errors.append("parameterized support predicate accepted the staged identity")
+    return errors
+
+
+regression_errors = index_authority_regression(tracked_regular_identities)
+if regression_errors:
+    print(regression_errors[0], file=sys.stderr)
+    sys.exit(1)
+
+
+def mutated_working_tree_reader(repository):
+    identities = tracked_regular_identities(repository)
+    for name in identities:
+        data = (repository / name).read_bytes()
+        identities[name] = (len(data), hashlib.sha256(data).hexdigest())
+    return identities
+
+
+for mutation_label, mutation_reader in [
+    ("working-tree content", mutated_working_tree_reader),
+    ("indexed identity bypass", lambda _repository: {}),
+]:
+    if not index_authority_regression(mutation_reader):
+        print(
+            f"index-authority regression accepted {mutation_label} mutation",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
 tracked_identities = tracked_regular_identities()
+tracked = list(tracked_identities)
+tracked.extend(
+    decoded_git_path(record)
+    for record in bounded_nul_records(
+        ["git", "ls-files", "--others", "--exclude-standard", "-z"], Path(".")
+    )
+)
 
 
 def canonical(value):
@@ -2713,12 +2932,7 @@ def parity_case_manifest(source):
 
 
 def task11_errors(source, names, regular_identities):
-    errors = []
-    if any(PurePosixPath(name).name in SUPPORT_BASENAMES for name in names):
-        errors.append("tracked deterministic support basename")
-    for identity in regular_identities.values():
-        if identity in SUPPORT_IDENTITIES:
-            errors.append("tracked exact support bytes")
+    errors = support_separation_errors(regular_identities)
     forbidden_paths = [
         name for name in names
         if name == "catalog-v1.json"
@@ -2904,8 +3118,10 @@ for index, identity in enumerate(sorted(SUPPORT_IDENTITIES)):
         sys.exit(1)
 for basename in sorted(SUPPORT_BASENAMES):
     virtual_path = f"innocent/{basename}"
+    virtual_identities = dict(tracked_identities)
+    virtual_identities[virtual_path] = (0, hashlib.sha256(b"").hexdigest())
     if not task11_errors(
-        dict(current), list(tracked) + [virtual_path], dict(tracked_identities)
+        dict(current), list(tracked) + [virtual_path], virtual_identities
     ):
         print(f"tracked deterministic support-basename mutation was accepted: {basename}", file=sys.stderr)
         sys.exit(1)
