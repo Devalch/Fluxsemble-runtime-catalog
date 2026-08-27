@@ -10,6 +10,9 @@ use std::{
 #[path = "../src/broker.rs"]
 mod broker;
 #[allow(dead_code)]
+#[path = "../src/broker_client.rs"]
+mod broker_client;
+#[allow(dead_code)]
 #[path = "../src/github.rs"]
 mod github;
 #[allow(dead_code)]
@@ -21,6 +24,7 @@ mod support;
 #[path = "../src/workflow.rs"]
 mod workflow;
 
+use broker_client::BrokerIdentityDigests;
 use github::{
     BrokerTransport, DownloadedAsset, LatestTransport, RemoteAsset, RemoteBoundaryError,
     RemoteRelease, RemoteReleaseAsset, RemoteTag, UploadSource,
@@ -72,8 +76,12 @@ impl RecoveryBroker {
 }
 
 impl BrokerTransport for RecoveryBroker {
-    fn config_sha256(&mut self) -> Result<String, RemoteBoundaryError> {
-        Ok(CONFIG_SHA256.to_owned())
+    fn identity_digests(&mut self) -> Result<BrokerIdentityDigests, RemoteBoundaryError> {
+        Ok(BrokerIdentityDigests {
+            broker_client_config_sha256: CONFIG_SHA256.to_owned(),
+            broker_executable_sha256: CONFIG_SHA256.to_owned(),
+            publisher_broker_config_sha256: CONFIG_SHA256.to_owned(),
+        })
     }
 
     fn create_tag(

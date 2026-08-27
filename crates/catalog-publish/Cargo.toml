@@ -6,13 +6,15 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-catalog-acquire = { path = "../catalog-acquire" }
+# Publisher receives only the fixed latest endpoint, never generic acquisition authority.
+catalog-latest-transport = { path = "../catalog-latest-transport" }
 catalog-core = { path = "../catalog-core" }
 libc.workspace = true
 serde.workspace = true
 serde_jcs.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tokio = { version = "1", features = ["rt"] }
 
 [dev-dependencies]
 catalog-core = { path = "../catalog-core", features = ["fixture-tools"] }

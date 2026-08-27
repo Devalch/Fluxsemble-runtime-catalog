@@ -12,15 +12,17 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     github::{
-        BrokerTransport, CredentialFreeLatest, DownloadedAsset, GitHubBroker, LatestTransport,
-        RemoteAsset, RemoteBoundaryError, RemoteRelease, RemoteReleaseAsset, RemoteTag,
-        UploadSource,
+        BrokerTransport, CredentialFreeLatest, DownloadedAsset, GitHubBroker, RemoteAsset,
+        RemoteBoundaryError, RemoteRelease, RemoteReleaseAsset, RemoteTag, UploadSource,
     },
     local::{
         FailureOutcome, PublishError, RemoteRecordKind, RemoteWorkflowState,
         open_remote_workflow_state,
     },
 };
+
+#[cfg(test)]
+use crate::github::LatestTransport;
 
 const REPOSITORY: &str = "Devalch/Fluxsemble-runtime-catalog";
 const OPERATION_DOMAIN: &[u8] = b"fluxsemble:runtime-catalog-remote-operation:v1\0";
@@ -84,7 +86,9 @@ struct RemoteOperationBodyV1 {
     repository: String,
     local_operation_id: String,
     signed_transfer_sha256: String,
-    broker_config_sha256: String,
+    broker_client_config_sha256: String,
+    broker_executable_sha256: String,
+    publisher_broker_config_sha256: String,
     source_commit: String,
     source_tree_sha256: String,
     sequence: u64,
@@ -141,7 +145,9 @@ struct DraftReceiptBodyV1 {
     local_operation_id: String,
     remote_operation_id: String,
     signed_transfer_sha256: String,
-    broker_config_sha256: String,
+    broker_client_config_sha256: String,
+    broker_executable_sha256: String,
+    publisher_broker_config_sha256: String,
     assets: Vec<RemoteReceiptAssetV1>,
     phase: String,
 }
@@ -223,7 +229,7 @@ pub fn stage_remote(
     broker_config: &Path,
 ) -> Result<RemoteWorkflowOutcome, RemoteWorkflowError> {
     let state = open_remote_workflow_state(state_path).map_err(local_error)?;
-    let mut broker = GitHubBroker::new(broker_config);
+    let mut broker = GitHubBroker::new(broker_config).map_err(|_| recovery_required())?;
     stage_remote_inner(&state, &mut broker)
 }
 
@@ -243,8 +249,10 @@ fn stage_remote_inner(
     broker: &mut dyn BrokerTransport,
 ) -> Result<RemoteWorkflowOutcome, RemoteWorkflowError> {
     state.revalidate().map_err(local_error)?;
-    let broker_config_sha256 = broker.config_sha256().map_err(|_| recovery_required())?;
-    require_sha256(&broker_config_sha256)?;
+    let broker_identity = broker.identity_digests().map_err(|_| recovery_required())?;
+    require_sha256(&broker_identity.broker_client_config_sha256)?;
+    require_sha256(&broker_identity.broker_executable_sha256)?;
+    require_sha256(&broker_identity.publisher_broker_config_sha256)?;
     let assets = state
         .assets()
         .iter()
@@ -259,7 +267,9 @@ fn stage_remote_inner(
         repository: REPOSITORY.to_owned(),
         local_operation_id: state.local_operation_id().to_owned(),
         signed_transfer_sha256: state.signed_transfer_sha256().to_owned(),
-        broker_config_sha256,
+        broker_client_config_sha256: broker_identity.broker_client_config_sha256,
+        broker_executable_sha256: broker_identity.broker_executable_sha256,
+        publisher_broker_config_sha256: broker_identity.publisher_broker_config_sha256,
         source_commit: state.source_commit().to_owned(),
         source_tree_sha256: state.source_tree_sha256().to_owned(),
         sequence: state.sequence(),
@@ -371,7 +381,17 @@ fn stage_remote_inner(
         local_operation_id: operation.record.operation.local_operation_id.clone(),
         remote_operation_id: operation.record.remote_operation_id.clone(),
         signed_transfer_sha256: operation.record.operation.signed_transfer_sha256.clone(),
-        broker_config_sha256: operation.record.operation.broker_config_sha256.clone(),
+        broker_client_config_sha256: operation
+            .record
+            .operation
+            .broker_client_config_sha256
+            .clone(),
+        broker_executable_sha256: operation.record.operation.broker_executable_sha256.clone(),
+        publisher_broker_config_sha256: operation
+            .record
+            .operation
+            .publisher_broker_config_sha256
+            .clone(),
         assets: receipt_assets,
         phase: "draft_verified".to_owned(),
     };
@@ -456,17 +476,19 @@ fn approve_inner(
     Ok(RemoteWorkflowOutcome::Approved)
 }
 
-/// Publishes only the approved exact draft and then attempts fixed latest verification.
-pub fn publish_remote(
+/// Publishes only the approved exact draft and then awaits fixed latest verification. The async
+/// API never creates a runtime; the CLI owns its one outer runtime.
+pub async fn publish_remote(
     state_path: &Path,
     approval_path: &Path,
     broker_config: &Path,
 ) -> Result<RemoteWorkflowOutcome, RemoteWorkflowError> {
     require_approval_path(state_path, approval_path)?;
     let state = open_remote_workflow_state(state_path).map_err(local_error)?;
-    let mut broker = GitHubBroker::new(broker_config);
-    let mut latest = CredentialFreeLatest;
-    publish_inner(&state, &mut broker, &mut latest)
+    let mut broker = GitHubBroker::new(broker_config).map_err(|_| recovery_required())?;
+    publish_broker_inner(&state, &mut broker)?;
+    verify_latest_production_inner(&state).await?;
+    Ok(RemoteWorkflowOutcome::PublishedAndLatestVerified)
 }
 
 #[allow(dead_code)]
@@ -480,14 +502,15 @@ pub(crate) fn publish_remote_fixture_with(
     require_approval_path(state_path, approval_path)?;
     let state =
         crate::local::open_fixture_remote_workflow_state(state_path).map_err(local_error)?;
-    publish_inner(&state, broker, latest)
+    publish_broker_inner(&state, broker)?;
+    verify_latest_inner(&state, latest)?;
+    Ok(RemoteWorkflowOutcome::PublishedAndLatestVerified)
 }
 
-fn publish_inner(
+fn publish_broker_inner(
     state: &RemoteWorkflowState,
     broker: &mut dyn BrokerTransport,
-    latest: &mut dyn LatestTransport,
-) -> Result<RemoteWorkflowOutcome, RemoteWorkflowError> {
+) -> Result<(), RemoteWorkflowError> {
     state.revalidate().map_err(local_error)?;
     let receipt_bytes = state
         .read_record(RemoteRecordKind::DraftReceipt)
@@ -501,8 +524,12 @@ fn publish_inner(
         .ok_or_else(recovery_required)?;
     let approval: ReleaseApprovalV1 = parse_canonical(&approval_bytes)?;
     validate_approval(&approval, &receipt, state)?;
-    let config_sha256 = broker.config_sha256().map_err(|_| recovery_required())?;
-    if config_sha256 != receipt.body.broker_config_sha256 {
+    let broker_identity = broker.identity_digests().map_err(|_| recovery_required())?;
+    if broker_identity.broker_client_config_sha256 != receipt.body.broker_client_config_sha256
+        || broker_identity.broker_executable_sha256 != receipt.body.broker_executable_sha256
+        || broker_identity.publisher_broker_config_sha256
+            != receipt.body.publisher_broker_config_sha256
+    {
         return Err(recovery_required());
     }
 
@@ -565,17 +592,25 @@ fn publish_inner(
             .write_record_no_clobber(RemoteRecordKind::PublicationReceipt, &publication_bytes)
             .map_err(local_error)?;
     }
-    verify_latest_inner(state, latest)?;
-    Ok(RemoteWorkflowOutcome::PublishedAndLatestVerified)
+    Ok(())
 }
 
 /// Retries only fixed credential-free latest verification; it accepts no broker configuration.
-pub fn verify_latest_remote(
+pub async fn verify_latest_remote(
     state_path: &Path,
 ) -> Result<RemoteWorkflowOutcome, RemoteWorkflowError> {
     let state = open_remote_workflow_state(state_path).map_err(local_error)?;
-    let mut latest = CredentialFreeLatest;
-    verify_latest_inner(&state, &mut latest)
+    verify_latest_production_inner(&state).await
+}
+
+async fn verify_latest_production_inner(
+    state: &RemoteWorkflowState,
+) -> Result<RemoteWorkflowOutcome, RemoteWorkflowError> {
+    let verification = prepare_latest(state)?;
+    let bytes = CredentialFreeLatest::fetch_catalog(&verification.expected)
+        .await
+        .map_err(|_| recovery_required())?;
+    complete_latest(state, verification, bytes)
 }
 
 #[allow(dead_code)]
@@ -589,10 +624,25 @@ pub(crate) fn verify_latest_fixture_with(
     verify_latest_inner(&state, latest)
 }
 
+#[cfg(test)]
 fn verify_latest_inner(
     state: &RemoteWorkflowState,
     latest: &mut dyn LatestTransport,
 ) -> Result<RemoteWorkflowOutcome, RemoteWorkflowError> {
+    let verification = prepare_latest(state)?;
+    let bytes = latest
+        .fetch_catalog(&verification.expected)
+        .map_err(|_| recovery_required())?;
+    complete_latest(state, verification, bytes)
+}
+
+struct LatestVerification {
+    publication_bytes: Vec<u8>,
+    publication: PublicationReceiptV1,
+    expected: RemoteAsset,
+}
+
+fn prepare_latest(state: &RemoteWorkflowState) -> Result<LatestVerification, RemoteWorkflowError> {
     state.revalidate().map_err(local_error)?;
     let publication_bytes = state
         .read_record(RemoteRecordKind::PublicationReceipt)
@@ -616,14 +666,27 @@ fn verify_latest_inner(
         return Err(recovery_required());
     }
     let catalog = state.catalog_asset().map_err(local_error)?;
-    let expected = RemoteAsset {
-        name: catalog.name().to_owned(),
-        size: catalog.size(),
-        sha256: catalog.sha256().to_owned(),
-    };
-    let bytes = latest
-        .fetch_catalog(&expected)
-        .map_err(|_| recovery_required())?;
+    Ok(LatestVerification {
+        publication_bytes,
+        publication,
+        expected: RemoteAsset {
+            name: catalog.name().to_owned(),
+            size: catalog.size(),
+            sha256: catalog.sha256().to_owned(),
+        },
+    })
+}
+
+fn complete_latest(
+    state: &RemoteWorkflowState,
+    verification: LatestVerification,
+    bytes: Vec<u8>,
+) -> Result<RemoteWorkflowOutcome, RemoteWorkflowError> {
+    let LatestVerification {
+        publication_bytes,
+        publication,
+        expected,
+    } = verification;
     if bytes.len() as u64 != expected.size || sha256(&bytes) != expected.sha256 {
         return Err(recovery_required());
     }
@@ -657,7 +720,7 @@ pub fn publish_transport_fixture(
     broker_config: &Path,
     source_commit: &str,
 ) -> Result<RemoteWorkflowOutcome, RemoteWorkflowError> {
-    let mut broker = GitHubBroker::new(broker_config);
+    let mut broker = GitHubBroker::new(broker_config).map_err(|_| recovery_required())?;
     publish_transport_fixture_with(&mut broker, source_commit)
 }
 
@@ -668,7 +731,7 @@ pub(crate) fn publish_transport_fixture_with(
     require_commit(source_commit)?;
     let manifest: TransportManifestV1 = parse_canonical(TRANSPORT_MANIFEST)?;
     validate_transport_manifest(&manifest)?;
-    let _config_sha256 = broker.config_sha256().map_err(|_| recovery_required())?;
+    let _broker_identity = broker.identity_digests().map_err(|_| recovery_required())?;
     let _create_result = broker.create_tag(REPOSITORY, &manifest.tag, source_commit);
     let tag = broker
         .read_tag(REPOSITORY, &manifest.tag)
@@ -1114,7 +1177,9 @@ fn validate_operation_body(body: &RemoteOperationBodyV1) -> Result<(), RemoteWor
     if body.repository != REPOSITORY
         || !valid_sha256(&body.local_operation_id)
         || !valid_sha256(&body.signed_transfer_sha256)
-        || !valid_sha256(&body.broker_config_sha256)
+        || !valid_sha256(&body.broker_client_config_sha256)
+        || !valid_sha256(&body.broker_executable_sha256)
+        || !valid_sha256(&body.publisher_broker_config_sha256)
         || !valid_commit(&body.source_commit)
         || !valid_sha256(&body.source_tree_sha256)
         || body.sequence == 0
@@ -1154,7 +1219,11 @@ fn validate_draft_receipt(
         || receipt.body.signed_transfer_sha256 != state.signed_transfer_sha256()
         || receipt.body.phase != "draft_verified"
         || receipt.body.remote_operation_id != operation.remote_operation_id
-        || receipt.body.broker_config_sha256 != operation.operation.broker_config_sha256
+        || receipt.body.broker_client_config_sha256
+            != operation.operation.broker_client_config_sha256
+        || receipt.body.broker_executable_sha256 != operation.operation.broker_executable_sha256
+        || receipt.body.publisher_broker_config_sha256
+            != operation.operation.publisher_broker_config_sha256
         || operation.release_id.as_deref() != Some(receipt.body.release_id.as_str())
         || operation.phase != RemoteOperationPhaseV1::AssetsVerified
         || operation.verified_assets as usize != operation.operation.assets.len()

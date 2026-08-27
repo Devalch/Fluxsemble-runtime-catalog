@@ -20,11 +20,15 @@ use sha2::{Digest, Sha256};
 #[allow(dead_code)]
 #[path = "../src/broker.rs"]
 mod broker;
+#[allow(dead_code)]
+#[path = "../src/broker_client.rs"]
+mod broker_client;
 
 use broker::{
     BrokerAssetUploadStatusV1, BrokerPublicationStatusV1, BrokerRequestV1, BrokerResponseV1,
     BrokerTagObjectTypeV1, BrokerTestCheckpoints, PublisherBrokerConfigV1,
 };
+use broker_client::{BrokerClient, PublisherBrokerClientConfigV1};
 
 const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 const TAG: &str = "catalog-v1-sequence-1";
@@ -600,6 +604,36 @@ fn write_config(path: &Path, value: &PublisherBrokerConfigV1) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
 }
 
+fn write_client_config(path: &Path, value: &PublisherBrokerClientConfigV1) {
+    fs::write(path, serde_jcs::to_vec(value).unwrap()).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+fn broker_client_fixture(fixture: &Fixture) -> (PathBuf, PathBuf) {
+    let executable = fixture.root.path("catalog-gh-broker");
+    fs::copy(env!("CARGO_BIN_EXE_catalog-gh-broker"), &executable).unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o500)).unwrap();
+    let client_config = fixture.root.path("broker-client-config.json");
+    write_client_config(
+        &client_config,
+        &PublisherBrokerClientConfigV1 {
+            schema_version: 1,
+            catalog_gh_broker_path: executable.to_str().unwrap().to_owned(),
+            catalog_gh_broker_sha256: sha256(&fs::read(&executable).unwrap()),
+            publisher_broker_config_path: fixture.config.to_str().unwrap().to_owned(),
+            publisher_broker_config_sha256: sha256(&fs::read(&fixture.config).unwrap()),
+        },
+    );
+    (client_config, executable)
+}
+
+fn atomic_replace(path: &Path, bytes: &[u8], mode: u32) {
+    let replacement = path.with_extension("replacement");
+    fs::write(&replacement, bytes).unwrap();
+    fs::set_permissions(&replacement, fs::Permissions::from_mode(mode)).unwrap();
+    fs::rename(&replacement, path).unwrap();
+}
+
 fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -631,7 +665,10 @@ fn execute(
 ) -> Result<BrokerResponseV1, broker::BrokerError> {
     struct Noop;
     impl BrokerTestCheckpoints for Noop {}
-    broker::execute_with_test_checkpoints(&fixture.config, request, &mut Noop)
+    let expected = fs::read(&fixture.config)
+        .map(|bytes| sha256(&bytes))
+        .unwrap_or_else(|_| "aa".repeat(32));
+    broker::execute_with_test_checkpoints(&fixture.config, &expected, request, &mut Noop)
 }
 
 #[test]
@@ -1302,8 +1339,13 @@ fn download_is_broker_streamed_bounded_and_removes_partial_or_descendant_output(
     };
     let started = Instant::now();
     assert!(
-        broker::execute_with_test_checkpoints(&blocked.config, &request, &mut BlockSettlement)
-            .is_err()
+        broker::execute_with_test_checkpoints(
+            &blocked.config,
+            &sha256(&fs::read(&blocked.config).unwrap()),
+            &request,
+            &mut BlockSettlement,
+        )
+        .is_err()
     );
     assert!(
         started.elapsed() < Duration::from_secs(4),
@@ -1357,7 +1399,13 @@ fn download_rebinds_the_canonical_parent_and_leaf_after_settlement() {
     };
 
     assert!(
-        broker::execute_with_test_checkpoints(&fixture.config, &request, &mut checkpoint).is_err(),
+        broker::execute_with_test_checkpoints(
+            &fixture.config,
+            &sha256(&fs::read(&fixture.config).unwrap()),
+            &request,
+            &mut checkpoint,
+        )
+        .is_err(),
         "download succeeded after its requested canonical parent was replaced"
     );
     let canonical_replacement = requested_parent.join("swapped.bin");
@@ -1411,6 +1459,7 @@ fn executable_is_supported_elf_only_and_retained_after_final_rebind() {
     };
     let response = broker::execute_with_test_checkpoints(
         &retained.config,
+        &sha256(&fs::read(&retained.config).unwrap()),
         &read_tag_request(),
         &mut checkpoint,
     )
@@ -1442,6 +1491,7 @@ fn executable_is_supported_elf_only_and_retained_after_final_rebind() {
     assert!(
         broker::execute_with_test_checkpoints(
             &rejected.config,
+            &sha256(&fs::read(&rejected.config).unwrap()),
             &read_tag_request(),
             &mut checkpoint
         )
@@ -1480,7 +1530,15 @@ fn config_executable_and_directory_identity_hash_mode_and_links_fail_closed() {
     symlink(&linked_config.config, &link).unwrap();
     struct Noop;
     impl BrokerTestCheckpoints for Noop {}
-    assert!(broker::execute_with_test_checkpoints(&link, &read_tag_request(), &mut Noop).is_err());
+    assert!(
+        broker::execute_with_test_checkpoints(
+            &link,
+            &sha256(&fs::read(&linked_config.config).unwrap()),
+            &read_tag_request(),
+            &mut Noop,
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -1537,9 +1595,175 @@ fn repeated_and_concurrent_requests_receive_distinct_fresh_homes() {
     assert!(homes.iter().all(|home| !Path::new(home).exists()));
 }
 
-fn run_binary(config: &Path, request: &[u8]) -> std::process::Output {
+#[test]
+fn real_broker_process_rejects_task9_config_swaps_before_every_workflow_mutation() {
+    for mutation in [
+        "create_tag",
+        "create_draft",
+        "upload_asset",
+        "publish_draft",
+    ] {
+        let response = match mutation {
+            "create_tag" => tag_json(),
+            "create_draft" => draft_json(),
+            "upload_asset" => b"upload response is intentionally ignored".to_vec(),
+            "publish_draft" => br#"{"draft":false,"id":7}"#.to_vec(),
+            _ => unreachable!(),
+        };
+        let fixture = Fixture::new(
+            &format!("process-config-swap-{mutation}"),
+            FakeBehavior::Success,
+            &response,
+        );
+        let input = fixture.root.path("support.bin");
+        fs::write(&input, b"support").unwrap();
+        fs::set_permissions(&input, fs::Permissions::from_mode(0o400)).unwrap();
+        let request = match mutation {
+            "create_tag" => BrokerRequestV1::CreateTag {
+                schema_version: 1,
+                repository: REPOSITORY.to_owned(),
+                tag: TAG.to_owned(),
+                commit_sha: COMMIT.to_owned(),
+            },
+            "create_draft" => BrokerRequestV1::CreateDraft {
+                schema_version: 1,
+                repository: REPOSITORY.to_owned(),
+                tag: TAG.to_owned(),
+                target_commitish: COMMIT.to_owned(),
+                title: "Runtime catalog sequence 1".to_owned(),
+                notes: "Reviewed release notes".to_owned(),
+                prerelease: false,
+            },
+            "upload_asset" => BrokerRequestV1::UploadAsset {
+                schema_version: 1,
+                repository: REPOSITORY.to_owned(),
+                tag: TAG.to_owned(),
+                name: "support.bin".to_owned(),
+                input_path: input.to_str().unwrap().to_owned(),
+            },
+            "publish_draft" => BrokerRequestV1::PublishDraft {
+                schema_version: 1,
+                repository: REPOSITORY.to_owned(),
+                release_id: "7".to_owned(),
+            },
+            _ => unreachable!(),
+        };
+        let (client_config, _) = broker_client_fixture(&fixture);
+        let client = BrokerClient::open(&client_config).unwrap();
+        let pinned = client.identity_digests().unwrap();
+        assert_eq!(
+            pinned.publisher_broker_config_sha256,
+            sha256(&fs::read(&fixture.config).unwrap())
+        );
+
+        let alternate_config_dir = fixture.root.path("alternate-github-config");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&alternate_config_dir)
+            .unwrap();
+        let mut replacement: PublisherBrokerConfigV1 =
+            serde_json::from_slice(&fs::read(&fixture.config).unwrap()).unwrap();
+        replacement.github_config_dir = alternate_config_dir.to_str().unwrap().to_owned();
+        atomic_replace(
+            &fixture.config,
+            &serde_jcs::to_vec(&replacement).unwrap(),
+            0o600,
+        );
+
+        assert!(client.execute(&request).is_err(), "{mutation}");
+        assert!(
+            !fixture.snapshot.exists(),
+            "config swap reached fake gh mutation: {mutation}"
+        );
+    }
+}
+
+#[test]
+fn broker_client_rebinds_client_config_and_fixed_broker_executable_before_process_launch() {
+    for swapped in ["client_config", "broker_executable"] {
+        let fixture = Fixture::new(
+            &format!("process-outer-swap-{swapped}"),
+            FakeBehavior::Success,
+            &tag_json(),
+        );
+        let (client_config, broker_executable) = broker_client_fixture(&fixture);
+        let client = BrokerClient::open(&client_config).unwrap();
+        let _ = client.identity_digests().unwrap();
+        match swapped {
+            "client_config" => {
+                atomic_replace(&client_config, &fs::read(&client_config).unwrap(), 0o600)
+            }
+            "broker_executable" => atomic_replace(
+                &broker_executable,
+                &fs::read(&broker_executable).unwrap(),
+                0o500,
+            ),
+            _ => unreachable!(),
+        }
+        assert!(client.execute(&read_tag_request()).is_err(), "{swapped}");
+        assert!(!fixture.snapshot.exists(), "{swapped}");
+    }
+}
+
+#[test]
+fn broker_expected_task9_digest_is_checked_before_gh_or_config_directory_authority() {
+    let fixture = Fixture::new(
+        "broker-expected-config-digest",
+        FakeBehavior::Success,
+        &tag_json(),
+    );
+    let request = read_tag_request().to_canonical_bytes().unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_catalog-gh-broker"))
-        .args(["--config", config.to_str().unwrap()])
+        .args([
+            "--config",
+            fixture.config.to_str().unwrap(),
+            "--expected-config-sha256",
+            &"00".repeat(32),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(&request).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(output.stderr, b"github broker failed\n");
+    assert!(!fixture.snapshot.exists());
+}
+
+#[test]
+fn real_broker_client_process_returns_only_canonical_typed_public_response() {
+    let fixture = Fixture::new(
+        "broker-client-real-process",
+        FakeBehavior::Success,
+        &tag_json(),
+    );
+    let (client_config, _) = broker_client_fixture(&fixture);
+    let client = BrokerClient::open(&client_config).unwrap();
+    let response = client.execute(&read_tag_request()).unwrap();
+    assert!(matches!(
+        response,
+        BrokerResponseV1::Tag {
+            tag,
+            commit_sha,
+            object_type: BrokerTagObjectTypeV1::Commit,
+            ..
+        } if tag == TAG && commit_sha == COMMIT
+    ));
+    assert!(fixture.snapshot.exists());
+}
+
+fn run_binary(config: &Path, request: &[u8]) -> std::process::Output {
+    let config_sha256 = sha256(&fs::read(config).unwrap());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_catalog-gh-broker"))
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--expected-config-sha256",
+            &config_sha256,
+        ])
         .env("GH_TOKEN", "ambient-gh-token-canary")
         .env("GITHUB_TOKEN", "ambient-github-token-canary")
         .env("HTTPS_PROXY", "ambient-proxy-canary")
@@ -1591,7 +1815,13 @@ fn binary_uses_fake_elf_only_exact_cli_environment_and_fixed_redaction() {
     assert!(!String::from_utf8_lossy(&output.stderr).contains("raw-token-canary"));
 
     let output = Command::new(env!("CARGO_BIN_EXE_catalog-gh-broker"))
-        .args(["--config", fixture.config.to_str().unwrap(), "extra"])
+        .args([
+            "--config",
+            fixture.config.to_str().unwrap(),
+            "--expected-config-sha256",
+            &sha256(&fs::read(&fixture.config).unwrap()),
+            "extra",
+        ])
         .output()
         .unwrap();
     assert!(!output.status.success());

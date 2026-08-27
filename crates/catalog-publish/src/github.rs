@@ -14,8 +14,11 @@ use std::{
 
 use sha2::{Digest, Sha256};
 
-use crate::broker::{
-    self, BrokerAssetUploadStatusV1, BrokerPublicationStatusV1, BrokerRequestV1, BrokerResponseV1,
+use crate::{
+    broker::{
+        BrokerAssetUploadStatusV1, BrokerPublicationStatusV1, BrokerRequestV1, BrokerResponseV1,
+    },
+    broker_client::{BrokerClient, BrokerIdentityDigests},
 };
 
 const MAX_ASSET_BYTES: u64 = 8 * 1024 * 1024 * 1024;
@@ -112,7 +115,7 @@ pub(crate) struct DownloadedAsset {
 /// Closed workflow-facing authenticated authority. There is deliberately no delete, replace,
 /// arbitrary route, host, argument, token, or credential method.
 pub(crate) trait BrokerTransport {
-    fn config_sha256(&mut self) -> Result<String, RemoteBoundaryError>;
+    fn identity_digests(&mut self) -> Result<BrokerIdentityDigests, RemoteBoundaryError>;
     fn create_tag(
         &mut self,
         repository: &str,
@@ -153,28 +156,36 @@ pub(crate) trait BrokerTransport {
     ) -> Result<(), RemoteBoundaryError>;
 }
 
-/// Closed latest authority. Implementations receive content identity only, never a URL.
+/// Closed fake latest authority. Production directly consumes only catalog-latest-transport's
+/// fixed async API; this seam exists solely for deterministic no-network workflow tests.
+#[cfg(test)]
 pub(crate) trait LatestTransport {
     fn fetch_catalog(&mut self, expected: &RemoteAsset) -> Result<Vec<u8>, RemoteBoundaryError>;
 }
 
-pub(crate) struct GitHubBroker<'a> {
-    config: &'a Path,
+pub(crate) struct GitHubBroker {
+    client: BrokerClient,
 }
 
-impl<'a> GitHubBroker<'a> {
-    pub(crate) const fn new(config: &'a Path) -> Self {
-        Self { config }
+impl GitHubBroker {
+    pub(crate) fn new(config: &Path) -> Result<Self, RemoteBoundaryError> {
+        Ok(Self {
+            client: BrokerClient::open(config).map_err(|_| RemoteBoundaryError)?,
+        })
     }
 
     fn execute(&self, request: BrokerRequestV1) -> Result<BrokerResponseV1, RemoteBoundaryError> {
-        broker::execute(self.config, &request).map_err(|_| RemoteBoundaryError)
+        self.client
+            .execute(&request)
+            .map_err(|_| RemoteBoundaryError)
     }
 }
 
-impl BrokerTransport for GitHubBroker<'_> {
-    fn config_sha256(&mut self) -> Result<String, RemoteBoundaryError> {
-        broker::config_sha256(self.config).map_err(|_| RemoteBoundaryError)
+impl BrokerTransport for GitHubBroker {
+    fn identity_digests(&mut self) -> Result<BrokerIdentityDigests, RemoteBoundaryError> {
+        self.client
+            .identity_digests()
+            .map_err(|_| RemoteBoundaryError)
     }
 
     fn create_tag(
@@ -363,30 +374,23 @@ impl BrokerTransport for GitHubBroker<'_> {
 
 pub(crate) struct CredentialFreeLatest;
 
-impl LatestTransport for CredentialFreeLatest {
-    fn fetch_catalog(&mut self, expected: &RemoteAsset) -> Result<Vec<u8>, RemoteBoundaryError> {
+impl CredentialFreeLatest {
+    pub(crate) async fn fetch_catalog(
+        expected: &RemoteAsset,
+    ) -> Result<Vec<u8>, RemoteBoundaryError> {
         if expected.name != "catalog-v1.json"
             || expected.size == 0
             || expected.size > MAX_CATALOG_BYTES
         {
             return Err(RemoteBoundaryError);
         }
-        let cache = ScratchDirectory::new(b"/tmp/catalog-publish-latest-XXXXXX\0")?;
-        let fetched = catalog_acquire::fetch_runtime_catalog_latest_exact(
-            &cache.path,
+        let fetched = catalog_latest_transport::fetch_runtime_catalog_latest_exact(
             expected.size,
             &expected.sha256,
         )
+        .await
         .map_err(|_| RemoteBoundaryError)?;
-        let mut file = fetched.into_file();
-        file.seek(SeekFrom::Start(0))
-            .map_err(|_| RemoteBoundaryError)?;
-        let mut bytes =
-            Vec::with_capacity(usize::try_from(expected.size).map_err(|_| RemoteBoundaryError)?);
-        (&mut file)
-            .take(expected.size + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|_| RemoteBoundaryError)?;
+        let bytes = fetched.into_bytes();
         if bytes.len() as u64 != expected.size || sha256(&bytes) != expected.sha256 {
             return Err(RemoteBoundaryError);
         }

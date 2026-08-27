@@ -1,5 +1,6 @@
 #[allow(dead_code)]
 mod broker;
+mod broker_client;
 mod github;
 mod local;
 mod workflow;
@@ -9,6 +10,7 @@ pub use broker::{
     BrokerReleaseAssetV1, BrokerRequestV1, BrokerResponseV1, BrokerTagObjectTypeV1,
     BrokerTransferredAssetV1, PublisherBrokerConfigV1,
 };
+pub use broker_client::PublisherBrokerClientConfigV1;
 pub use local::{
     FailureOutcome, PublishError, PublishOutcome, VerifiedTransferredSignedBundle, recover_local,
     stage_local, verify_transferred_signed_bundle,

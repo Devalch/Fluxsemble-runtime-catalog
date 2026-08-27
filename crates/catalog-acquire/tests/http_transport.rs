@@ -96,37 +96,6 @@ fn redirect_downgrade_unapproved_query_userinfo_origin_loop_and_overflow_fail_cl
     }
 }
 
-#[test]
-fn fixed_runtime_catalog_latest_request_has_no_url_or_origin_input() {
-    let request = http::runtime_catalog_latest_request_for_test(7, &"ab".repeat(32)).unwrap();
-    assert_eq!(
-        request.url.as_str(),
-        "https://github.com/Devalch/Fluxsemble-runtime-catalog/releases/latest/download/catalog-v1.json"
-    );
-    assert_eq!(request.expected_size, Some(7));
-    assert_eq!(request.maximum_size.get(), 7);
-    assert_eq!(request.sha256.as_str(), "ab".repeat(32));
-    assert_eq!(
-        request
-            .allowed_origins
-            .iter()
-            .map(http::HttpsOrigin::as_str)
-            .collect::<Vec<_>>(),
-        [
-            "https://github.com",
-            "https://release-assets.githubusercontent.com"
-        ]
-    );
-    for (size, digest) in [
-        (0, "ab".repeat(32)),
-        (8 * 1024 * 1024 + 1, "ab".repeat(32)),
-        (7, "AB".repeat(32)),
-        (7, "0".repeat(63)),
-    ] {
-        assert!(http::runtime_catalog_latest_request_for_test(size, &digest).is_err());
-    }
-}
-
 #[tokio::test]
 async fn github_profile_allows_only_a_bounded_final_release_asset_query() {
     let body = b"github-asset";

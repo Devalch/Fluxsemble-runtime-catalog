@@ -619,24 +619,31 @@ impl BrokerTestCheckpoints for NoopTestCheckpoints {}
 #[cfg(not(test))]
 pub(crate) fn execute(
     config_path: &Path,
+    expected_config_sha256: &str,
     request: &BrokerRequestV1,
 ) -> Result<BrokerResponseV1, BrokerError> {
-    execute_impl(config_path, request)
+    execute_impl(config_path, expected_config_sha256, request)
 }
 
 #[cfg(test)]
 pub(crate) fn execute(
     config_path: &Path,
+    expected_config_sha256: &str,
     request: &BrokerRequestV1,
 ) -> Result<BrokerResponseV1, BrokerError> {
-    execute_impl(config_path, request, &mut NoopTestCheckpoints)
+    execute_impl(
+        config_path,
+        expected_config_sha256,
+        request,
+        &mut NoopTestCheckpoints,
+    )
 }
 
 pub(crate) fn config_sha256(config_path: &Path) -> Result<String, BrokerError> {
     #[cfg(test)]
-    let config = read_config(config_path, &mut NoopTestCheckpoints)?;
+    let config = read_config(config_path, None, &mut NoopTestCheckpoints)?;
     #[cfg(not(test))]
-    let config = read_config(config_path)?;
+    let config = read_config(config_path, None)?;
     rebind_config(&config)?;
     Ok(config.sha256.clone())
 }
@@ -644,21 +651,26 @@ pub(crate) fn config_sha256(config_path: &Path) -> Result<String, BrokerError> {
 #[cfg(test)]
 pub(crate) fn execute_with_test_checkpoints(
     config_path: &Path,
+    expected_config_sha256: &str,
     request: &BrokerRequestV1,
     checkpoints: &mut dyn BrokerTestCheckpoints,
 ) -> Result<BrokerResponseV1, BrokerError> {
-    execute_impl(config_path, request, checkpoints)
+    execute_impl(config_path, expected_config_sha256, request, checkpoints)
 }
 
 fn execute_impl(
     config_path: &Path,
+    expected_config_sha256: &str,
     request: &BrokerRequestV1,
     #[cfg(test)] checkpoints: &mut dyn BrokerTestCheckpoints,
 ) -> Result<BrokerResponseV1, BrokerError> {
-    // No credential or process capability is opened before the complete typed request validates.
+    // No credential or process capability is opened before the complete typed request and the
+    // operation-pinned Task 9 configuration digest validate.
     request.validate()?;
+    valid_sha256(expected_config_sha256)?;
     let config = read_config(
         config_path,
+        Some(expected_config_sha256),
         #[cfg(test)]
         checkpoints,
     )?;
@@ -716,12 +728,16 @@ fn execute_impl(
     command.stderr(Stdio::piped());
     let executable_descriptor = config.executable.file.as_raw_fd();
     let config_directory_descriptor = config.config_directory.file.as_raw_fd();
+    let broker_pid = current_pid();
     let mut containment_filter = process_containment_filter();
     // SAFETY: setpgid, fcntl, prctl, and seccomp installation are child-local; the filter was
     // completely allocated before fork and remains live through the pre-exec callback.
     unsafe {
         command.pre_exec(move || {
-            if libc::setpgid(0, 0) != 0 {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0
+                || current_parent_pid() != broker_pid
+                || libc::setpgid(0, 0) != 0
+            {
                 return Err(std::io::Error::last_os_error());
             }
             for descriptor in [executable_descriptor, config_directory_descriptor] {
@@ -1041,6 +1057,7 @@ fn project_draft(value: &Value) -> Result<BrokerResponseV1, BrokerError> {
 
 fn read_config(
     path: &Path,
+    expected_sha256: Option<&str>,
     #[cfg(test)] checkpoints: &mut dyn BrokerTestCheckpoints,
 ) -> Result<VerifiedBrokerConfig, BrokerError> {
     let path = canonical_existing_path(path)?;
@@ -1058,11 +1075,15 @@ fn read_config(
     }
     let sha256 = sha256(&bytes);
     let after = file.metadata().map_err(|_| rejected())?;
-    if Identity::from_metadata(&after) != identity {
+    if Identity::from_metadata(&after) != identity
+        || expected_sha256.is_some_and(|expected| expected != sha256)
+    {
         return Err(rejected());
     }
     verify_named_file(&path, &file, identity, secure_config_file)?;
 
+    // The expected canonical digest is checked before executable, config-directory, or process
+    // authority is opened. This is the broker-side half of the client's retained rebind.
     let executable_path = canonical_existing_path(Path::new(&value.gh_path))?;
     let executable_file = open_absolute_no_links(
         &executable_path,
@@ -2910,6 +2931,16 @@ fn current_euid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
+fn current_pid() -> libc::pid_t {
+    // SAFETY: getpid has no preconditions.
+    unsafe { libc::getpid() }
+}
+
+fn current_parent_pid() -> libc::pid_t {
+    // SAFETY: getppid has no preconditions.
+    unsafe { libc::getppid() }
+}
+
 fn object(value: &Value) -> Result<&serde_json::Map<String, Value>, BrokerError> {
     value.as_object().ok_or_else(rejected)
 }
@@ -3101,13 +3132,16 @@ fn validate_json_bounds(value: &Value) -> Result<(), BrokerError> {
 
 pub(crate) fn run_process() -> Result<(), BrokerError> {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
-    if arguments.len() != 2
+    if arguments.len() != 4
         || arguments[0] != "--config"
         || arguments[1].is_empty()
         || arguments[1].as_bytes().len() > MAX_PATH_BYTES
+        || arguments[2] != "--expected-config-sha256"
     {
         return Err(rejected());
     }
+    let expected_config_sha256 = arguments[3].to_str().ok_or_else(rejected)?;
+    valid_sha256(expected_config_sha256)?;
     let config = PathBuf::from(&arguments[1]);
     let mut request_bytes = Vec::new();
     std::io::stdin()
@@ -3118,7 +3152,7 @@ pub(crate) fn run_process() -> Result<(), BrokerError> {
         return Err(rejected());
     }
     let request = BrokerRequestV1::from_canonical_bytes(&request_bytes).map_err(|_| rejected())?;
-    let response = execute(&config, &request)?;
+    let response = execute(&config, expected_config_sha256, &request)?;
     let bytes = response.to_canonical_bytes().map_err(|_| rejected())?;
     std::io::stdout()
         .write_all(&bytes)

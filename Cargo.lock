@@ -92,17 +92,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "catalog-latest-transport"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "sha2",
+ "tokio",
+]
+
+[[package]]
 name = "catalog-publish"
 version = "0.1.0"
 dependencies = [
- "catalog-acquire",
  "catalog-core",
+ "catalog-latest-transport",
  "ed25519-dalek",
  "libc",
  "serde",
  "serde_jcs",
  "serde_json",
  "sha2",
+ "tokio",
 ]
 
 [[package]]

@@ -101,13 +101,11 @@ fn run() -> Result<String, FailureOutcome> {
             require_flag(state_flag, "--state")?;
             require_flag(approval_flag, "--approval")?;
             require_flag(config_flag, "--broker-config")?;
-            match catalog_publish::publish_remote(
+            match run_remote_future(catalog_publish::publish_remote(
                 Path::new(state),
                 Path::new(approval),
                 Path::new(config),
-            )
-            .map_err(|error| error.outcome())?
-            {
+            ))? {
                 catalog_publish::RemoteWorkflowOutcome::PublishedAndLatestVerified => {
                     Ok("release published and latest verified".to_owned())
                 }
@@ -116,9 +114,7 @@ fn run() -> Result<String, FailureOutcome> {
         }
         [command, state_flag, state] if command == "verify-latest" => {
             require_flag(state_flag, "--state")?;
-            match catalog_publish::verify_latest_remote(Path::new(state))
-                .map_err(|error| error.outcome())?
-            {
+            match run_remote_future(catalog_publish::verify_latest_remote(Path::new(state)))? {
                 catalog_publish::RemoteWorkflowOutcome::LatestVerified => {
                     Ok("public latest verified".to_owned())
                 }
@@ -141,6 +137,24 @@ fn run() -> Result<String, FailureOutcome> {
         }
         _ => Err(FailureOutcome::Normal),
     }
+}
+
+fn run_remote_future(
+    future: impl std::future::Future<
+        Output = Result<
+            catalog_publish::RemoteWorkflowOutcome,
+            catalog_publish::RemoteWorkflowError,
+        >,
+    >,
+) -> Result<catalog_publish::RemoteWorkflowOutcome, FailureOutcome> {
+    // The CLI is the sole runtime owner. The public fixed-latest APIs are async and never nest or
+    // block on a runtime, so library callers can safely await them inside an existing Tokio runtime.
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| FailureOutcome::Normal)?
+        .block_on(future)
+        .map_err(|error| error.outcome())
 }
 
 fn bounded_arguments() -> Result<Vec<String>, FailureOutcome> {

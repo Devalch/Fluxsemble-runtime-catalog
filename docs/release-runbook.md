@@ -24,7 +24,7 @@ On every stop the owner reviews:
 - repository exactly `Devalch/Fluxsemble-runtime-catalog`;
 - clean reviewed source commit and tree digest;
 - sequence and canonical tag;
-- broker executable identity and owner-private broker-config SHA-256;
+- owner-private broker-client config SHA-256, retained `catalog-gh-broker` executable SHA-256, and inner Task 9 broker-config SHA-256;
 - release ID, tag target, title, notes, `draft` and `prerelease` state;
 - ordered asset names, public IDs, sizes, and SHA-256 values;
 - local operation, draft, approval, publication, and latest receipt digests.
@@ -52,9 +52,11 @@ Before any remote step, independently verify that local recovery is clear and re
 
 ## 2. Harmless permanent transport prerelease
 
+Every `--broker-config` below names the outer mode-`0600` canonical `PublisherBrokerClientConfigV1`, not the credential-bearing Task 9 config. It contains only the canonical absolute `catalog-gh-broker` path/digest and canonical absolute inner Task 9 config path/digest. The publication process never opens the GitHub config directory; each typed request launches the retained broker executable as a separate process and the broker independently checks the supplied pinned inner digest before authenticated authority.
+
 The committed manifest is exactly `conformance/transport/manifest-v1.json`. It fixes repository, tag `transport-v1`, title `Fluxsemble runtime catalog transport fixture v1`, `draft=true`, `prerelease=true`, and the single digest-bound `github-release-asset-v1.txt`. It contains no catalog, runtime archive, key, credential, private path, or production tag.
 
-The owner first reviews the manifest and asset bytes/digest, broker executable/config digest, and exact reviewed 40-character source commit. Then stop separately before tag, draft, upload, and publication. Only after those exact mutations are authorized, run:
+The owner first reviews the manifest and asset bytes/digest, all three broker client/executable/inner-config digests, and exact reviewed 40-character source commit. Then stop separately before tag, draft, upload, and publication. Only after those exact mutations are authorized, run:
 
 ```text
 catalog-publish publish-transport-fixture --source-commit FULL_REVIEWED_COMMIT_SHA --broker-config /ABSOLUTE/OWNER-PRIVATE/BROKER_CONFIG
@@ -70,7 +72,7 @@ The owner reviews and explicitly authorizes the exact production tag mutation, t
 catalog-publish stage-remote --state /ABSOLUTE/OWNER-PRIVATE/STATE --broker-config /ABSOLUTE/OWNER-PRIVATE/BROKER_CONFIG
 ```
 
-Before its first mutation the tool writes owner-private canonical `latest/remote-operation-v1.json`, binding the local operation, broker-config digest, repository, source, sequence/tag, release metadata, and ordered inventory. It creates or exact-resumes the lightweight tag, verifies the commit object, exact-resumes or creates one draft non-prerelease release, uploads support assets first and `catalog-v1.json` last, and reads the same draft immediately before and after every tag-authorized upload. Every asset is downloaded and hash-verified.
+Before its first mutation the tool writes owner-private canonical `latest/remote-operation-v1.json`, binding the local operation, broker-client config digest, retained broker executable digest, inner Task 9 config digest, repository, source, sequence/tag, release metadata, and ordered inventory. It creates or exact-resumes the lightweight tag, verifies the commit object, exact-resumes or creates one draft non-prerelease release, uploads support assets first and `catalog-v1.json` last, and reads the same draft immediately before and after every tag-authorized upload. Every asset is downloaded and hash-verified.
 
 Expected safe completion is:
 
@@ -78,7 +80,7 @@ Expected safe completion is:
 remote draft staged; explicit approval required
 ```
 
-Completion writes no-clobber mode-`0400` `latest/draft-receipt-v1.json`. Stop. The release remains `draft=true`, `prerelease=false`. Independently inspect GitHub read-only state and compare repository, tag commit/object type, release ID/target/title/notes/state, every asset ID/name/size/digest, signed bundle/local operation digest, and broker-config digest to the receipt.
+Completion writes no-clobber mode-`0400` `latest/draft-receipt-v1.json`. Stop. The release remains `draft=true`, `prerelease=false`. Independently inspect GitHub read-only state and compare repository, tag commit/object type, release ID/target/title/notes/state, every asset ID/name/size/digest, signed bundle/local operation digest, and all three operation-pinned broker digests to the receipt.
 
 A remote failure reports uncertainty or recovery required and preserves the operation record plus remote tag/draft/assets. Do not delete or replace anything. Review the recorded phase and current remote readback before an exact retry.
 
@@ -114,7 +116,7 @@ Before any public-latest request it durably writes `latest/publication-receipt-v
 https://github.com/Devalch/Fluxsemble-runtime-catalog/releases/latest/download/catalog-v1.json
 ```
 
-The fixed catalog-acquire transport is credential-free, no-proxy, redirect bounded, and content size/SHA bound. Expected safe completion is `release published and latest verified`; `latest/latest-receipt-v1.json` records the exact local immutable catalog object identity returned by latest.
+The dedicated async `catalog-latest-transport` capability is credential-free, no-proxy, Rustls-only, redirect bounded, content size/SHA bound, and has no URL/origin/method/header input or runtime creation. Expected safe completion is `release published and latest verified`; `latest/latest-receipt-v1.json` records the exact local immutable catalog object identity returned by latest.
 
 If publication succeeded but latest verification failed, do not republish or mutate the release. Preserve the publication receipt and retry only fixed credential-free verification:
 

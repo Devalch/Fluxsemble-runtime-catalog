@@ -11,6 +11,9 @@ use std::{
 #[path = "../src/broker.rs"]
 mod broker;
 #[allow(dead_code)]
+#[path = "../src/broker_client.rs"]
+mod broker_client;
+#[allow(dead_code)]
 #[path = "../src/github.rs"]
 mod github;
 #[allow(dead_code)]
@@ -22,6 +25,7 @@ mod support;
 #[path = "../src/workflow.rs"]
 mod workflow;
 
+use broker_client::BrokerIdentityDigests;
 use github::{
     BrokerTransport, DownloadedAsset, LatestTransport, RemoteAsset, RemoteBoundaryError,
     RemoteRelease, RemoteReleaseAsset, RemoteTag, UploadSource,
@@ -99,9 +103,13 @@ impl FakeBroker {
 }
 
 impl BrokerTransport for FakeBroker {
-    fn config_sha256(&mut self) -> Result<String, RemoteBoundaryError> {
-        self.record("config_sha256")?;
-        Ok(CONFIG_SHA256.to_owned())
+    fn identity_digests(&mut self) -> Result<BrokerIdentityDigests, RemoteBoundaryError> {
+        self.record("identity_digests")?;
+        Ok(BrokerIdentityDigests {
+            broker_client_config_sha256: CONFIG_SHA256.to_owned(),
+            broker_executable_sha256: CONFIG_SHA256.to_owned(),
+            publisher_broker_config_sha256: CONFIG_SHA256.to_owned(),
+        })
     }
 
     fn create_tag(
@@ -326,7 +334,7 @@ fn tag_precedes_exact_draft_support_uploads_pre_post_binding_and_catalog_last() 
     assert_eq!(
         &fake.calls[..6],
         [
-            "config_sha256",
+            "identity_digests",
             "create_tag",
             "read_tag",
             "read_draft",
@@ -361,11 +369,23 @@ fn tag_precedes_exact_draft_support_uploads_pre_post_binding_and_catalog_last() 
         serde_jcs::to_vec(&serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()).unwrap(),
         bytes
     );
-    assert!(
-        String::from_utf8(bytes)
-            .unwrap()
-            .contains("Devalch/Fluxsemble-runtime-catalog")
-    );
+    let receipt_text = String::from_utf8(bytes).unwrap();
+    assert!(receipt_text.contains("Devalch/Fluxsemble-runtime-catalog"));
+    for binding in [
+        "broker_client_config_sha256",
+        "broker_executable_sha256",
+        "publisher_broker_config_sha256",
+    ] {
+        assert!(receipt_text.contains(binding), "missing {binding}");
+    }
+    let operation_text = fs::read_to_string(state.join("latest/remote-operation-v1.json")).unwrap();
+    for binding in [
+        "broker_client_config_sha256",
+        "broker_executable_sha256",
+        "publisher_broker_config_sha256",
+    ] {
+        assert!(operation_text.contains(binding), "missing {binding}");
+    }
 }
 
 #[test]

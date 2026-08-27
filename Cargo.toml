@@ -3,6 +3,8 @@ resolver = "2"
 members = [
   "crates/catalog-core",
   "crates/catalog-acquire",
+  # Narrow fixed-latest transport is isolated so publisher cannot receive generic acquisition.
+  "crates/catalog-latest-transport",
   "crates/catalog-sign",
   "crates/catalog-publish",
 ]

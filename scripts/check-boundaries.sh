@@ -13,6 +13,7 @@ metadata = json.loads(subprocess.check_output([
 expected_names = [
     "catalog-acquire",
     "catalog-core",
+    "catalog-latest-transport",
     "catalog-publish",
     "catalog-sign",
 ]
@@ -26,11 +27,13 @@ workspace_names = set(expected_names)
 expected_internal_deps = {
     "catalog-core": [],
     "catalog-acquire": [("catalog-core", "normal")],
+    # Deliberately no generic acquisition dependency: this package is the fixed-latest capability.
+    "catalog-latest-transport": [],
     "catalog-sign": [("catalog-core", "normal")],
     "catalog-publish": [
-        ("catalog-acquire", "normal"),
         ("catalog-core", "dev"),
         ("catalog-core", "normal"),
+        ("catalog-latest-transport", "normal"),
     ],
 }
 expected_external_deps = {
@@ -57,6 +60,12 @@ expected_external_deps = {
         ("tokio", "normal"),
         ("xz2", "normal"),
     ],
+    "catalog-latest-transport": [
+        ("reqwest", "normal"),
+        ("sha2", "normal"),
+        ("tokio", "dev"),
+        ("tokio", "normal"),
+    ],
     "catalog-sign": [
         ("ed25519-dalek", "normal"),
         ("libc", "normal"),
@@ -74,6 +83,7 @@ expected_external_deps = {
         ("serde_jcs", "normal"),
         ("serde_json", "normal"),
         ("sha2", "normal"),
+        ("tokio", "normal"),
     ],
 }
 
@@ -1672,7 +1682,9 @@ def publisher_errors(local_source, lib_source, main_source, manifest_source, tes
         errors.append("publisher gained ambient environment lookup")
     if re.search(r"--(?:private-|signing-)?key(?:[= ]|\\b)", main_source, re.IGNORECASE):
         errors.append("publisher gained a key CLI flag")
-    for forbidden in ["catalog-sign", "reqwest", "tokio", "hyper", "ureq", "curl", "openssh"]:
+    for forbidden in [
+        "catalog-sign", "catalog-acquire", "reqwest", "hyper", "ureq", "curl", "openssh"
+    ]:
         if forbidden in manifest_source:
             errors.append(f"publisher gained forbidden dependency: {forbidden}")
     if '#[allow(dead_code)]\n#[cfg(test)]\npub fn verify_transferred_fixture_signed_bundle(' not in local_source:
@@ -1794,6 +1806,7 @@ import re
 import sys
 
 broker = Path("crates/catalog-publish/src/broker.rs").read_text(encoding="utf-8")
+broker_client = Path("crates/catalog-publish/src/broker_client.rs").read_text(encoding="utf-8")
 binary = Path("crates/catalog-publish/src/bin/catalog-gh-broker.rs").read_text(encoding="utf-8")
 lib = Path("crates/catalog-publish/src/lib.rs").read_text(encoding="utf-8")
 local = Path("crates/catalog-publish/src/local.rs").read_text(encoding="utf-8")
@@ -1804,7 +1817,8 @@ tests = Path("crates/catalog-publish/tests/broker_boundary.rs").read_text(encodi
 # one-at-a-time removals fail even when neighboring identifiers and explanatory text remain.
 policies = [
     ("exact seven request kinds", '"create_tag",\n            "read_tag",\n            "create_draft",\n            "read_draft",\n            "upload_asset",\n            "download_asset",\n            "publish_draft",', 1),
-    ("request validation before config authority", "request.validate()?;\n    let config = read_config", 1),
+    ("request and pinned digest validation before config authority", "request.validate()?;\n    valid_sha256(expected_config_sha256)?;\n    let config = read_config", 1),
+    ("expected Task 9 digest before inner authority", "expected_sha256.is_some_and(|expected| expected != sha256)", 1),
     ("canonical request/config bytes", "serde_jcs::to_vec(&strict.0).map_err(|_| rejected())? != bytes", 1),
     ("duplicate JSON member rejection", "if values.contains_key(&key)", 1),
     ("JSON depth and node bounds", "if depth > MAX_JSON_DEPTH || *nodes > MAX_JSON_NODES", 1),
@@ -1838,6 +1852,8 @@ policies = [
     ("nonblocking child reap", "child.try_wait()", 1),
     ("successful-return containment", "let contained = terminate_and_reap(child, deadline);", 1),
     ("exceptional detached child reap", 'name("catalog-gh-exceptional-reaper".to_owned())', 1),
+    ("pre-exec parent-death containment", "libc::PR_SET_PDEATHSIG, libc::SIGKILL", 1),
+    ("pre-exec broker parent identity", "current_parent_pid() != broker_pid", 1),
     ("pre-exec containment filter", "let mut containment_filter = process_containment_filter();", 1),
     ("containment installation", "install_process_containment(&mut containment_filter)", 1),
     ("containment no-new-privileges", "libc::PR_SET_NO_NEW_PRIVS", 1),
@@ -1932,6 +1948,9 @@ test_policies = [
     ("config-retention survivor marker", "escaped-config-marker", 2),
     ("blocked settlement writer fault", "block_download_settlement_after_first_write", 1),
     ("stubborn post-deadline fake", "stubborn-closed-stdio", 1),
+    ("real broker process client", "real_broker_client_process_returns_only_canonical_typed_public_response", 1),
+    ("phase config swap matrix", "real_broker_process_rejects_task9_config_swaps_before_every_workflow_mutation", 1),
+    ("broker expected digest boundary", "broker_expected_task9_digest_is_checked_before_gh_or_config_directory_authority", 1),
 ]
 
 validator_predicates = [
@@ -2003,6 +2022,7 @@ def broker_errors(source, binary_source=binary, lib_source=lib, local_source=loc
         errors.append(f"broker environment allowlist changed: {environment_names}")
     command_sources = {
         "crates/catalog-publish/src/broker.rs": source,
+        "crates/catalog-publish/src/broker_client.rs": broker_client,
         "crates/catalog-publish/src/bin/catalog-gh-broker.rs": binary_source,
         "crates/catalog-publish/src/lib.rs": lib_source,
         "crates/catalog-publish/src/local.rs": local_source,
@@ -2010,11 +2030,14 @@ def broker_errors(source, binary_source=binary, lib_source=lib, local_source=loc
     }
     for name, candidate in command_sources.items():
         count = candidate.count("Command::new(")
-        if name == "crates/catalog-publish/src/broker.rs":
+        if name in {
+            "crates/catalog-publish/src/broker.rs",
+            "crates/catalog-publish/src/broker_client.rs",
+        }:
             if count != 1:
-                errors.append(f"broker launch call count changed: {count}")
+                errors.append(f"fixed broker/client launch call count changed in {name}: {count}")
         elif count:
-            errors.append(f"process launch escaped broker implementation: {name}")
+            errors.append(f"process launch escaped fixed broker/client implementations: {name}")
     for forbidden in [
         "/bin/sh", "sh -c", "gh auth", "auth token", "api graphql", "--jq",
         "--template", "--hostname", "--clobber", "reqwest::", "ureq::", "curl::",
@@ -2124,7 +2147,7 @@ for label, old, new in [
     ("upload response ID fabrication", "status: BrokerAssetUploadStatusV1,\n        name: String,", "status: BrokerAssetUploadStatusV1,\n        release_id: String,\n        name: String,"),
     ("executable hash bypass", "hash_descriptor(&executable.file, executable.identity.size)? != executable.sha256", "false /* hash_descriptor executable sha256 */"),
     ("settlement hash bypass", "digest != expected_digest", "false /* digest != expected_digest */"),
-    ("request authority ordering", "request.validate()?;\n    let config = read_config", "let config = read_config /* request.validate moved after authority */"),
+    ("request authority ordering", "request.validate()?;\n    valid_sha256(expected_config_sha256)?;\n    let config = read_config", "let config = read_config /* request and expected digest validation moved after authority */"),
     ("seccomp installation bypass", "install_process_containment(&mut containment_filter)", "Ok(()) /* install_process_containment bypass */"),
     ("seccomp architecture bypass", "jump(BPF_JMP_JEQ_K, AUDIT_ARCH_X86_64, 1, 0)", "jump(BPF_JMP_JEQ_K, AUDIT_ARCH_X86_64, 0, 1)"),
     ("seccomp x32 bypass", "jump(BPF_JMP_JGE_K, X32_SYSCALL_BIT, 0, 1)", "jump(BPF_JMP_JGE_K, X32_SYSCALL_BIT, 1, 0)"),
@@ -2164,7 +2187,8 @@ sources = {
     "github": Path("crates/catalog-publish/src/github.rs").read_text(encoding="utf-8"),
     "local": Path("crates/catalog-publish/src/local.rs").read_text(encoding="utf-8"),
     "broker": Path("crates/catalog-publish/src/broker.rs").read_text(encoding="utf-8"),
-    "acquire_http": Path("crates/catalog-acquire/src/http.rs").read_text(encoding="utf-8"),
+    "broker_client": Path("crates/catalog-publish/src/broker_client.rs").read_text(encoding="utf-8"),
+    "latest": Path("crates/catalog-latest-transport/src/lib.rs").read_text(encoding="utf-8"),
     "main": Path("crates/catalog-publish/src/main.rs").read_text(encoding="utf-8"),
     "lib": Path("crates/catalog-publish/src/lib.rs").read_text(encoding="utf-8"),
     "manifest": Path("conformance/transport/manifest-v1.json").read_text(encoding="utf-8"),
@@ -2173,7 +2197,6 @@ sources = {
     "github_tests": Path("crates/catalog-publish/tests/github_workflow.rs").read_text(encoding="utf-8"),
     "recovery_tests": Path("crates/catalog-publish/tests/remote_recovery.rs").read_text(encoding="utf-8"),
     "broker_tests": Path("crates/catalog-publish/tests/broker_boundary.rs").read_text(encoding="utf-8"),
-    "http_tests": Path("crates/catalog-acquire/tests/http_transport.rs").read_text(encoding="utf-8"),
 }
 
 policies = [
@@ -2196,7 +2219,9 @@ policies = [
     ("workflow", "catalog-last production inventory", '.is_none_or(|asset| asset.name != "catalog-v1.json")', 1),
     ("workflow", "support inventory excludes early catalog", '.any(|asset| asset.name == "catalog-v1.json")', 2),
     ("workflow", "draft receipt remote operation binding", 'receipt.body.remote_operation_id != operation.remote_operation_id', 1),
-    ("workflow", "draft receipt config binding", 'receipt.body.broker_config_sha256 != operation.operation.broker_config_sha256', 1),
+    ("workflow", "draft receipt client-config binding", 'receipt.body.broker_client_config_sha256\n            != operation.operation.broker_client_config_sha256', 1),
+    ("workflow", "draft receipt broker-executable binding", 'receipt.body.broker_executable_sha256 != operation.operation.broker_executable_sha256', 1),
+    ("workflow", "draft receipt inner-config binding", 'receipt.body.publisher_broker_config_sha256\n            != operation.operation.publisher_broker_config_sha256', 1),
     ("workflow", "draft receipt release binding", 'operation.release_id.as_deref() != Some(receipt.body.release_id.as_str())', 1),
     ("workflow", "draft receipt complete phase", 'operation.phase != RemoteOperationPhaseV1::AssetsVerified', 1),
     ("workflow", "approval explicit status", 'approval.status != "approved"', 1),
@@ -2204,7 +2229,7 @@ policies = [
     ("workflow", "publication exact approval digest", 'publication.approval_sha256 != sha256(&canonical(approval)?)', 1),
     ("workflow", "publication exact draft receipt digest", 'publication.draft_receipt_sha256 != sha256(&canonical(receipt)?)', 1),
     ("workflow", "publication durable before latest", '.write_record_no_clobber(RemoteRecordKind::PublicationReceipt, &publication_bytes)', 1),
-    ("workflow", "fixed latest content fetch", '.fetch_catalog(&expected)', 1),
+    ("workflow", "fixed async latest content fetch", 'CredentialFreeLatest::fetch_catalog(&verification.expected)', 1),
     ("workflow", "latest receipt durable", '.write_record_no_clobber(RemoteRecordKind::LatestReceipt, &canonical(&receipt)?)', 1),
     ("workflow", "fixed transport manifest include", 'include_bytes!("../../../conformance/transport/manifest-v1.json")', 1),
     ("workflow", "fixed transport asset include", 'include_bytes!("../../../conformance/transport/github-release-asset-v1.txt")', 1),
@@ -2215,7 +2240,7 @@ policies = [
     ("workflow", "transport pre-post release ID", 'after.release_id != before.release_id', 1),
     ("workflow", "transport publish release ID", 'published.release_id != release.release_id', 1),
     ("workflow", "transport no catalog asset", '.any(|asset| asset.name == "catalog-v1.json")', 2),
-    ("github", "fixed latest API only", 'catalog_acquire::fetch_runtime_catalog_latest_exact(', 1),
+    ("github", "fixed latest API only", 'catalog_latest_transport::fetch_runtime_catalog_latest_exact(', 1),
     ("github", "latest exact catalog name", 'expected.name != "catalog-v1.json"', 1),
     ("github", "latest catalog size ceiling", 'expected.size > MAX_CATALOG_BYTES', 1),
     ("github", "scratch retained/canonical directory identity", 'ScratchIdentity::from_metadata(&canonical_metadata) != self.identity', 1),
@@ -2223,12 +2248,22 @@ policies = [
     ("github", "download canonical leaf identity", 'ScratchIdentity::from_metadata(&retained_metadata)\n                != ScratchIdentity::from_metadata(&canonical_metadata)', 1),
     ("github", "download canonical bytes", 'read_scratch_file(&canonical, expected_size)? != bytes', 1),
     ("github", "scratch current owner", 'metadata.uid() == current_euid()', 2),
-    ("acquire_http", "single well-known latest URL", '"https://github.com/Devalch/Fluxsemble-runtime-catalog/releases/latest/download/catalog-v1.json"', 1),
-    ("acquire_http", "latest fixed GitHub origin", 'HttpsOrigin("https://github.com".to_owned())', 1),
-    ("acquire_http", "latest fixed asset origin", 'HttpsOrigin("https://release-assets.githubusercontent.com".to_owned())', 1),
-    ("acquire_http", "latest bounded size", 'expected_size > MAX_RUNTIME_CATALOG_BYTES', 1),
-    ("acquire_http", "latest lowercase digest", '!is_lower_sha256(expected_sha256)', 1),
-    ("acquire_http", "latest GitHub redirect profile", 'CredentialFreeFetcher::for_github_release_assets(cache_root)?', 1),
+    ("latest", "single well-known latest URL", '"https://github.com/Devalch/Fluxsemble-runtime-catalog/releases/latest/download/catalog-v1.json"', 1),
+    ("latest", "latest fixed GitHub origin", 'const GITHUB_HOST: &str = "github.com";', 1),
+    ("latest", "latest fixed asset origin", 'const GITHUB_ASSET_HOST: &str = "release-assets.githubusercontent.com";', 1),
+    ("latest", "latest bounded size", 'expected_size > MAX_RUNTIME_CATALOG_BYTES', 1),
+    ("latest", "latest lowercase digest", '!valid_sha256(expected_sha256)', 1),
+    ("latest", "latest no proxy", '.no_proxy()', 1),
+    ("latest", "latest Rustls", '.use_rustls_tls()', 1),
+    ("latest", "async fixed API", 'pub async fn fetch_runtime_catalog_latest_exact(', 1),
+    ("latest", "manual closed redirects", '.redirect(Policy::none())', 1),
+    ("broker_client", "strict client config schema", '#[serde(deny_unknown_fields)]\npub struct PublisherBrokerClientConfigV1', 1),
+    ("broker_client", "retained broker proc descriptor", 'let executable_path = OsString::from(format!("/proc/self/fd/{executable_fd}"));', 1),
+    ("broker_client", "inner digest passed every request", 'OsStr::new("--expected-config-sha256")', 1),
+    ("broker_client", "client process group containment", 'libc::kill(-pid, libc::SIGKILL)', 1),
+    ("broker_client", "canonical typed response", 'BrokerResponseV1::from_canonical_bytes(&stdout)', 1),
+    ("broker_client", "outer config exact mode", 'metadata.permissions().mode() & 0o7777 == 0o600', 1),
+    ("main", "CLI owns outer runtime", 'tokio::runtime::Builder::new_current_thread()', 1),
     ("broker", "bounded release-list completeness", 'if releases.len() >= 100', 1),
     ("broker", "exact missing release projection", '[] => Ok(BrokerResponseV1::DraftMissing {', 1),
     ("broker", "unique release projection", '[release] => project_draft(release)', 1),
@@ -2256,7 +2291,10 @@ test_policies = [
     ("recovery_tests", "transport concurrent ID evidence", 'transport_fixture_rejects_concurrent_release_id_drift_before_publication', 1),
     ("recovery_tests", "latest retry without broker", 'latest_mismatch_keeps_publication_receipt_and_credential_free_retry_needs_no_broker', 1),
     ("broker_tests", "draft missing duplicate truncation evidence", 'read_draft_list_distinguishes_exact_missing_duplicate_and_truncated_state', 1),
-    ("http_tests", "fixed latest no URL input evidence", 'fixed_runtime_catalog_latest_request_has_no_url_or_origin_input', 1),
+    ("broker_tests", "real broker process evidence", 'real_broker_client_process_returns_only_canonical_typed_public_response', 1),
+    ("broker_tests", "phase config swaps", 'real_broker_process_rejects_task9_config_swaps_before_every_workflow_mutation', 1),
+    ("latest", "fixed latest async local policy evidence", 'fixed_latest_policy_is_async_exact_and_credential_free', 1),
+    ("latest", "nested runtime regression", 'public_async_api_returns_result_inside_existing_tokio_runtime_without_panicking', 1),
 ]
 
 def task10_errors(current):
@@ -2289,13 +2327,17 @@ def task10_errors(current):
     if min(before, upload, after, single, download) < 0 or not (before < upload < after < single < download):
         errors.append("pre/upload/post/single-new/download order changed")
 
-    publish_region = workflow.split("fn publish_inner(", 1)[-1].split("pub fn verify_latest_remote", 1)[0]
+    publish_region = workflow.split("fn publish_broker_inner(", 1)[-1].split("pub async fn verify_latest_remote", 1)[0]
     publish = publish_region.find("broker.publish_draft(")
     postread = publish_region.find("let after = broker", publish)
     durable = publish_region.find("RemoteRecordKind::PublicationReceipt", postread)
-    latest = publish_region.find("verify_latest_inner(state, latest)?", durable)
-    if min(publish, postread, durable, latest) < 0 or not (publish < postread < durable < latest):
-        errors.append("publish/post-read/publication-receipt/latest order changed")
+    if min(publish, postread, durable) < 0 or not (publish < postread < durable):
+        errors.append("publish/post-read/publication-receipt order changed")
+    production_publish = workflow.split("pub async fn publish_remote(", 1)[-1].split("#[allow(dead_code)]", 1)[0]
+    broker_phase = production_publish.find("publish_broker_inner(&state, &mut broker)?")
+    latest_phase = production_publish.find("verify_latest_production_inner(&state).await?", broker_phase)
+    if broker_phase < 0 or latest_phase < broker_phase:
+        errors.append("durable broker publication no longer precedes async latest")
 
     transport_region = workflow.split("pub(crate) fn publish_transport_fixture_with(", 1)[-1].split("fn begin_operation", 1)[0]
     transport_order = [
@@ -2313,7 +2355,7 @@ def task10_errors(current):
     trait = current["github"].split("pub(crate) trait BrokerTransport", 1)[-1].split("pub(crate) trait LatestTransport", 1)[0]
     methods = re.findall(r"^    fn ([a-z0-9_]+)\(", trait, re.MULTILINE)
     if methods != [
-        "config_sha256", "create_tag", "read_tag", "read_draft", "create_draft",
+        "identity_digests", "create_tag", "read_tag", "read_draft", "create_draft",
         "upload_asset", "download_asset", "publish_draft",
     ]:
         errors.append(f"workflow broker authority changed: {methods}")
@@ -2327,8 +2369,36 @@ def task10_errors(current):
             errors.append(f"Task 10 gained alternate network/process authority: {forbidden}")
     if "CredentialFreeFetcher::" in current["github"] or "FetchRequest" in current["github"]:
         errors.append("publisher bypasses the fixed latest API with general acquisition authority")
+    if "catalog_acquire" in current["github"] or "broker::execute(" in production_network:
+        errors.append("publisher regained generic acquire or in-process broker authority")
     if "https://" in current["workflow"] or "https://" in current["github"]:
-        errors.append("publisher gained a URL literal outside the fixed acquire transport")
+        errors.append("publisher gained a URL literal outside the fixed latest transport")
+
+    latest_source = current["latest"]
+    if "tokio::runtime" in latest_source or ".block_on(" in latest_source:
+        errors.append("fixed latest API creates or blocks on a nested runtime")
+    if re.search(r"pub (?:async )?fn [^(]+\([^)]*(?:Url|url|origin|method|header|redirect)", latest_source):
+        errors.append("fixed latest public API gained arbitrary transport input")
+    public_async = re.findall(r"pub async fn ([a-z0-9_]+)\(", latest_source)
+    if public_async != ["fetch_runtime_catalog_latest_exact"]:
+        errors.append(f"fixed latest async authority changed: {public_async}")
+
+    client_decl = current["broker_client"].split("pub struct PublisherBrokerClientConfigV1", 1)[-1].split("}", 1)[0]
+    client_fields = re.findall(r"pub ([a-z0-9_]+):", client_decl)
+    if client_fields != [
+        "schema_version", "catalog_gh_broker_path", "catalog_gh_broker_sha256",
+        "publisher_broker_config_path", "publisher_broker_config_sha256",
+    ]:
+        errors.append(f"broker client config fields changed: {client_fields}")
+    for forbidden in ["token", "credential", "github_config_dir", "header", "repository"]:
+        if forbidden in client_decl.lower():
+            errors.append(f"broker client config gained forbidden authority: {forbidden}")
+    execute_region = current["broker_client"].split("pub(crate) fn execute(", 1)[-1].split("fn revalidate(", 1)[0]
+    first_rebind = execute_region.find("self.revalidate()?")
+    process = execute_region.find("self.execute_process(request_bytes)?", first_rebind)
+    second_rebind = execute_region.find("self.revalidate()?", first_rebind + 1)
+    if min(first_rebind, process, second_rebind) < 0 or not (first_rebind < process < second_rebind):
+        errors.append("broker client does not rebind all operation-pinned files around every request")
 
     manifest = current["manifest"]
     try:
