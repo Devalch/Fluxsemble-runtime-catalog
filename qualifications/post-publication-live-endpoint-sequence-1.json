@@ -1,0 +1,141 @@
+{
+  "schema_version": 2,
+  "receipt_id": "post-publication-live-endpoint-sequence-1",
+  "repository": "Devalch/Fluxsemble-runtime-catalog",
+  "producer_head_before_evidence": "cfbf59fbc29c4ef2873f7999d0c52d550f738b36",
+  "published_release": {
+    "release_id": "378550795",
+    "tag": "catalog-v1-sequence-1",
+    "source_commit": "1b88ca0b36aaa0deadae2daec823c09fbe0fadbe",
+    "published_at": "2026-08-28T15:06:08Z",
+    "latest_catalog_url": "https://github.com/Devalch/Fluxsemble-runtime-catalog/releases/latest/download/catalog-v1.json",
+    "payload_sha256": "f1587ddc20140f44f5a223cc8df7f7b998839408f66c52d54f2b77abfde5e4dc",
+    "envelope_sha256": "7c235f5c3a4e74251d525f7d1c24c19c25e773aae32a9717898bc2a9273628d5"
+  },
+  "qualified_consumer": {
+    "repository": "Devalch/Fluxsemble",
+    "implementation_commit": "e2c22e6bd5989fbc87793643f209967e8cd64dcd",
+    "application_sha256": "3c5e8d1961358a855f8eb86fde08a8471409a273b2a78def302a84db38e2dfa8",
+    "daemon_sha256": "90ff1cb9ba2a83e3fa929133edf69c2d744c8f4551b331a24628ffb68520f893",
+    "compatibility_profile_id": "builtin-pi-0.83.0-node-22.19.0-linux-x86_64-v1",
+    "compatibility_profile_sha256": "016f39ac96b41a78c5c394b67c5f2d058a59aa7e6891eed10322a061fc0921d5",
+    "build_binding_sha256": "6f6fd672d344eb91d837f92b4d447389a428d773ee548034a4a01d6ffd696d48",
+    "fixed_candidate_qualification_sha256": "76cf70cfa0515ecb841440ad071314800e96addbffc0b0f7ba62324a2100261c",
+    "fixed_candidate_tests": 7,
+    "fixed_candidate_checks": 8,
+    "all_fixed_candidate_outcomes_passed": true
+  },
+  "live_journeys": {
+    "clean_isolated_startup": "accepted_sequence_1",
+    "authenticated_check_now": "unchanged",
+    "reviewed_install": {
+      "outcome": "completed",
+      "provider": "builtin:pi",
+      "target": "linux_x86_64",
+      "pi_version": "0.83.0",
+      "node_version": "22.19.0",
+      "durable_stages": [
+        "queued",
+        "downloading",
+        "extracting",
+        "verifying",
+        "activating",
+        "completed"
+      ],
+      "published_health": "passed",
+      "active_after_reopen": true
+    },
+    "offline_failure_preservation": {
+      "safe_error_code": "catalog_network_unavailable",
+      "accepted_catalog_preserved": true,
+      "active_installation_preserved": true
+    },
+    "reconnect": {
+      "outcome": "unchanged",
+      "active_installation_preserved": true,
+      "transparent_daemon_restart_preserved_catalog_and_selection": true,
+      "duplicate_command_created": false,
+      "live_stale_announcement_observed": false,
+      "stale_announcement_and_resync_contract": "focused_tests_passed"
+    },
+    "accessibility_and_command_parity": {
+      "pointer_selection": "passed_via_xtest",
+      "keyboard_selection": "passed_via_xtest",
+      "review_cancel": "passed",
+      "palette_review": "passed",
+      "focus_containment_and_return": "passed",
+      "separate_confirmation_cancelled_without_submit": true,
+      "catalog_check_ui_trace_count": 1,
+      "catalog_check_durable_receipt_delta": 1,
+      "catalog_check_event_cursor_range": [
+        6,
+        7
+      ]
+    },
+    "rollback": {
+      "outcome": "disabled",
+      "safe_reason_code": "no_rollback_candidate"
+    }
+  },
+  "external_evidence_sha256": {
+    "attempt_outcome": "d80e181761b4e0a16eb77f2c42afff83caf6b46def0b26e1eb44d59aa991a035",
+    "rollback_unavailable": "f6c9e5498208b1b0ff49d4742b6ef8906c633486f5575b86b35e8bd1829d6922",
+    "runtime_events_and_managed_transport": "7f67b6cd904f05119ddfdc288fd9fbcdbcafc46632800bcae1740eb8ce45a3c7",
+    "sanitized_connected_namespace": "38831a88e9cfb029e579d59e8f4c951c8fba7096b66c9bf42c15b74f9cba06c2",
+    "sanitized_offline_namespace": "0254016aefd4b7dad72fe4623f2e61cb9110930d0d59019e0581015d0e0622d5",
+    "final_live_ui_provenance": "01d0011e93e0992bb329d9ce2d936f8164709e0bc049f38de8b307a69307b4ae",
+    "final_driver_confinement": "780a105c204bf5e2336e9017ce740c09a06dfda07d95c5cb14ef5a5dea036a3c",
+    "reviewed_targeted_verification": "f06d95f4c5cc598cbdcfd87f8f6c6f6352096c69da4e1f65469aab6d892d49a0",
+    "final_evidence_manifest": "313d29a1759dd19346c7507bf3eeaec53cb0204530f1846d1686de67032f190a"
+  },
+  "boundary_evidence": {
+    "consumer_boundary_check": "passed",
+    "producer_dependency": "absent",
+    "publication_mutation_during_task_21": false,
+    "published_catalog_changed": false,
+    "production_signing_key_used": false,
+    "direct_daemon_substitution_claimed": false,
+    "ui_tauri_origin": "sole_client_bounded_temporal_correlation_not_cryptographic_per_action_proof",
+    "ui_driver_daemon_endpoint_access": false,
+    "ui_driver_application_data_access": false
+  },
+  "reviews": {
+    "closure_final": {
+      "run_id": "83c58ea0-e66a-44e5-bc80-02acabfaf595",
+      "supported": "Task 21 Steps 1 through 4 and owner-amended targeted Step 5",
+      "verdict": "step_6_receipt_reconciliation_only"
+    },
+    "security_final": {
+      "run_id": "dc0c9465-8196-46e4-ad18-2763c0538cb0",
+      "supported": "qualified build binding, complete driver-source confinement, path and secret redaction, sole-client command correlation, and restart preservation",
+      "verdict": "addressed_no_new_blocker"
+    }
+  },
+  "verification": {
+    "consumer_fixed_candidate_qualification": "passed",
+    "consumer_boundary_check": "passed",
+    "targeted_verification_groups": 6,
+    "targeted_verification_outcome": "passed",
+    "consumer_full_gate": "not_run_owner_approved_targeted_substitution",
+    "producer_full_gate": "not_run_owner_approved_targeted_substitution",
+    "full_gate_rerun_trigger": "before_branch_integration_release_replacement_or_subsequent_production_code_change"
+  },
+  "task_21_step_5_amendment": {
+    "approved_by": "release_owner",
+    "approval_channel": "interactive_session",
+    "approval_statement_sha256": "41003121927e1066a415b88e0729a3ebff585e36275d14af494b9f71fc409313",
+    "replacement": "six_group_targeted_verification",
+    "full_gates_claimed": false
+  },
+  "closure_status": "completed_under_owner_approved_targeted_verification_amendment",
+  "open_requirements": [],
+  "residual_risks": [
+    "The complete repository gates were not run; the approved targeted checks do not establish unrelated workspace behavior.",
+    "A live stale-data announcement was not observed during transparent daemon restarts; focused reconnect tests cover announcement deduplication, disconnect during download, remount, cursor gaps, stale events, focus preservation, and no duplicate command.",
+    "The UI-to-receipt relationship is sole-client bounded temporal correlation, not cryptographic per-action proof.",
+    "Sequence 1 remains limited to builtin:pi 0.83.0 with Node 22.19.0 on linux_x86_64 for Fluxsemble 0.1.0.",
+    "No live rollback was attempted because a first installation has no rollback candidate.",
+    "Future Pi or Node tuples remain blocked pending a separately approved version-flexible-installer project.",
+    "This post-publication receipt does not retroactively authorize or mutate signing, publication, tags, releases, or assets."
+  ]
+}
