@@ -1,5 +1,13 @@
-use std::collections::{BTreeSet, HashSet};
+use std::{
+    collections::{BTreeSet, HashSet},
+    fs,
+    io::{Read, Write},
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 
+use base64::Engine as _;
 use catalog_core::{
     ArtifactDescriptor, InitialPiReleaseIntentV1, LockedPackageRecord, PiCatalogExtensionMetadata,
     ProviderExtensionV1,
@@ -17,58 +25,441 @@ use crate::{
 };
 
 const ROOT_NAME: &str = "@earendil-works/pi-coding-agent";
-const ROOT_VERSION: &str = "0.83.0";
-const NODE_VERSION: &str = "22.19.0";
 const ENTRYPOINT: &str = "dist/cli.js";
-const LOCKED_COUNT: usize = 139;
-const APPLICABLE_COUNT: usize = 130;
-const PRE_PRUNE_COUNT: usize = 131;
+const MAX_LOCKED_COUNT: usize = 4_096;
 const MAX_PACKAGE_INPUT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_METADATA_BYTES: usize = 4 * 1024 * 1024;
+const MAX_CHECKSUM_BYTES: usize = 1024 * 1024;
+const MAX_ARCHIVE_BYTES: usize = 512 * 1024 * 1024;
+const NPM_ORIGIN: &str = "https://registry.npmjs.org";
+const NODE_ORIGIN: &str = "https://nodejs.org";
+const SUPPORT_ORIGIN: &str = "https://github.com";
+const SUPPORT_REPOSITORY: &str = "Devalch/Fluxsemble-runtime-catalog";
 
-const MISSING_LOCK_INTEGRITY: [&str; 3] = [
-    "node_modules/@earendil-works/pi-agent-core",
-    "node_modules/@earendil-works/pi-ai",
-    "node_modules/@earendil-works/pi-tui",
-];
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoverPiReleaseRequest {
+    pub sequence: u64,
+    pub generated_at: String,
+    pub expires_at: String,
+    pub pi_version: String,
+    pub node_version: String,
+    pub title: String,
+    pub notes: String,
+    pub target: String,
+}
 
-const PRUNED: [(&str, &[&str]); 9] = [
-    (
-        "node_modules/@mariozechner/clipboard-darwin-arm64",
-        &["declaration.cpu", "declaration.os", "lock.cpu", "lock.os"],
-    ),
-    (
-        "node_modules/@mariozechner/clipboard-darwin-universal",
-        &["declaration.os", "lock.os"],
-    ),
-    (
-        "node_modules/@mariozechner/clipboard-darwin-x64",
-        &["declaration.os", "lock.os"],
-    ),
-    (
-        "node_modules/@mariozechner/clipboard-linux-arm64-gnu",
-        &["declaration.cpu", "lock.cpu"],
-    ),
-    (
-        "node_modules/@mariozechner/clipboard-linux-arm64-musl",
-        &["declaration.cpu", "declaration.libc", "lock.cpu"],
-    ),
-    (
-        "node_modules/@mariozechner/clipboard-linux-riscv64-gnu",
-        &["declaration.cpu", "lock.cpu"],
-    ),
-    (
-        "node_modules/@mariozechner/clipboard-linux-x64-musl",
-        &["declaration.libc"],
-    ),
-    (
-        "node_modules/@mariozechner/clipboard-win32-arm64-msvc",
-        &["declaration.cpu", "declaration.os", "lock.cpu", "lock.os"],
-    ),
-    (
-        "node_modules/@mariozechner/clipboard-win32-x64-msvc",
-        &["declaration.os", "lock.os"],
-    ),
-];
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredPiRelease {
+    pub intent: InitialPiReleaseIntentV1,
+    pub package_inputs: PackageInputManifestV1,
+}
+
+/// Credential-free byte transport used by authenticated release discovery.
+///
+/// Production callers use [`discover_pi_release`]. This seam is public only so integration tests
+/// can provide deterministic public-origin responses; the discovery implementation still chooses
+/// every URL and applies the same digest, origin, and archive checks.
+#[doc(hidden)]
+pub trait ReleaseDiscoveryTransport {
+    fn fetch(&self, url: &str, maximum_bytes: usize) -> Result<Vec<u8>, AcquireError>;
+}
+
+pub fn discover_pi_release(
+    request: DiscoverPiReleaseRequest,
+) -> Result<DiscoveredPiRelease, AcquireError> {
+    discover_pi_release_with_transport(request, &HttpReleaseDiscoveryTransport::new()?)
+}
+
+#[doc(hidden)]
+pub fn discover_pi_release_with_transport(
+    request: DiscoverPiReleaseRequest,
+    transport: &dyn ReleaseDiscoveryTransport,
+) -> Result<DiscoveredPiRelease, AcquireError> {
+    validate_discovery_request(&request)?;
+
+    let root_metadata_url = npm_metadata_url(ROOT_NAME, &request.pi_version)?;
+    let root_metadata = transport.fetch(&root_metadata_url, MAX_METADATA_BYTES)?;
+    let (root_url, root_integrity) =
+        parse_npm_metadata(&root_metadata, ROOT_NAME, &request.pi_version, None)?;
+    let root_bytes = transport.fetch(&root_url, MAX_ARCHIVE_BYTES)?;
+    let mut root_archive = verified_bytes(root_bytes, &root_url, Some(&root_integrity))?;
+    let root_inspection = inspect_npm_archive(&mut root_archive, true)?;
+    let declaration = parse_json_object(&root_inspection.declaration, 64 * 1024)?;
+    let shrinkwrap_bytes = root_inspection
+        .shrinkwrap
+        .as_ref()
+        .ok_or(AcquireError::Graph)?;
+    let shrinkwrap = parse_json_object(shrinkwrap_bytes, 1024 * 1024)?;
+    require_string(&declaration, "name", ROOT_NAME)?;
+    require_string(&declaration, "version", &request.pi_version)?;
+    let bin = declaration
+        .get("bin")
+        .and_then(Value::as_object)
+        .ok_or(AcquireError::Graph)?;
+    require_string(bin, "pi", ENTRYPOINT)?;
+    require_string(&shrinkwrap, "name", ROOT_NAME)?;
+    require_string(&shrinkwrap, "version", &request.pi_version)?;
+    if shrinkwrap.get("lockfileVersion").and_then(Value::as_u64) != Some(3)
+        || shrinkwrap.get("requires").and_then(Value::as_bool) != Some(true)
+    {
+        return Err(AcquireError::Graph);
+    }
+    let package_records = lock_package_records(&shrinkwrap)?;
+    verify_complete_closure(&package_records)?;
+
+    let mut locked_descriptors = Vec::with_capacity(package_records.len() - 1);
+    let mut locked_archives = Vec::with_capacity(package_records.len() - 1);
+    for (locator, lock) in package_records
+        .iter()
+        .filter(|(locator, _)| !locator.is_empty())
+    {
+        let name = lock
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                locator
+                    .rsplit("node_modules/")
+                    .next()
+                    .unwrap_or("")
+                    .to_owned()
+            });
+        let version = lock
+            .get("version")
+            .and_then(Value::as_str)
+            .ok_or(AcquireError::Graph)?;
+        let resolved = lock
+            .get("resolved")
+            .and_then(Value::as_str)
+            .ok_or(AcquireError::Graph)?;
+        require_registry_url(resolved)?;
+        let integrity = match lock.get("integrity").and_then(Value::as_str) {
+            Some(integrity) if valid_sri(integrity) => integrity.to_owned(),
+            Some(_) => return Err(AcquireError::Graph),
+            None => {
+                let metadata_url = npm_metadata_url(&name, version)?;
+                let metadata = transport.fetch(&metadata_url, MAX_METADATA_BYTES)?;
+                let (_, integrity) = parse_npm_metadata(&metadata, &name, version, Some(resolved))?;
+                integrity
+            }
+        };
+        let bytes = transport.fetch(resolved, MAX_ARCHIVE_BYTES)?;
+        let archive = verified_bytes(bytes, resolved, Some(&integrity))?;
+        locked_descriptors.push(serde_json::json!({
+            "locator": locator,
+            "name": name,
+            "version": version,
+            "resolved_url": resolved,
+            "registry_integrity": integrity,
+            "archive_sha256": archive.sha256(),
+        }));
+        locked_archives.push(archive);
+    }
+
+    let node_name = format!("node-v{}-linux-x64.tar.xz", request.node_version);
+    let node_url = format!("{NODE_ORIGIN}/dist/v{}/{}", request.node_version, node_name);
+    let checksums_url = format!(
+        "{NODE_ORIGIN}/dist/v{}/SHASUMS256.txt",
+        request.node_version
+    );
+    let checksums = transport.fetch(&checksums_url, MAX_CHECKSUM_BYTES)?;
+    let node_sha256 = parse_node_checksum(&checksums, &node_name)?;
+    let node_bytes = transport.fetch(&node_url, MAX_ARCHIVE_BYTES)?;
+    let mut node_archive = verified_bytes(node_bytes, &node_url, None)?;
+    if node_archive.sha256() != node_sha256 {
+        return Err(AcquireError::DigestMismatch);
+    }
+    let node_inspection = inspect_node_archive(&mut node_archive)?;
+    let (entrypoint_size, entrypoint_sha256) = root_inspection
+        .regular_fact(&format!("package/{ENTRYPOINT}"))
+        .ok_or(AcquireError::Archive)?;
+
+    let root_manifest_sha256 = sha256(&root_inspection.declaration);
+    let shrinkwrap_sha256 = sha256(shrinkwrap_bytes);
+    let tag = format!("catalog-v1-sequence-{}", request.sequence);
+    let support_prefix = format!("{SUPPORT_ORIGIN}/{SUPPORT_REPOSITORY}/releases/download/{tag}");
+    let intent_value = serde_json::json!({
+        "sequence": request.sequence.to_string(),
+        "tag": tag,
+        "generated_at": request.generated_at,
+        "expires_at": request.expires_at,
+        "fluxsemble_requirement": "=0.1.0",
+        "release": {
+            "provider": "builtin:pi",
+            "allowed_origins": [SUPPORT_ORIGIN, NODE_ORIGIN, NPM_ORIGIN],
+            "release": {
+                "version": request.pi_version,
+                "target": request.target,
+                "compatibility_ranges": ["=0.1.0"],
+                "release_metadata": {"title": request.title, "notes": request.notes},
+                "components": [
+                    {
+                        "component_id": "component:node",
+                        "version": request.node_version,
+                        "artifacts": [{
+                            "artifact_id": "artifact:node-linux-x86_64",
+                            "url": node_url,
+                            "size_bytes": node_archive.size().to_string(),
+                            "sha256": node_sha256,
+                            "inventory": [{
+                                "path": "bin/node",
+                                "size_bytes": node_inspection.node_size.to_string(),
+                                "sha256": node_inspection.node_sha256,
+                            }]
+                        }]
+                    },
+                    {
+                        "component_id": "component:pi",
+                        "version": request.pi_version,
+                        "artifacts": [{
+                            "artifact_id": "artifact:pi-coding-agent",
+                            "url": root_url,
+                            "size_bytes": root_archive.size().to_string(),
+                            "sha256": root_archive.sha256(),
+                            "inventory": [{
+                                "path": ENTRYPOINT,
+                                "size_bytes": entrypoint_size.to_string(),
+                                "sha256": entrypoint_sha256,
+                            }]
+                        }]
+                    }
+                ],
+                "provider_extension": {"kind": "pi", "metadata": {
+                    "approved_package": {"name": ROOT_NAME, "version": request.pi_version},
+                    "expected_entrypoint": ENTRYPOINT,
+                    "component_id": "component:pi",
+                    "package_artifact_id": "artifact:pi-coding-agent",
+                    "registry_integrity": root_integrity,
+                    "root_package_manifest": {
+                        "url": format!("{support_prefix}/pi-package-{root_manifest_sha256}.json"),
+                        "size_bytes": root_inspection.declaration.len().to_string(),
+                        "sha256": root_manifest_sha256,
+                    },
+                    "shipped_shrinkwrap": {
+                        "lockfile_version": 3,
+                        "root_package": {"name": ROOT_NAME, "version": request.pi_version},
+                        "artifact": {
+                            "url": format!("{support_prefix}/pi-shrinkwrap-{shrinkwrap_sha256}.json"),
+                            "size_bytes": shrinkwrap_bytes.len().to_string(),
+                            "sha256": shrinkwrap_sha256,
+                        },
+                        "locked_packages": locked_descriptors,
+                    }
+                }}
+            }
+        }
+    });
+    let intent = InitialPiReleaseIntentV1::from_json(
+        &serde_json::to_vec(&intent_value).map_err(|_| AcquireError::Input)?,
+    )
+    .map_err(|_| AcquireError::Input)?;
+    let package_inputs = discover_package_inputs(&intent, &mut root_archive, &mut locked_archives)?;
+    package_inputs.validate_for_intent(&intent)?;
+    Ok(DiscoveredPiRelease {
+        intent,
+        package_inputs,
+    })
+}
+
+struct HttpReleaseDiscoveryTransport {
+    client: reqwest::blocking::Client,
+}
+
+impl HttpReleaseDiscoveryTransport {
+    fn new() -> Result<Self, AcquireError> {
+        let client = reqwest::blocking::Client::builder()
+            .https_only(true)
+            .use_rustls_tls()
+            .no_proxy()
+            .referer(false)
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(60))
+            .build()
+            .map_err(|_| AcquireError::Transport)?;
+        Ok(Self { client })
+    }
+}
+
+impl ReleaseDiscoveryTransport for HttpReleaseDiscoveryTransport {
+    fn fetch(&self, url: &str, maximum_bytes: usize) -> Result<Vec<u8>, AcquireError> {
+        require_fixed_discovery_url(url)?;
+        let response = self
+            .client
+            .get(url)
+            .send()
+            .map_err(|_| AcquireError::Transport)?;
+        if response.status() != reqwest::StatusCode::OK {
+            return Err(AcquireError::UnexpectedStatus);
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > maximum_bytes as u64)
+        {
+            return Err(AcquireError::SizeLimitExceeded);
+        }
+        let mut bytes = Vec::new();
+        response
+            .take(maximum_bytes as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| AcquireError::Transport)?;
+        if bytes.len() > maximum_bytes {
+            return Err(AcquireError::SizeLimitExceeded);
+        }
+        Ok(bytes)
+    }
+}
+
+fn validate_discovery_request(request: &DiscoverPiReleaseRequest) -> Result<(), AcquireError> {
+    if request.sequence == 0
+        || request.target != "linux_x86_64"
+        || !valid_version(&request.pi_version)
+        || !valid_version(&request.node_version)
+    {
+        return Err(AcquireError::Input);
+    }
+    Ok(())
+}
+
+fn npm_metadata_url(name: &str, version: &str) -> Result<String, AcquireError> {
+    if name.is_empty() || !valid_version(version) {
+        return Err(AcquireError::Input);
+    }
+    let encoded = name.replace('/', "%2F");
+    Ok(format!("{NPM_ORIGIN}/{encoded}/{version}"))
+}
+
+fn parse_npm_metadata(
+    bytes: &[u8],
+    expected_name: &str,
+    expected_version: &str,
+    expected_tarball: Option<&str>,
+) -> Result<(String, String), AcquireError> {
+    if bytes.is_empty() || bytes.len() > MAX_METADATA_BYTES {
+        return Err(AcquireError::Input);
+    }
+    reject_duplicate_json(bytes)?;
+    let value: Value = serde_json::from_slice(bytes).map_err(|_| AcquireError::Input)?;
+    let object = value.as_object().ok_or(AcquireError::Input)?;
+    require_string(object, "name", expected_name)?;
+    require_string(object, "version", expected_version)?;
+    let dist = object
+        .get("dist")
+        .and_then(Value::as_object)
+        .ok_or(AcquireError::Input)?;
+    let tarball = dist
+        .get("tarball")
+        .and_then(Value::as_str)
+        .ok_or(AcquireError::Input)?;
+    let integrity = dist
+        .get("integrity")
+        .and_then(Value::as_str)
+        .ok_or(AcquireError::Input)?;
+    require_registry_url(tarball)?;
+    if expected_tarball.is_some_and(|expected| expected != tarball) || !valid_sri(integrity) {
+        return Err(AcquireError::Input);
+    }
+    Ok((tarball.to_owned(), integrity.to_owned()))
+}
+
+fn parse_node_checksum(bytes: &[u8], expected_name: &str) -> Result<String, AcquireError> {
+    if bytes.is_empty() || bytes.len() > MAX_CHECKSUM_BYTES {
+        return Err(AcquireError::Input);
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| AcquireError::Input)?;
+    let mut found = None;
+    for line in text.lines() {
+        let Some((digest, name)) = line.split_once("  ") else {
+            return Err(AcquireError::Input);
+        };
+        if name == expected_name {
+            if found.is_some() || !valid_sha256(digest) {
+                return Err(AcquireError::Input);
+            }
+            found = Some(digest.to_owned());
+        }
+    }
+    found.ok_or(AcquireError::Input)
+}
+
+fn verified_bytes(
+    bytes: Vec<u8>,
+    url: &str,
+    sri: Option<&str>,
+) -> Result<VerifiedArchive, AcquireError> {
+    if bytes.is_empty() || bytes.len() > MAX_ARCHIVE_BYTES {
+        return Err(AcquireError::SizeLimitExceeded);
+    }
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let path = std::env::temp_dir().join(format!(
+        "catalog-release-discovery-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|_| AcquireError::TemporaryFile)?;
+    file.write_all(&bytes)
+        .map_err(|_| AcquireError::TemporaryFile)?;
+    file.sync_all().map_err(|_| AcquireError::TemporaryFile)?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o400))
+        .map_err(|_| AcquireError::TemporaryFile)?;
+    drop(file);
+    let file = fs::File::open(&path).map_err(|_| AcquireError::TemporaryFile)?;
+    let result = VerifiedArchive::verify(
+        file,
+        url.to_owned(),
+        bytes.len() as u64,
+        sha256(&bytes),
+        sri.map(str::to_owned),
+    );
+    let _ = fs::remove_file(path);
+    result
+}
+
+fn require_fixed_discovery_url(url: &str) -> Result<(), AcquireError> {
+    if url.len() > 4096
+        || url.contains(['?', '#', '\\'])
+        || (!url.starts_with(&format!("{NPM_ORIGIN}/"))
+            && !url.starts_with(&format!("{NODE_ORIGIN}/")))
+    {
+        return Err(AcquireError::InvalidPolicy);
+    }
+    Ok(())
+}
+
+fn require_registry_url(url: &str) -> Result<(), AcquireError> {
+    if url.starts_with(&format!("{NPM_ORIGIN}/"))
+        && !url.contains(['?', '#', '\\'])
+        && url.len() <= 4096
+    {
+        Ok(())
+    } else {
+        Err(AcquireError::InvalidPolicy)
+    }
+}
+
+fn safe_locator(value: &str) -> bool {
+    value.len() <= 1024
+        && value.starts_with("node_modules/")
+        && !value.contains('\\')
+        && value
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
+fn valid_version(value: &str) -> bool {
+    let mut parts = value.split('.');
+    parts.clone().count() == 3
+        && parts.all(|part| {
+            !part.is_empty()
+                && (part == "0" || !part.starts_with('0'))
+                && part.bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -139,6 +530,29 @@ impl PackageInputManifestV1 {
         self.locked_packages.len()
     }
 
+    #[must_use]
+    pub fn root_version(&self) -> &str {
+        &self.root.version
+    }
+
+    pub fn validate_for_intent(
+        &self,
+        intent: &InitialPiReleaseIntentV1,
+    ) -> Result<(), AcquireError> {
+        self.validate()?;
+        if intent.release().target().as_str() != "linux_x86_64"
+            || intent.release().pi_version().as_str() != self.root.version
+            || pi_metadata(intent)?
+                .shipped_shrinkwrap()
+                .locked_packages()
+                .len()
+                != self.locked_packages.len()
+        {
+            return Err(AcquireError::Graph);
+        }
+        Ok(())
+    }
+
     pub(crate) fn archive_size_for(&self, locator: &str) -> Option<u64> {
         self.locked_packages
             .iter()
@@ -147,45 +561,53 @@ impl PackageInputManifestV1 {
     }
 
     fn validate(&self) -> Result<(), AcquireError> {
+        let applicable = self
+            .locked_packages
+            .iter()
+            .filter(|record| matches!(record.applicability, LinuxApplicability::Applicable))
+            .count();
         if self.schema_version != 1
             || self.target_os != "linux"
             || self.target_cpu != "x64"
             || self.target_libc != "glibc"
             || self.root.name != ROOT_NAME
-            || self.root.version != ROOT_VERSION
-            || self.locked_packages.len() != LOCKED_COUNT
-            || self.pre_prune_package_count != PRE_PRUNE_COUNT as u16
-            || self.applicable_package_count != APPLICABLE_COUNT as u16
+            || self.root.version.is_empty()
+            || self.root.archive_size == 0
+            || self.root.manifest_size == 0
+            || self.root.shrinkwrap_size == 0
+            || self.root.archive_member_count == 0
+            || !valid_sha256(&self.root.archive_sha256)
+            || !valid_sha256(&self.root.manifest_sha256)
+            || !valid_sha256(&self.root.shrinkwrap_sha256)
+            || self.locked_packages.is_empty()
+            || self.locked_packages.len() > MAX_LOCKED_COUNT
+            || self.pre_prune_package_count as usize != applicable + 1
+            || self.applicable_package_count as usize != applicable
             || self
                 .locked_packages
                 .windows(2)
                 .any(|pair| pair[0].locator.as_bytes() >= pair[1].locator.as_bytes())
-            || self
-                .locked_packages
-                .iter()
-                .filter(|record| matches!(record.applicability, LinuxApplicability::Applicable))
-                .count()
-                != APPLICABLE_COUNT
         {
             return Err(AcquireError::Graph);
         }
-        let actual_pruned = self
-            .locked_packages
-            .iter()
-            .filter_map(|record| match &record.applicability {
-                LinuxApplicability::Applicable => None,
-                LinuxApplicability::Pruned { reasons } => {
-                    Some((record.locator.as_str(), reasons.as_slice()))
-                }
-            })
-            .collect::<Vec<_>>();
-        if actual_pruned.len() != PRUNED.len()
-            || actual_pruned.iter().zip(PRUNED).any(|(actual, expected)| {
-                actual.0 != expected.0
-                    || actual.1.iter().map(String::as_str).collect::<Vec<_>>() != expected.1
-            })
-        {
-            return Err(AcquireError::Graph);
+        for record in &self.locked_packages {
+            if record.locator.is_empty()
+                || record.name.is_empty()
+                || record.version.is_empty()
+                || record.archive_size == 0
+                || record.archive_member_count == 0
+                || !record
+                    .resolved_url
+                    .starts_with("https://registry.npmjs.org/")
+                || record.resolved_url.contains(['?', '#', '\\'])
+                || !safe_locator(&record.locator)
+                || !valid_sri(&record.registry_integrity)
+                || !valid_sha256(&record.archive_sha256)
+                || !valid_sha256(&record.declaration_sha256)
+                || matches!(&record.applicability, LinuxApplicability::Pruned { reasons } if reasons.is_empty() || reasons.windows(2).any(|pair| pair[0] >= pair[1]) || reasons.iter().any(|reason| !matches!(reason.as_str(), "declaration.cpu" | "declaration.libc" | "declaration.os" | "lock.cpu" | "lock.libc" | "lock.os")))
+            {
+                return Err(AcquireError::Graph);
+            }
         }
         Ok(())
     }
@@ -273,7 +695,9 @@ pub fn discover_package_inputs(
         root_artifact,
         Some(metadata.registry_integrity().as_str()),
     )?;
-    if locked_archives.len() != LOCKED_COUNT {
+    let locked_count = metadata.shipped_shrinkwrap().locked_packages().len();
+    if locked_count == 0 || locked_count > MAX_LOCKED_COUNT || locked_archives.len() != locked_count
+    {
         return Err(AcquireError::Graph);
     }
     let root = inspect_npm_archive(root_archive, true)?;
@@ -285,7 +709,7 @@ pub fn discover_package_inputs(
     verify_lock_records(metadata, &package_records)?;
     verify_complete_closure(&package_records)?;
 
-    let mut observed = Vec::with_capacity(LOCKED_COUNT);
+    let mut observed = Vec::with_capacity(locked_count);
     for ((record, archive), (locator, lock)) in metadata
         .shipped_shrinkwrap()
         .locked_packages()
@@ -328,6 +752,14 @@ pub fn discover_package_inputs(
             applicability,
         });
     }
+    let applicable_count = observed
+        .iter()
+        .filter(|record| matches!(record.applicability, LinuxApplicability::Applicable))
+        .count();
+    let applicable_package_count =
+        u16::try_from(applicable_count).map_err(|_| AcquireError::Graph)?;
+    let pre_prune_package_count =
+        u16::try_from(applicable_count + 1).map_err(|_| AcquireError::Graph)?;
     let manifest = PackageInputManifestV1 {
         schema_version: 1,
         target_os: "linux".to_owned(),
@@ -335,7 +767,7 @@ pub fn discover_package_inputs(
         target_libc: "glibc".to_owned(),
         root: ObservedRootInput {
             name: ROOT_NAME.to_owned(),
-            version: ROOT_VERSION.to_owned(),
+            version: intent.release().pi_version().as_str().to_owned(),
             archive_size: root_archive.size(),
             archive_sha256: root_archive.sha256().to_owned(),
             manifest_size: root.declaration.len() as u64,
@@ -346,8 +778,8 @@ pub fn discover_package_inputs(
                 .map_err(|_| AcquireError::Graph)?,
         },
         locked_packages: observed,
-        pre_prune_package_count: PRE_PRUNE_COUNT as u16,
-        applicable_package_count: APPLICABLE_COUNT as u16,
+        pre_prune_package_count,
+        applicable_package_count,
     };
     manifest.validate()?;
     Ok(manifest)
@@ -364,7 +796,7 @@ pub fn verify_npm_graph(mut request: NpmGraphRequest) -> Result<VerifiedNpmGraph
     )?;
     require_archive(&request.node_archive, node, None)?;
     let node_inspection = inspect_node_archive(&mut request.node_archive)?;
-    if node_inspection.member_count != 5_780 {
+    if node_inspection.member_count == 0 {
         return Err(AcquireError::Graph);
     }
     verify_npm_graph_after_node_admission(request)
@@ -413,15 +845,23 @@ fn require_exact_intent(
     intent: &InitialPiReleaseIntentV1,
     metadata: &PiCatalogExtensionMetadata,
 ) -> Result<(), AcquireError> {
+    let pi_version = intent.release().pi_version().as_str();
+    let locked_count = metadata.shipped_shrinkwrap().locked_packages().len();
     if intent.release().provider() != "builtin:pi"
         || intent.release().target().as_str() != "linux_x86_64"
-        || intent.release().pi_version().as_str() != ROOT_VERSION
-        || intent.release().node_version().as_str() != NODE_VERSION
         || metadata.approved_package().name().as_str() != ROOT_NAME
-        || metadata.approved_package().version().as_str() != ROOT_VERSION
+        || metadata.approved_package().version().as_str() != pi_version
+        || metadata.shipped_shrinkwrap().root_package().name().as_str() != ROOT_NAME
+        || metadata
+            .shipped_shrinkwrap()
+            .root_package()
+            .version()
+            .as_str()
+            != pi_version
         || metadata.expected_entrypoint().as_str() != ENTRYPOINT
         || metadata.shipped_shrinkwrap().lockfile_version() != 3
-        || metadata.shipped_shrinkwrap().locked_packages().len() != LOCKED_COUNT
+        || locked_count == 0
+        || locked_count > MAX_LOCKED_COUNT
     {
         return Err(AcquireError::Graph);
     }
@@ -455,7 +895,7 @@ fn node_artifact(intent: &InitialPiReleaseIntentV1) -> Result<&ArtifactDescripto
         .iter()
         .find(|component| component.component_id().as_str() == "component:node")
         .ok_or(AcquireError::Graph)?;
-    if component.version().as_str() != NODE_VERSION || component.artifacts().len() != 1 {
+    if component.version() != intent.release().node_version() || component.artifacts().len() != 1 {
         return Err(AcquireError::Graph);
     }
     component.artifacts().first().ok_or(AcquireError::Graph)
@@ -506,18 +946,19 @@ fn verify_root_documents(
     {
         return Err(AcquireError::Graph);
     }
+    let pi_version = intent.release().pi_version().as_str();
     require_string(declaration, "name", ROOT_NAME)?;
-    require_string(declaration, "version", ROOT_VERSION)?;
+    require_string(declaration, "version", pi_version)?;
     let bin = declaration
         .get("bin")
         .and_then(Value::as_object)
         .ok_or(AcquireError::Graph)?;
     require_string(bin, "pi", ENTRYPOINT)?;
     require_string(shrinkwrap, "name", ROOT_NAME)?;
-    require_string(shrinkwrap, "version", ROOT_VERSION)?;
+    require_string(shrinkwrap, "version", pi_version)?;
     if shrinkwrap.get("lockfileVersion").and_then(Value::as_u64) != Some(3)
         || shrinkwrap.get("requires").and_then(Value::as_bool) != Some(true)
-        || intent.release().catalog_release().version().as_str() != ROOT_VERSION
+        || intent.release().catalog_release().version().as_str() != pi_version
     {
         return Err(AcquireError::Graph);
     }
@@ -533,7 +974,7 @@ fn lock_package_records(
         .get("packages")
         .and_then(Value::as_object)
         .ok_or(AcquireError::Graph)?;
-    if packages.len() != LOCKED_COUNT + 1 || !packages.contains_key("") {
+    if packages.len() < 2 || packages.len() > MAX_LOCKED_COUNT + 1 || !packages.contains_key("") {
         return Err(AcquireError::Graph);
     }
     let mut records = packages
@@ -568,7 +1009,7 @@ fn verify_lock_records(
         require_string(package, "resolved", expected.resolved_url().as_str())?;
         match package.get("integrity").and_then(Value::as_str) {
             Some(value) if value == expected.registry_integrity().as_str() => {}
-            None if MISSING_LOCK_INTEGRITY.contains(&locator.as_str()) => {}
+            None => {}
             _ => return Err(AcquireError::Graph),
         }
     }
@@ -681,6 +1122,21 @@ fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn valid_sri(value: &str) -> bool {
+    value.len() == 95
+        && value.starts_with("sha512-")
+        && base64::engine::general_purpose::STANDARD
+            .decode(&value[7..])
+            .is_ok_and(|bytes| bytes.len() == 64)
+}
+
 fn reject_duplicate_json(bytes: &[u8]) -> Result<(), AcquireError> {
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     NoDuplicates::deserialize(&mut deserializer).map_err(|_| AcquireError::Graph)?;
@@ -780,9 +1236,54 @@ mod tests {
     use sha2::{Digest, Sha256, Sha512};
 
     use super::{
-        AcquireError, MISSING_LOCK_INTEGRITY, NpmGraphRequest, PRUNED, PackageInputManifestV1,
-        VerifiedArchive, discover_package_inputs, verify_npm_graph_after_exact_node_for_test,
+        AcquireError, NpmGraphRequest, PackageInputManifestV1, VerifiedArchive,
+        discover_package_inputs, verify_npm_graph_after_exact_node_for_test,
     };
+
+    const MISSING_LOCK_INTEGRITY: [&str; 3] = [
+        "node_modules/@earendil-works/pi-agent-core",
+        "node_modules/@earendil-works/pi-ai",
+        "node_modules/@earendil-works/pi-tui",
+    ];
+
+    const PRUNED: [(&str, &[&str]); 9] = [
+        (
+            "node_modules/@mariozechner/clipboard-darwin-arm64",
+            &["declaration.cpu", "declaration.os", "lock.cpu", "lock.os"],
+        ),
+        (
+            "node_modules/@mariozechner/clipboard-darwin-universal",
+            &["declaration.os", "lock.os"],
+        ),
+        (
+            "node_modules/@mariozechner/clipboard-darwin-x64",
+            &["declaration.os", "lock.os"],
+        ),
+        (
+            "node_modules/@mariozechner/clipboard-linux-arm64-gnu",
+            &["declaration.cpu", "lock.cpu"],
+        ),
+        (
+            "node_modules/@mariozechner/clipboard-linux-arm64-musl",
+            &["declaration.cpu", "declaration.libc", "lock.cpu"],
+        ),
+        (
+            "node_modules/@mariozechner/clipboard-linux-riscv64-gnu",
+            &["declaration.cpu", "lock.cpu"],
+        ),
+        (
+            "node_modules/@mariozechner/clipboard-linux-x64-musl",
+            &["declaration.libc"],
+        ),
+        (
+            "node_modules/@mariozechner/clipboard-win32-arm64-msvc",
+            &["declaration.cpu", "declaration.os", "lock.cpu", "lock.os"],
+        ),
+        (
+            "node_modules/@mariozechner/clipboard-win32-x64-msvc",
+            &["declaration.os", "lock.os"],
+        ),
+    ];
 
     #[test]
     fn post_exact_node_graph_accepts_root_plus_139_locked_archives() {

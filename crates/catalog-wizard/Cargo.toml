@@ -6,10 +6,14 @@ license = "MIT"
 rust-version = "1.85"
 
 [dependencies]
+catalog-acquire = { path = "../catalog-acquire" }
+catalog-core = { path = "../catalog-core" }
 chrono = { workspace = true }
+libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 semver = { workspace = true }
 serde = { workspace = true }
+serde_jcs = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tokio = { version = "1", features = ["rt", "time"] }

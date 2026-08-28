@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod config;
+pub mod intent;
 pub mod npm;
 pub mod prompt;
 pub mod sequence;

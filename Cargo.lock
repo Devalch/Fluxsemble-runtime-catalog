@@ -134,10 +134,14 @@ dependencies = [
 name = "catalog-wizard"
 version = "0.1.0"
 dependencies = [
+ "catalog-acquire",
+ "catalog-core",
  "chrono",
+ "libc",
  "reqwest",
  "semver",
  "serde",
+ "serde_jcs",
  "serde_json",
  "sha2",
  "tokio",

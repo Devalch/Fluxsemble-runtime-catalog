@@ -23,10 +23,6 @@ const MAX_PAX_BYTES: u64 = 256 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 const MAX_SHRINKWRAP_BYTES: u64 = 1024 * 1024;
 
-const NODE_ROOT: &str = "node-v22.19.0-linux-x64";
-const PINNED_NODE_URL: &str = "https://nodejs.org/dist/v22.19.0/node-v22.19.0-linux-x64.tar.xz";
-const PINNED_NODE_SHA256: &str = "c0649af18e6a24f6fe5535a3e86b341dd49a8e71117c8b68bde973ef834f16f2";
-const PINNED_NODE_SIZE: u64 = 30_479_988;
 const LEGACY_STAR_NODE_TYPES_SHA256: &str =
     "c32937b40ab720ef6242de0bf4c8b8e48f1e4a29fbb4cb9d9f596471ee58d5c4";
 const LEGACY_STAR_NODE_TYPES_SIZE: u64 = 445_223;
@@ -36,20 +32,6 @@ const LEGACY_NODETAR_SIZE: u64 = 3_125;
 const CANONICAL_PAX_SHA256: &str =
     "972976d054d30dfcdc6bc537b1712e28860cef38ab9e3da09b5846e5a59ef43c";
 const CANONICAL_PAX_SIZE: u64 = 1_048_048;
-const NODE_LINKS: [(&str, &str); 3] = [
-    (
-        "node-v22.19.0-linux-x64/bin/corepack",
-        "../lib/node_modules/corepack/dist/corepack.js",
-    ),
-    (
-        "node-v22.19.0-linux-x64/bin/npm",
-        "../lib/node_modules/npm/bin/npm-cli.js",
-    ),
-    (
-        "node-v22.19.0-linux-x64/bin/npx",
-        "../lib/node_modules/npm/bin/npx-cli.js",
-    ),
-];
 
 /// One exact, fully rehashed archive descriptor. It carries no pathname authority.
 pub struct VerifiedArchive {
@@ -177,11 +159,22 @@ pub(crate) struct NpmArchiveInspection {
     pub declaration: Vec<u8>,
     pub shrinkwrap: Option<Vec<u8>>,
     pub member_count: usize,
+    regular_facts: BTreeMap<String, RegularMemberFact>,
+}
+
+impl NpmArchiveInspection {
+    pub(crate) fn regular_fact(&self, path: &str) -> Option<(u64, String)> {
+        self.regular_facts
+            .get(path)
+            .map(|fact| (fact.size, hex_lower(&fact.sha256)))
+    }
 }
 
 #[derive(Debug)]
 pub(crate) struct NodeArchiveInspection {
     pub member_count: usize,
+    pub node_size: u64,
+    pub node_sha256: String,
 }
 
 pub fn verify_npm_archive_shape(
@@ -249,25 +242,27 @@ pub(crate) fn inspect_npm_archive(
         declaration,
         shrinkwrap,
         member_count: parsed.member_count,
+        regular_facts: parsed.regular_facts,
     })
 }
 
 pub(crate) fn inspect_node_archive(
     archive: &mut VerifiedArchive,
 ) -> Result<NodeArchiveInspection, AcquireError> {
-    require_pinned_node_identity(archive.source_url(), archive.size(), archive.sha256())?;
+    let expected_root =
+        require_pinned_node_identity(archive.source_url(), archive.size(), archive.sha256())?;
     let parsed = read_compressed_tar(archive, Compression::Xz, ArchivePolicy::ExactNode)?;
-    if parsed.physical_header_count != 7_013
-        || parsed.member_count != 5_780
-        || parsed.gnu_long_name_count != 1_233
-        || parsed.regular_count != 4_673
-        || parsed.directory_count != 1_104
-        || parsed.symlink_count != 3
-    {
+    if parsed.node_root.as_deref() != Some(expected_root.as_str()) || parsed.symlink_count != 3 {
         return Err(AcquireError::Archive);
     }
+    let node = parsed
+        .regular_facts
+        .get(&format!("{expected_root}/bin/node"))
+        .ok_or(AcquireError::Archive)?;
     Ok(NodeArchiveInspection {
         member_count: parsed.member_count,
+        node_size: node.size,
+        node_sha256: hex_lower(&node.sha256),
     })
 }
 
@@ -275,11 +270,31 @@ pub(crate) fn require_pinned_node_identity(
     url: &str,
     size: u64,
     sha256: &str,
-) -> Result<(), AcquireError> {
-    if url != PINNED_NODE_URL || size != PINNED_NODE_SIZE || sha256 != PINNED_NODE_SHA256 {
+) -> Result<String, AcquireError> {
+    let name = url
+        .strip_prefix("https://nodejs.org/dist/v")
+        .and_then(|rest| rest.split_once('/'))
+        .and_then(|(directory_version, name)| {
+            let root = name.strip_suffix(".tar.xz")?;
+            (name == format!("node-v{directory_version}-linux-x64.tar.xz")
+                && valid_version(directory_version))
+            .then(|| root.to_owned())
+        })
+        .ok_or(AcquireError::Archive)?;
+    if size == 0 || size > MAX_ARCHIVE_BYTES || !valid_sha256(sha256) {
         return Err(AcquireError::Archive);
     }
-    Ok(())
+    Ok(name)
+}
+
+fn valid_version(value: &str) -> bool {
+    let mut parts = value.split('.');
+    parts.clone().count() == 3
+        && parts.all(|part| {
+            !part.is_empty()
+                && (part == "0" || !part.starts_with('0'))
+                && part.bytes().all(|byte| byte.is_ascii_digit())
+        })
 }
 
 #[derive(Clone, Copy)]
@@ -313,6 +328,8 @@ impl ArchivePolicy {
 
 struct ParsedTar {
     captured: BTreeMap<String, Vec<u8>>,
+    regular_facts: BTreeMap<String, RegularMemberFact>,
+    node_root: Option<String>,
     member_count: usize,
     physical_header_count: usize,
     gnu_long_name_count: usize,
@@ -377,6 +394,7 @@ fn parse_tar(reader: &mut impl Read, policy: ArchivePolicy) -> Result<ParsedTar,
     let mut links = BTreeMap::new();
     let mut captured = BTreeMap::new();
     let mut npm_root: Option<String> = None;
+    let mut node_root: Option<String> = None;
     let mut pending_pax: Option<PaxHeader> = None;
     let mut pending_long_name: Option<String> = None;
     let mut headers = 0_usize;
@@ -494,8 +512,18 @@ fn parse_tar(reader: &mut impl Read, policy: ArchivePolicy) -> Result<ParsedTar,
                 return Err(AcquireError::Archive);
             }
             npm_root.get_or_insert_with(|| root.to_owned());
-        } else if path != NODE_ROOT && !path.starts_with(&format!("{NODE_ROOT}/")) {
-            return Err(AcquireError::Archive);
+        } else {
+            let root = path.split('/').next().ok_or(AcquireError::Archive)?;
+            if root.is_empty()
+                || node_root
+                    .as_deref()
+                    .is_some_and(|observed| observed != root)
+                || !root.starts_with("node-v")
+                || !root.ends_with("-linux-x64")
+            {
+                return Err(AcquireError::Archive);
+            }
+            node_root.get_or_insert_with(|| root.to_owned());
         }
         members += 1;
         if members > MAX_TAR_MEMBERS || size > MAX_TAR_MEMBER_BYTES {
@@ -567,16 +595,14 @@ fn parse_tar(reader: &mut impl Read, policy: ArchivePolicy) -> Result<ParsedTar,
         }
     }
     if policy == ArchivePolicy::ExactNode {
-        let expected = NODE_LINKS
-            .into_iter()
-            .map(|(path, target)| (path.to_owned(), target.to_owned()))
-            .collect::<BTreeMap<_, _>>();
+        let root = node_root.as_deref().ok_or(AcquireError::Archive)?;
+        let expected = node_links(root);
         if links != expected {
             return Err(AcquireError::Archive);
         }
         for (path, target) in &links {
             let resolved = resolve_link(path, target)?;
-            if !resolved.starts_with(&format!("{NODE_ROOT}/"))
+            if !resolved.starts_with(&format!("{root}/"))
                 || !regular_paths.contains(&resolved)
                 || links.contains_key(&resolved)
             {
@@ -586,6 +612,8 @@ fn parse_tar(reader: &mut impl Read, policy: ArchivePolicy) -> Result<ParsedTar,
     }
     Ok(ParsedTar {
         captured,
+        regular_facts,
+        node_root,
         member_count: members,
         physical_header_count: headers,
         gnu_long_name_count: gnu_long_names,
@@ -594,6 +622,25 @@ fn parse_tar(reader: &mut impl Read, policy: ArchivePolicy) -> Result<ParsedTar,
         directory_count,
         symlink_count,
     })
+}
+
+fn node_links(root: &str) -> BTreeMap<String, String> {
+    [
+        (
+            format!("{root}/bin/corepack"),
+            "../lib/node_modules/corepack/dist/corepack.js".to_owned(),
+        ),
+        (
+            format!("{root}/bin/npm"),
+            "../lib/node_modules/npm/bin/npm-cli.js".to_owned(),
+        ),
+        (
+            format!("{root}/bin/npx"),
+            "../lib/node_modules/npm/bin/npx-cli.js".to_owned(),
+        ),
+    ]
+    .into_iter()
+    .collect()
 }
 
 fn validate_pax_following_header(
@@ -641,7 +688,7 @@ fn validate_gnu_long_name_header(
     Ok(())
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct RegularMemberFact {
     mode: u32,
     size: u64,
@@ -1082,7 +1129,7 @@ fn current_euid() -> u32 {
 mod tests {
     use std::io::Cursor;
 
-    use super::{ArchivePolicy, NODE_LINKS, parse_tar, require_pinned_node_identity};
+    use super::{ArchivePolicy, node_links, parse_tar, require_pinned_node_identity};
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum LinkMutation {
@@ -1129,13 +1176,24 @@ mod tests {
     }
 
     #[test]
-    fn node_identity_is_one_exact_tuple() {
-        let url = "https://nodejs.org/dist/v22.19.0/node-v22.19.0-linux-x64.tar.xz";
-        let digest = "c0649af18e6a24f6fe5535a3e86b341dd49a8e71117c8b68bde973ef834f16f2";
-        assert!(require_pinned_node_identity(url, 30_479_988, digest).is_ok());
-        assert!(require_pinned_node_identity(&format!("{url}/"), 30_479_988, digest).is_err());
-        assert!(require_pinned_node_identity(url, 30_479_987, digest).is_err());
-        assert!(require_pinned_node_identity(url, 30_479_988, &"0".repeat(64)).is_err());
+    fn node_identity_is_version_derived_and_origin_locked() {
+        let url = "https://nodejs.org/dist/v22.20.0/node-v22.20.0-linux-x64.tar.xz";
+        let digest = "00bbd05e306ea68b6e13e17360d0e2f680b493ef95f2fea1c4296ff7437530bc";
+        assert_eq!(
+            require_pinned_node_identity(url, 30_000_000, digest).unwrap(),
+            "node-v22.20.0-linux-x64"
+        );
+        assert!(
+            require_pinned_node_identity(
+                &url.replace("nodejs.org", "example.com"),
+                30_000_000,
+                digest
+            )
+            .is_err()
+        );
+        assert!(require_pinned_node_identity(&format!("{url}/"), 30_000_000, digest).is_err());
+        assert!(require_pinned_node_identity(url, 0, digest).is_err());
+        assert!(require_pinned_node_identity(url, 30_000_000, &"0".repeat(63)).is_err());
     }
 
     fn node_tar(mutation: LinkMutation) -> Vec<u8> {
@@ -1165,7 +1223,7 @@ mod tests {
                 entries.push(TarEntry::file(path, bytes));
             }
         }
-        for (index, (path, expected_target)) in NODE_LINKS.iter().enumerate() {
+        for (index, (path, expected_target)) in node_links(root).iter().enumerate() {
             if mutation == LinkMutation::MissingLink && index == 0 {
                 continue;
             }
