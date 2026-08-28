@@ -87,6 +87,55 @@ fn digest_addressed_objects_and_latest_are_exact_immutable_and_reusable() {
 }
 
 #[test]
+fn unsupported_unnamed_files_use_no_clobber_local_staging_fallback() {
+    let temp = TempTree::new("object-unnamed-fallback");
+    let transfer = temp.path("transfer");
+    let state = temp.path("state");
+    fixture_transfer(&transfer, 42, b"support-asset");
+    let verified = local::verify_transferred_fixture_signed_bundle(&transfer).unwrap();
+
+    local::configure_unnamed_open_error(Some(libc::EOPNOTSUPP));
+    let result = local::stage_local(&verified, &state);
+    local::configure_unnamed_open_error(None);
+
+    assert_eq!(result.unwrap(), PublishOutcome::Staged);
+    assert!(state.join("latest/catalog-v1.ref").is_file());
+    for entry in fs::read_dir(state.join("objects")).unwrap() {
+        let metadata = entry.unwrap().metadata().unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o7777, 0o400);
+        assert_eq!(std::os::unix::fs::MetadataExt::nlink(&metadata), 1);
+    }
+}
+
+#[test]
+fn named_latest_fallback_failure_before_recovery_binding_is_preserved() {
+    let temp = TempTree::new("named-latest-fallback-failure");
+    let transfer = temp.path("transfer");
+    let state = temp.path("state");
+    fixture_transfer(&transfer, 42, b"support-asset");
+    let verified = local::verify_transferred_fixture_signed_bundle(&transfer).unwrap();
+
+    local::configure_unnamed_open_error(Some(libc::EOPNOTSUPP));
+    let error = local::stage_local_with_fault(&verified, &state, FaultPoint::BeforeRecoveryRecord)
+        .unwrap_err();
+    local::configure_unnamed_open_error(None);
+
+    assert_eq!(error.outcome(), FailureOutcome::FailedPriorPreserved);
+    let temporary = state.join("latest/.catalog-v1.ref.tmp");
+    let metadata = fs::metadata(&temporary).unwrap();
+    assert_eq!(metadata.permissions().mode() & 0o7777, 0o400);
+    assert_eq!(std::os::unix::fs::MetadataExt::nlink(&metadata), 1);
+    let before = fs::read(&temporary).unwrap();
+    assert_eq!(
+        local::stage_local(&verified, &state).unwrap_err().outcome(),
+        FailureOutcome::RecoveryRequired
+    );
+    assert_eq!(fs::read(&temporary).unwrap(), before);
+    assert!(!state.join("latest/recovery-v1.json").exists());
+    assert!(!state.join("latest/catalog-v1.ref").exists());
+}
+
+#[test]
 fn previsibility_failures_preserve_prior_and_may_leave_only_safe_objects() {
     for fault in [
         FaultPoint::BeforeObjectWrite,

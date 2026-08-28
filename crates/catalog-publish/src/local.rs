@@ -2177,15 +2177,26 @@ fn install_recovery_record(
 struct LatestTemporary {
     file: fs::File,
     identity: FileIdentity,
+    visible: bool,
 }
 
 fn open_latest_temporary(state: &StateCapabilities) -> Result<LatestTemporary, PublishError> {
     if name_exists(&state.latest, LATEST_TEMP)? {
         return Err(recovery_required());
     }
-    let file = open_unnamed(&state.latest, 0o600)?;
+    let (file, visible) = match open_unnamed_result(&state.latest, 0o600)? {
+        UnnamedOpen::File(file) => (file, false),
+        UnnamedOpen::Unsupported => (
+            open_exclusive_state_file(&state.latest, LATEST_TEMP, 0o600)?,
+            true,
+        ),
+    };
     let identity = FileIdentity::from_metadata(&file.metadata().map_err(|_| rejected())?);
-    Ok(LatestTemporary { file, identity })
+    Ok(LatestTemporary {
+        file,
+        identity,
+        visible,
+    })
 }
 
 fn finalize_latest_temporary(
@@ -2203,7 +2214,7 @@ fn finalize_latest_temporary(
     file.sync_all().map_err(|_| rejected())?;
     let metadata = temporary.file.metadata().map_err(|_| rejected())?;
     if FileIdentity::from_metadata(&metadata) != temporary.identity
-        || !secure_file_allow_links(&metadata, 0)
+        || !secure_file_allow_links(&metadata, u64::from(temporary.visible))
         || metadata.len() != bytes.len() as u64
         || read_descriptor(&temporary.file, metadata.len())? != bytes
     {
@@ -2217,7 +2228,9 @@ fn link_latest_temporary(
     temporary: &LatestTemporary,
     bytes: &[u8],
 ) -> Result<(), PublishError> {
-    link_unnamed(&temporary.file, &state.latest, LATEST_TEMP)?;
+    if !temporary.visible {
+        link_unnamed(&temporary.file, &state.latest, LATEST_TEMP)?;
+    }
     state.latest.sync_all().map_err(|_| recovery_required())?;
     let rebound = open_regular_at(&state.latest, LATEST_TEMP)?;
     let metadata = rebound.metadata().map_err(|_| recovery_required())?;
@@ -2913,7 +2926,13 @@ fn publish_or_reuse_object(objects: &fs::File, source: &RetainedFile) -> Result<
         objects.sync_all().map_err(|_| rejected())?;
         return Ok(());
     }
-    let mut output = open_unnamed(objects, 0o600)?;
+    let (mut output, unnamed) = match open_unnamed_result(objects, 0o600)? {
+        UnnamedOpen::File(file) => (file, true),
+        UnnamedOpen::Unsupported => (
+            open_exclusive_state_file(objects, &source.sha256, 0o600)?,
+            false,
+        ),
+    };
     let before = source.file.metadata().map_err(|_| rejected())?;
     if !secure_file(&before)
         || before.len() != source.size
@@ -2952,13 +2971,16 @@ fn publish_or_reuse_object(objects: &fs::File, source: &RetainedFile) -> Result<
         .map_err(|_| rejected())?;
     output.sync_all().map_err(|_| rejected())?;
     let output_metadata = output.metadata().map_err(|_| rejected())?;
-    if !secure_file_allow_links(&output_metadata, 0)
+    let expected_links = if unnamed { 0 } else { 1 };
+    if !secure_file_allow_links(&output_metadata, expected_links)
         || output_metadata.len() != source.size
         || hash_descriptor(&output, source.size)? != source.sha256
     {
         return Err(rejected());
     }
-    link_unnamed(&output, objects, &source.sha256)?;
+    if unnamed {
+        link_unnamed(&output, objects, &source.sha256)?;
+    }
     objects.sync_all().map_err(|_| rejected())?;
     let rebound = open_regular_at(objects, &source.sha256)?;
     let metadata = rebound.metadata().map_err(|_| rejected())?;
@@ -3475,13 +3497,6 @@ fn write_unnamed_and_link(
 enum UnnamedOpen {
     File(fs::File),
     Unsupported,
-}
-
-fn open_unnamed(parent: &fs::File, mode: u32) -> Result<fs::File, PublishError> {
-    match open_unnamed_result(parent, mode)? {
-        UnnamedOpen::File(file) => Ok(file),
-        UnnamedOpen::Unsupported => Err(rejected()),
-    }
 }
 
 fn open_unnamed_result(parent: &fs::File, mode: u32) -> Result<UnnamedOpen, PublishError> {
