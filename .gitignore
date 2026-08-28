@@ -1,4 +1,5 @@
 .release-work/
+.worktrees/
 target/
 catalog-v1.json
 signed-release-bundle/
