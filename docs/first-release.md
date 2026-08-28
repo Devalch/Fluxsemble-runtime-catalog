@@ -1,6 +1,6 @@
 # First runtime catalog candidate
 
-This document records public reproducibility evidence for the unsigned sequence-1 candidate. It is not a production signature, qualification, publication, or remote-state receipt.
+This document records public reproducibility evidence and the approved compatibility qualification for the unsigned sequence-1 candidate. It is not a production signature, publication, or remote-state receipt.
 
 ## Approved intent
 
@@ -9,8 +9,8 @@ This document records public reproducibility evidence for the unsigned sequence-
 - Provider/target: `builtin:pi` / `linux_x86_64`.
 - Pi/Node: `0.83.0` / `22.19.0`.
 - Release title/notes: `Pi 0.83.0` / `Approved managed Pi release.`
-- Representative fixture freshness: `2026-08-26T00:00:00Z` through `2026-09-26T00:00:00Z`. These timestamps are intent-fixture inputs, not compiled semantic or qualification authority.
-- Canonical intent: 55,798 bytes, SHA-256 `9d9d6023b95f1908edd51f7d08c04c85dc64e35a8c08866e45a2b2bdcfedd047`.
+- Representative fixture freshness: `2026-08-26T00:00:00Z` through `2026-09-26T00:00:00Z`. These timestamps remain frozen Task 11 fixture inputs, not compatibility-reuse authority.
+- Canonical intent: 55,798 bytes, raw SHA-256 `9d9d6023b95f1908edd51f7d08c04c85dc64e35a8c08866e45a2b2bdcfedd047`.
 - Immutable semantic domain digest: `46116101d1ffa3b1184d14347f62478fbc3a2d609afc3ba0bf6b2505265e8441`.
 
 ## Authenticated public inputs
@@ -50,4 +50,16 @@ The exact candidate is also carried in a nonproduction fixture envelope whose ke
 - Support asset `pi-package-e02deae1cec07035807436c1864c88342e2f7d49050d03b858a3719f0c7aedbf.json` uses its immutable sequence tag URL and exact 3,560-byte digest-bound bytes.
 - Support asset `pi-shrinkwrap-9a17a6b9ba0a57b37773644f7945b1bf0bc10aa8923b87233fee6f75af1e1772.json` uses its immutable sequence tag URL and exact 61,540-byte digest-bound bytes.
 
-No production key, credential, SSH state, remote mutation, production envelope, tag, release, or publication was used or claimed.
+## Final build qualification
+
+The release owner approved the exact public qualification input and then the resulting domain-separated qualification digest. Qualification used Fluxsemble commit `6fade3f51846a112177d2c0d14206a504884c48c`, application SHA-256 `45a566b5b890ecd373c1b5e16c738a447a7fe34de32e02737859ce15da8eafdc`, daemon SHA-256 `f851c018703e46bc782cba34618a2e28d170ee3fbadd144bf33a9fe439e5fad9`, and compact profile SHA-256 `016f39ac96b41a78c5c394b67c5f2d058a59aa7e6891eed10322a061fc0921d5`.
+
+- Compatibility-input SHA-256: `308d4ea3990f7b856b3ac025b4be2cc3ecf96b246721bbe99354c23fd7390057`.
+- Qualification-record domain SHA-256: `27b5539f10ff306c56e1c0e38d284f6e47b52e38e567de4483099c7d6b645e2e`.
+- Qualification record: 1,145 bytes, raw SHA-256 `5eddfb0e5f6fa2e51eb98e5eba1d3584ccbb7a051233bc0cebb0c8f64899f5cb`.
+- Final source record: 56,421 bytes, raw SHA-256 `88f1621c85072f11ece99e061d8af4226bbde002ed627d703a2249bf9f39f3d2`, domain-separated SHA-256 `9fee452c4fae2f53027e935ad2d2d239c229c24e0b6c7a6da9b86d5a5ee76037`.
+- Final source freshness: `2026-08-28T11:00:00Z` through `2026-09-28T11:00:00Z`; only these excluded freshness fields differ from the frozen representative intent.
+- All required catalog conformance, managed installation, Node/Pi probe, Pi RPC readiness, activation, managed resolution, required-failure, and cancellation checks passed.
+- Residual scope: only the initial Pi/Linux tuple is qualified, and rollback publication is not qualified for sequence 1.
+
+No production key, credential, SSH state, remote mutation, production envelope, production tag, release, or publication was used or claimed.
