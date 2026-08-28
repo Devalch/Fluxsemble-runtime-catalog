@@ -2519,10 +2519,11 @@ fn bind_recovery_stage(
         return Err(output_rejected());
     }
     let directory_metadata = directory.metadata().map_err(|_| output_rejected())?;
+    let directory_names = enumerate_names(directory)?;
     let name = name.to_str().map_err(|_| output_rejected())?;
     if !valid_staging_name(name)
         || !secure_directory(&directory_metadata)
-        || directory_metadata.nlink() != 3
+        || !valid_staging_directory_shape(directory_metadata.nlink(), &directory_names)
     {
         return Err(output_rejected());
     }
@@ -2732,6 +2733,10 @@ fn rewrite_recovery_binding(
         return Err(output_rejected());
     }
     parent.sync_all().map_err(|_| output_rejected())
+}
+
+fn valid_staging_directory_shape(observed_nlink: u64, names: &BTreeSet<String>) -> bool {
+    directory_nlink_matches(observed_nlink, 3) && names == &BTreeSet::from(["payload".to_owned()])
 }
 
 fn valid_staging_name(name: &str) -> bool {
@@ -3272,7 +3277,7 @@ const fn verification_failed() -> SignError {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::BTreeMap,
+        collections::{BTreeMap, BTreeSet},
         fs,
         os::unix::fs::{DirBuilderExt, PermissionsExt},
         path::{Path, PathBuf},
@@ -3299,6 +3304,20 @@ mod tests {
             assert!(!directory_nlink_matches(0, conventional));
             assert!(!directory_nlink_matches(conventional + 1, conventional));
         }
+    }
+
+    #[test]
+    fn staging_binding_accepts_portable_links_only_with_exact_payload_child() {
+        let payload = BTreeSet::from(["payload".to_owned()]);
+        assert!(valid_staging_directory_shape(1, &payload));
+        assert!(valid_staging_directory_shape(3, &payload));
+        assert!(!valid_staging_directory_shape(2, &payload));
+        assert!(!valid_staging_directory_shape(4, &payload));
+        assert!(!valid_staging_directory_shape(1, &BTreeSet::new()));
+        assert!(!valid_staging_directory_shape(
+            1,
+            &BTreeSet::from(["payload".to_owned(), "unexpected".to_owned()]),
+        ));
     }
 
     #[test]

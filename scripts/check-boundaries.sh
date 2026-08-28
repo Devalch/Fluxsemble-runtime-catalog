@@ -1215,6 +1215,9 @@ def round2_errors(source):
             "fn recover_signed_output(",
             "settle_bound_empty_staging(parent_path)?;",
             "read_recovery_stage_binding(&parent)?",
+            "let directory_names = enumerate_names(directory)?;",
+            "!valid_staging_directory_shape(directory_metadata.nlink(), &directory_names)",
+            "names == &BTreeSet::from([\"payload\".to_owned()])",
             "FileIdentity::from_metadata(&metadata) != binding.identity",
             "metadata.permissions().mode() & 0o7777 != binding.mode",
             "!enumerate_names(&directory)",
@@ -1339,6 +1342,8 @@ mutations = [
     ("signing", "self.parent.sync_all().is_err()", "false", "first/final fsync uncertainty"),
     ("signing", "observed == 1 || observed == conventional", "observed == conventional", "portable signing directory links"),
     ("inner", "observed == 1 || observed == conventional", "observed == conventional", "portable isolation directory links"),
+    ("signing", "!valid_staging_directory_shape(directory_metadata.nlink(), &directory_names)", "false", "portable staging binding"),
+    ("signing", "names == &BTreeSet::from([\"payload\".to_owned()])", "true", "exact staging child set"),
     ("signing", "!directory_nlink_matches(container_metadata.nlink(), 2)", "false", "exact empty cleanup identity"),
     ("signing", "if !secure_directory(&container_metadata)\n            || !directory_nlink_matches(container_metadata.nlink(), 2)\n            || !enumerate_names(&self.container)", "if !secure_directory(&container_metadata)\n            || !directory_nlink_matches(container_metadata.nlink(), 2)\n            || !removed_container_enumeration()", "nonempty cleanup rejection"),
     ("signing", """let Some(mut file) = open_recovery_binding(parent, true)? else {
