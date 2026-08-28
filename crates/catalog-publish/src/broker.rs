@@ -2102,11 +2102,10 @@ fn process_containment_filter() -> Vec<libc::sock_filter> {
     const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
     const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
     const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
-    // Offline compatibility evidence for the pinned /usr/bin/gh is Fedora gh 2.97.0-2.fc44,
-    // SHA-256 16fdbf30d6f97bc5b0fb94745e00fa06ae68beb6c6653d7f584b32602800397d,
-    // built with Go 1.26.5. go1.26.5/src/runtime/os_linux.go uses this base thread set;
-    // runtime/sys_linux_amd64.s adds CLONE_SETTLS for normal newosproc, while newosproc0 can use
-    // the bare set. TID-address metadata changes bookkeeping only and cannot create a process.
+    // Compatibility is pinned to Fedora gh 2.97.0-2.fc44 at SHA-256
+    // 16fdbf30d6f97bc5b0fb94745e00fa06ae68beb6c6653d7f584b32602800397d. Its dynamically linked
+    // libc thread path falls back from unavailable clone3 to classic clone with this base set plus
+    // TLS/TID bookkeeping flags. Those optional flags cannot create a process.
     const GO_RUNTIME_THREAD_CLONE_REQUIRED: u32 = (libc::CLONE_VM
         | libc::CLONE_FS
         | libc::CLONE_FILES
@@ -2134,6 +2133,10 @@ fn process_containment_filter() -> Vec<libc::sock_filter> {
         statement(BPF_LD_W_ABS, 0),
         jump(BPF_JMP_JGE_K, X32_SYSCALL_BIT, 0, 1),
         statement(BPF_RET_K, SECCOMP_RET_KILL_PROCESS),
+        // clone3 arguments are indirect and cannot be safely inspected by classic BPF. Report the
+        // syscall as unavailable so libc can fall back to the bounded classic-clone branch below.
+        jump(BPF_JMP_JEQ_K, libc::SYS_clone3 as u32, 0, 1),
+        statement(BPF_RET_K, SECCOMP_RET_ERRNO | libc::ENOSYS as u32),
         // clone is admitted only when every thread-sharing bit is present and no bit outside the
         // bounded runtime metadata allowlist is present. The high flag word must also be zero.
         jump(BPF_JMP_JEQ_K, libc::SYS_clone as u32, 0, 10),
@@ -2152,7 +2155,6 @@ fn process_containment_filter() -> Vec<libc::sock_filter> {
     let denied = [
         libc::SYS_fork,
         libc::SYS_vfork,
-        libc::SYS_clone3,
         libc::SYS_setsid,
         libc::SYS_setpgid,
         libc::SYS_unshare,

@@ -87,6 +87,7 @@ const FAKE_C: &str = r#"
 #include <fcntl.h>
 #include <limits.h>
 #include <linux/sched.h>
+#include <pthread.h>
 #include <sched.h>
 #include <signal.h>
 #include <stdio.h>
@@ -152,6 +153,7 @@ static int syscall_errno(long result) {
 }
 
 static volatile int thread_clone_ran;
+static volatile int pthread_ran;
 static unsigned char thread_stack[64 * 1024];
 static unsigned char probe_thread_stacks[32][64 * 1024];
 
@@ -159,6 +161,12 @@ static int thread_clone_main(void *unused) {
     (void)unused;
     thread_clone_ran = 1;
     return 0;
+}
+
+static void *pthread_main(void *unused) {
+    (void)unused;
+    pthread_ran = 1;
+    return NULL;
 }
 
 static int raw_clone_errno(unsigned long flags) {
@@ -208,6 +216,10 @@ static void append_containment_probe(void) {
     errno = 0; long clone_result = syscall(SYS_clone, SIGCHLD, 0, 0, 0, 0); int clone_errno = syscall_errno(clone_result);
     if (clone_result == 0) _exit(83);
     errno = 0; int clone3_errno = syscall_errno(syscall(SYS_clone3, NULL, 0));
+    pthread_t pthread;
+    pthread_ran = 0;
+    int pthread_create_result = pthread_create(&pthread, NULL, pthread_main, NULL);
+    int pthread_join_result = pthread_create_result == 0 ? pthread_join(pthread, NULL) : -1;
     errno = 0; int unshare_errno = syscall_errno(syscall(SYS_unshare, 0));
     errno = 0; int setns_errno = syscall_errno(syscall(SYS_setns, -1, 0));
     errno = 0; int mount_errno = syscall_errno(syscall(SYS_mount, NULL, NULL, NULL, 0, NULL));
@@ -285,9 +297,10 @@ static void append_containment_probe(void) {
 
     fputs("PROBE_BEGIN\n", snapshot);
     fprintf(snapshot,
-        "setsid=%d\nsetpgid=%d\nfork=%d\nvfork=%d\nprocess_clone=%d\nclone3=%d\nunshare=%d\nsetns=%d\nmount=%d\nthread_clone=%d\nthread_ran=%d\n",
+        "setsid=%d\nsetpgid=%d\nfork=%d\nvfork=%d\nprocess_clone=%d\nclone3=%d\npthread_create=%d\npthread_join=%d\npthread_ran=%d\nunshare=%d\nsetns=%d\nmount=%d\nthread_clone=%d\nthread_ran=%d\n",
         setsid_errno, setpgid_errno, fork_errno, vfork_errno, clone_errno, clone3_errno,
-        unshare_errno, setns_errno, mount_errno, thread_errno, thread_clone_ran);
+        pthread_create_result, pthread_join_result, pthread_ran, unshare_errno, setns_errno,
+        mount_errno, thread_errno, thread_clone_ran);
     fprintf(snapshot,
         "settls_clone=%d\ntid_parent=%d\ntid_child=%d\ntid_clear=%d\ntid_all=%d\n",
         settls_errno, tid_parent_errno, tid_child_errno, tid_clear_errno, tid_all_errno);
@@ -461,7 +474,7 @@ fn compiled_fake() -> &'static Path {
             let executable = root.join("fake-gh");
             fs::write(&source, FAKE_C).unwrap();
             let output = Command::new("cc")
-                .args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"])
+                .args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-pthread"])
                 .arg(&source)
                 .arg("-o")
                 .arg(&executable)
@@ -1136,7 +1149,6 @@ fn seccomp_denies_process_and_session_escape_but_allows_runtime_thread_clone() {
         "fork",
         "vfork",
         "process_clone",
-        "clone3",
         "unshare",
         "setns",
         "mount",
@@ -1146,6 +1158,10 @@ fn seccomp_denies_process_and_session_escape_but_allows_runtime_thread_clone() {
             "missing EPERM containment outcome for {syscall}: {outcomes}"
         );
     }
+    assert!(outcomes.lines().any(|line| line == "clone3=38"));
+    assert!(outcomes.lines().any(|line| line == "pthread_create=0"));
+    assert!(outcomes.lines().any(|line| line == "pthread_join=0"));
+    assert!(outcomes.lines().any(|line| line == "pthread_ran=1"));
     assert!(outcomes.lines().any(|line| line == "thread_clone=0"));
     assert!(outcomes.lines().any(|line| line == "thread_ran=1"));
     let errno = |name: &str| {
