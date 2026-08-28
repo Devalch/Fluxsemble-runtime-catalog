@@ -1,0 +1,5 @@
+repository = "Devalch/Fluxsemble-runtime-catalog"
+fluxsemble_requirement = "=0.1.0"
+target = "linux_x86_64"
+state_root = ".release-work"
+default_node_channel = "22"

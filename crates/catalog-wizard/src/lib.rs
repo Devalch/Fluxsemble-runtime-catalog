@@ -1,4 +1,6 @@
 pub mod cli;
+pub mod config;
+pub mod state;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WizardError {
