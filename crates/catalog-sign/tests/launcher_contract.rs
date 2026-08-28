@@ -199,6 +199,59 @@ fn real_launcher_authenticates_static_signer_and_transfer_before_isolated_failur
 }
 
 #[test]
+fn launcher_owner_ancestors_accept_only_0700_or_0755() {
+    let root = TempRoot::new();
+    let static_source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/x86_64-unknown-linux-musl/release/catalog-sign")
+        .canonicalize()
+        .expect("build the authorized musl signer before this integration test");
+
+    for (mode, admitted) in [
+        (0o700, true),
+        (0o755, true),
+        (0o750, false),
+        (0o751, false),
+        (0o775, false),
+    ] {
+        let ancestor = root.path.join(format!("owner-ancestor-{mode:o}"));
+        fs::DirBuilder::new().mode(mode).create(&ancestor).unwrap();
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(mode)).unwrap();
+        let ceremony = ancestor.join("ceremony");
+        fs::DirBuilder::new().mode(0o700).create(&ceremony).unwrap();
+        let input = ceremony.join("input");
+        write_transfer(&input);
+        let signer = ceremony.join("catalog-sign-static");
+        fs::copy(&static_source, &signer).unwrap();
+        fs::set_permissions(&signer, fs::Permissions::from_mode(0o500)).unwrap();
+        let config = ceremony.join("launcher-config-v1.json");
+        write_config(&config, &signer, &sha256(&fs::read(&signer).unwrap()));
+        let output = ceremony.join("output");
+
+        let result = Command::new(env!("CARGO_BIN_EXE_catalog-sign-launcher"))
+            .args([
+                "isolation-probe",
+                "--config",
+                config.to_str().unwrap(),
+                "--input",
+                input.to_str().unwrap(),
+                "--output",
+                output.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+
+        assert_eq!(
+            result.status.success(),
+            admitted,
+            "owner ancestor mode {mode:o}: stdout={} stderr={}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr),
+        );
+        assert_eq!(output.exists(), admitted);
+    }
+}
+
+#[test]
 fn fixture_authority_signs_through_real_launcher_and_reverse_transfer() {
     let root = TempRoot::new();
     let input = root.path.join("input");

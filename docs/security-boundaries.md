@@ -34,7 +34,7 @@ catalog-sign-launcher isolation-probe --config CONFIG --input BUNDLE --output FR
 {"bwrap_path":"/usr/bin/bwrap","bwrap_sha256":"64 lowercase hex","schema_version":1,"signer_path":"/absolute/static/catalog-sign","signer_sha256":"64 lowercase hex"}
 ```
 
-Paths are canonical absolute paths opened component-by-component without links. `/usr/bin/bwrap` must be root-owned, one-link mode `0755`, executable, bounded, and match its full configured SHA-256. The signer must be current-owner, one-link mode `0500`, bounded, match its full configured SHA-256, and parse as x86_64 ELF64 with load segments and no `PT_INTERP` or `PT_DYNAMIC`. Production ceremony builds it outside isolation with:
+Paths are canonical absolute paths opened component-by-component without links. Root-owned ancestors retain their fixed safe-mode allowlist; same-EUID ancestors admit only exact mode `0700` or non-group/non-world-writable `0755`, and reject `0750`, `0751`, writable, and every other mode. Same-EUID actors with access to these producer-owned paths are trusted producer principals. `/usr/bin/bwrap` must be root-owned, one-link mode `0755`, executable, bounded, and match its full configured SHA-256. The signer must be current-owner, one-link mode `0500`, bounded, match its full configured SHA-256, and parse as x86_64 ELF64 with load segments and no `PT_INTERP` or `PT_DYNAMIC`. Production ceremony builds it outside isolation with:
 
 ```bash
 rustup target add x86_64-unknown-linux-musl # public one-time prerequisite when absent

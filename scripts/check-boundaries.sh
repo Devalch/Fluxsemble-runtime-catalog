@@ -1204,6 +1204,7 @@ def round2_errors(source):
             "authorized_recovery_mode_combination(",
             "valid_bound_staging(&value[\"staging\"])",
             '"recover-sign",\n                "--input"',
+            "metadata.uid() == current_euid() && matches!(mode, 0o700 | 0o755)",
         ],
         "signing": [
             "PublicationDurability::Uncertain",
@@ -1268,6 +1269,7 @@ def round2_errors(source):
             'recovered_value["isolation_attestation"]["original_operation_mode"]',
             "completed recovered-manifest retry failed",
             "recovery admitted a different launcher config/signer identity",
+            "launcher_owner_ancestors_accept_only_0700_or_0755",
         ],
     }
     for name, tokens in required.items():
@@ -1338,6 +1340,7 @@ mutations = [
     ("launcher", "open_existing_output(&request.output)?", "create_fresh_output(&request.output)?", "closed recovery output"),
     ("launcher", "write_recovery_binding(", "removed_binding_write(", "persisted recovery binding"),
     ("launcher", "verify_recovery_binding(", "removed_binding_verify(", "recovery config/signer binding"),
+    ("launcher", "metadata.uid() == current_euid() && matches!(mode, 0o700 | 0o755)", "metadata.uid() == current_euid() && mode == 0o700", "owner ancestor exact modes"),
     ("signing", "self.published = true;", "", "payload visibility state"),
     ("signing", "self.parent.sync_all().is_err()", "false", "first/final fsync uncertainty"),
     ("signing", "observed == 1 || observed == conventional", "observed == conventional", "portable signing directory links"),
