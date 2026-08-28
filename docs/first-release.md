@@ -57,8 +57,8 @@ The release owner approved the exact public qualification input and then the res
 - Compatibility-input SHA-256: `308d4ea3990f7b856b3ac025b4be2cc3ecf96b246721bbe99354c23fd7390057`.
 - Qualification-record domain SHA-256: `27b5539f10ff306c56e1c0e38d284f6e47b52e38e567de4483099c7d6b645e2e`.
 - Qualification record: 1,145 bytes, raw SHA-256 `5eddfb0e5f6fa2e51eb98e5eba1d3584ccbb7a051233bc0cebb0c8f64899f5cb`.
-- Final source record: 56,421 bytes, raw SHA-256 `88f1621c85072f11ece99e061d8af4226bbde002ed627d703a2249bf9f39f3d2`, domain-separated SHA-256 `9fee452c4fae2f53027e935ad2d2d239c229c24e0b6c7a6da9b86d5a5ee76037`.
-- Final source freshness: `2026-08-28T11:00:00Z` through `2026-09-28T11:00:00Z`; only these excluded freshness fields differ from the frozen representative intent.
+- Final source record: 56,421 bytes, raw SHA-256 `fd6912bb89356d5cdc9e3e8ec28919ee8c9e58ea05d7cec5f3a8fd7d1f380bc6`, domain-separated SHA-256 `2cf24067658991ee326ea5fe334568da09a8d3fdf8b5441ea70756ef2b774fb0`.
+- Final source freshness: `2026-08-28T11:10:00Z` through `2026-09-28T11:10:00Z`; it begins after exact qualification-digest approval, and only these excluded freshness fields differ from the frozen representative intent.
 - All required catalog conformance, managed installation, Node/Pi probe, Pi RPC readiness, activation, managed resolution, required-failure, and cancellation checks passed.
 - Residual scope: only the initial Pi/Linux tuple is qualified, and rollback publication is not qualified for sequence 1.
 
