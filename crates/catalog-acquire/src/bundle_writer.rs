@@ -326,7 +326,9 @@ impl OutputRoot {
 
         let (container_name, container) = create_staging_container(&parent)?;
         let container_metadata = container.metadata().map_err(|_| AcquireError::Bundle)?;
-        if !secure_directory(&container_metadata) || container_metadata.nlink() != 2 {
+        if !secure_directory(&container_metadata)
+            || !directory_nlink_matches(container_metadata.nlink(), 2)
+        {
             return Err(AcquireError::Bundle);
         }
         let payload_name = CString::new("payload").expect("fixed output payload name");
@@ -337,7 +339,9 @@ impl OutputRoot {
         let payload =
             open_directory_at(&container, &payload_name).map_err(|_| AcquireError::Bundle)?;
         let payload_metadata = payload.metadata().map_err(|_| AcquireError::Bundle)?;
-        if !secure_directory(&payload_metadata) || payload_metadata.nlink() != 2 {
+        if !secure_directory(&payload_metadata)
+            || !directory_nlink_matches(payload_metadata.nlink(), 2)
+        {
             return Err(AcquireError::Bundle);
         }
         container.sync_all().map_err(|_| AcquireError::Bundle)?;
@@ -369,7 +373,7 @@ impl OutputRoot {
         let directory =
             open_directory_at(&self.payload, &name_c).map_err(|_| AcquireError::Bundle)?;
         let metadata = directory.metadata().map_err(|_| AcquireError::Bundle)?;
-        if !secure_directory(&metadata) || metadata.nlink() != 2 {
+        if !secure_directory(&metadata) || !directory_nlink_matches(metadata.nlink(), 2) {
             return Err(AcquireError::Bundle);
         }
         self.payload.sync_all().map_err(|_| AcquireError::Bundle)?;
@@ -1280,9 +1284,9 @@ fn verify_named_directory(
         || !secure_directory(&before)
         || !secure_directory(&named_metadata)
         || !secure_directory(&after)
-        || before.nlink() != expected_nlink
-        || named_metadata.nlink() != expected_nlink
-        || after.nlink() != expected_nlink
+        || !directory_nlink_matches(before.nlink(), expected_nlink)
+        || !directory_nlink_matches(named_metadata.nlink(), expected_nlink)
+        || !directory_nlink_matches(after.nlink(), expected_nlink)
         || before.len() != named_metadata.len()
         || before.len() != after.len()
     {
@@ -1509,7 +1513,7 @@ fn enumerate_tree(root: &fs::File) -> Result<EnumeratedTransferTree, AcquireErro
             let name_c = CString::new(name.as_str()).map_err(|_| AcquireError::Bundle)?;
             let directory = open_directory_at(root, &name_c).map_err(|_| AcquireError::Bundle)?;
             let metadata = directory.metadata().map_err(|_| AcquireError::Bundle)?;
-            if !secure_directory(&metadata) || metadata.nlink() != 2 {
+            if !secure_directory(&metadata) || !directory_nlink_matches(metadata.nlink(), 2) {
                 return Err(AcquireError::Bundle);
             }
             let names = enumerate_names(&directory)?;
@@ -1607,6 +1611,10 @@ fn entry(path: &str, size: u64, digest: &str) -> TransferEntry {
     }
 }
 
+fn directory_nlink_matches(observed: u64, conventional: u64) -> bool {
+    observed == 1 || observed == conventional
+}
+
 fn secure_directory(metadata: &fs::Metadata) -> bool {
     metadata.is_dir()
         && !metadata.file_type().is_symlink()
@@ -1689,6 +1697,19 @@ mod tests {
         VerifiedBundleWriteRequest, export_transfer_bundle_after_preflight_for_test,
         write_verified_bundle, write_verified_bundle_after_preflight_for_test,
     };
+
+    #[test]
+    fn bundle_directory_link_count_accepts_portable_and_conventional_values_only() {
+        for conventional in [2, 3, 5] {
+            assert!(super::directory_nlink_matches(1, conventional));
+            assert!(super::directory_nlink_matches(conventional, conventional));
+            assert!(!super::directory_nlink_matches(0, conventional));
+            assert!(!super::directory_nlink_matches(
+                conventional + 1,
+                conventional
+            ));
+        }
+    }
 
     #[test]
     fn extracted_support_object_is_exact_read_only_and_descriptor_retained() {

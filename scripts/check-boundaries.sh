@@ -3096,6 +3096,9 @@ def task11_errors(source, names, regular_identities):
     for token in ["bytes.len() as u64 != size || sha256_bytes(bytes) != sha256", "libc::O_CREAT | libc::O_EXCL", "0o400", "Self::verified_file(reopened, source_url, size, sha256)"]:
         if token not in writer:
             errors.append(f"extracted support descriptor policy missing: {token}")
+    for token in ["fn directory_nlink_matches(observed: u64, conventional: u64) -> bool", "observed == 1 || observed == conventional", "!directory_nlink_matches(container_metadata.nlink(), 2)", "!directory_nlink_matches(payload_metadata.nlink(), 2)", "!directory_nlink_matches(metadata.nlink(), 2)", "!directory_nlink_matches(before.nlink(), expected_nlink)"]:
+        if token not in writer:
+            errors.append(f"portable acquisition directory policy missing: {token}")
     for token in ["verify_fixture_signed_catalog(ENVELOPE)", "55_797", "7dba62c8b44883cbd7b3615fd9fe3b1a08a3aa2c75c7729704c14804d1cc2a2b"]:
         if token not in vector_test:
             errors.append(f"fixture/production vector evidence missing: {token}")
@@ -3158,6 +3161,7 @@ for name, old, new in [
     ("acquire", b"InputSourceKind::ReleaseIntent => SupportAcquisition::ExtractFromVerifiedRoot", b"InputSourceKind::ReleaseIntent => SupportAcquisition::FetchPublishedObjects"),
     ("acquire", b"InputSourceKind::CatalogSource => SupportAcquisition::ExtractFromVerifiedRoot", b"InputSourceKind::CatalogSource => SupportAcquisition::FetchPublishedObjects"),
     ("writer", b"bytes.len() as u64 != size || sha256_bytes(bytes) != sha256", b"false"),
+    ("writer", b"observed == 1 || observed == conventional", b"observed == conventional"),
     ("vector_test", b"assert!(verify_signed_catalog(ENVELOPE).is_err())", b"assert!(true)"),
     ("parity", b'if pointer_value(mutated, case["pointer"]) != case["after"]:', b"if False:"),
     ("parity", b"if json_differences(candidate, mutated) != expected_difference:", b"if False:"),
