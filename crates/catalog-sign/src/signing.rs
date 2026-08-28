@@ -392,7 +392,7 @@ pub fn verify_transferred_bundle(path: &Path) -> Result<VerifiedTransferredBundl
     }
     let root = open_absolute_directory(path)?;
     let root_metadata = root.metadata().map_err(|_| bundle_rejected())?;
-    if !secure_directory(&root_metadata) || root_metadata.nlink() != 4 {
+    if !secure_directory(&root_metadata) || !directory_nlink_matches(root_metadata.nlink(), 4) {
         return Err(bundle_rejected());
     }
     let root_identity = FileIdentity::from_metadata(&root_metadata);
@@ -412,7 +412,7 @@ pub fn verify_transferred_bundle(path: &Path) -> Result<VerifiedTransferredBundl
     for name in ["objects", "records"] {
         let directory = open_directory_at(&root, name)?;
         let metadata = directory.metadata().map_err(|_| bundle_rejected())?;
-        if !secure_directory(&metadata) || metadata.nlink() != 2 {
+        if !secure_directory(&metadata) || !directory_nlink_matches(metadata.nlink(), 2) {
             return Err(bundle_rejected());
         }
         directories.insert(
@@ -1118,7 +1118,7 @@ fn reopen_signed_output(
 ) -> Result<BTreeMap<String, Vec<u8>>, SignError> {
     let root = open_absolute_directory(path).map_err(|_| verification_failed())?;
     let metadata = root.metadata().map_err(|_| verification_failed())?;
-    if !secure_directory(&metadata) || metadata.nlink() != 2 {
+    if !secure_directory(&metadata) || !directory_nlink_matches(metadata.nlink(), 2) {
         return Err(verification_failed());
     }
     let names = enumerate_names(&root).map_err(|_| verification_failed())?;
@@ -1150,7 +1150,7 @@ fn recover_signed_output(
     let parent_path = path.parent().ok_or_else(verification_failed)?;
     let root = open_absolute_directory(path).map_err(|_| verification_failed())?;
     let metadata = root.metadata().map_err(|_| verification_failed())?;
-    if !secure_directory(&metadata) || metadata.nlink() != 2 {
+    if !secure_directory(&metadata) || !directory_nlink_matches(metadata.nlink(), 2) {
         return Err(verification_failed());
     }
     let names = enumerate_names(&root).map_err(|_| verification_failed())?;
@@ -1268,7 +1268,7 @@ fn settle_bound_empty_staging(parent_path: &Path) -> Result<(), SignError> {
         || metadata.uid() != binding.uid
         || metadata.permissions().mode() & 0o7777 != binding.mode
         || !secure_directory(&metadata)
-        || metadata.nlink() != 2
+        || !directory_nlink_matches(metadata.nlink(), 2)
         || !enumerate_names(&directory)
             .map_err(|_| verification_failed())?
             .is_empty()
@@ -1960,7 +1960,7 @@ fn flatten_tree(
 fn verify_root_binding(bundle: &VerifiedTransferredBundle) -> Result<(), SignError> {
     let metadata = bundle.root.metadata().map_err(|_| bundle_rejected())?;
     if !secure_directory(&metadata)
-        || metadata.nlink() != 4
+        || !directory_nlink_matches(metadata.nlink(), 4)
         || FileIdentity::from_metadata(&metadata) != bundle.root_identity
         || enumerate_names(&bundle.root)? != bundle.root_names
     {
@@ -1970,7 +1970,7 @@ fn verify_root_binding(bundle: &VerifiedTransferredBundle) -> Result<(), SignErr
         let rebound = open_directory_at(&bundle.root, name)?;
         let metadata = rebound.metadata().map_err(|_| bundle_rejected())?;
         if !secure_directory(&metadata)
-            || metadata.nlink() != 2
+            || !directory_nlink_matches(metadata.nlink(), 2)
             || FileIdentity::from_metadata(&metadata) != directory.identity
             || enumerate_names(&directory.file)? != directory.names
         {
@@ -2313,7 +2313,7 @@ impl StagedOutput {
         }
         let payload = open_directory_at(&container, "payload").map_err(|_| output_rejected())?;
         let metadata = payload.metadata().map_err(|_| output_rejected())?;
-        if !secure_directory(&metadata) || metadata.nlink() != 2 {
+        if !secure_directory(&metadata) || !directory_nlink_matches(metadata.nlink(), 2) {
             return Err(output_rejected());
         }
         container.sync_all().map_err(|_| output_rejected())?;
@@ -2458,7 +2458,7 @@ impl StagedOutput {
             .metadata()
             .map_err(|_| SignError::OutputDurabilityUncertain)?;
         if !secure_directory(&container_metadata)
-            || container_metadata.nlink() != 2
+            || !directory_nlink_matches(container_metadata.nlink(), 2)
             || !enumerate_names(&self.container)
                 .map_err(|_| SignError::OutputDurabilityUncertain)?
                 .is_empty()
@@ -2766,7 +2766,7 @@ fn create_staging_container(parent: &fs::File) -> Result<(CString, fs::File), Si
                 open_directory_at(parent, name.to_str().map_err(|_| output_rejected())?)
                     .map_err(|_| output_rejected())?;
             let metadata = directory.metadata().map_err(|_| output_rejected())?;
-            if !secure_directory(&metadata) || metadata.nlink() != 2 {
+            if !secure_directory(&metadata) || !directory_nlink_matches(metadata.nlink(), 2) {
                 return Err(output_rejected());
             }
             parent.sync_all().map_err(|_| output_rejected())?;
@@ -2798,6 +2798,10 @@ fn name_exists_at(parent: &fs::File, name: &CString) -> Result<bool, SignError> 
         return Ok(false);
     }
     Err(output_rejected())
+}
+
+fn directory_nlink_matches(observed: u64, conventional: u64) -> bool {
+    observed == 1 || observed == conventional
 }
 
 fn secure_directory(metadata: &fs::Metadata) -> bool {
@@ -3286,6 +3290,16 @@ mod tests {
 
     const SRI: &str = "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
     const MAX_AUTHENTIC_CORPUS_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
+
+    #[test]
+    fn signing_directory_link_count_accepts_portable_and_conventional_values_only() {
+        for conventional in [2, 3, 4, 6] {
+            assert!(directory_nlink_matches(1, conventional));
+            assert!(directory_nlink_matches(conventional, conventional));
+            assert!(!directory_nlink_matches(0, conventional));
+            assert!(!directory_nlink_matches(conventional + 1, conventional));
+        }
+    }
 
     #[test]
     fn committed_approved_evidence_derives_compiled_admission_digests() {

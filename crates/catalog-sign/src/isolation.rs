@@ -1133,6 +1133,10 @@ fn valid_staging_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
+fn directory_nlink_matches(observed: u64, conventional: u64) -> bool {
+    observed == 1 || observed == conventional
+}
+
 fn collect_output_paths(
     root: &Path,
     relative: &Path,
@@ -1149,7 +1153,7 @@ fn collect_output_paths(
     }
     if !metadata.is_dir()
         || metadata.permissions().mode() & 0o7777 != 0o700
-        || metadata.nlink() != 2
+        || !directory_nlink_matches(metadata.nlink(), 2)
     {
         return Err(rejected());
     }
@@ -1361,6 +1365,16 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn isolation_directory_link_count_accepts_portable_and_conventional_values_only() {
+        for conventional in [2, 3, 4] {
+            assert!(directory_nlink_matches(1, conventional));
+            assert!(directory_nlink_matches(conventional, conventional));
+            assert!(!directory_nlink_matches(0, conventional));
+            assert!(!directory_nlink_matches(conventional + 1, conventional));
+        }
+    }
 
     #[test]
     fn recovery_mode_combinations_are_exact() {

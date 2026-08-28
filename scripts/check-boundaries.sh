@@ -1208,7 +1208,9 @@ def round2_errors(source):
         "signing": [
             "PublicationDurability::Uncertain",
             "self.published = true;",
-            "container_metadata.nlink() != 2",
+            "fn directory_nlink_matches(observed: u64, conventional: u64) -> bool",
+            "observed == 1 || observed == conventional",
+            "!directory_nlink_matches(container_metadata.nlink(), 2)",
             "SignError::OutputDurabilityUncertain",
             "fn recover_signed_output(",
             "settle_bound_empty_staging(parent_path)?;",
@@ -1236,6 +1238,9 @@ def round2_errors(source):
             "libc::AT_EMPTY_PATH",
             "Some(libc::EEXIST)",
             "verify_exact_public_file(&existing, bytes, 1)",
+            "fn directory_nlink_matches(observed: u64, conventional: u64) -> bool",
+            "observed == 1 || observed == conventional",
+            "!directory_nlink_matches(metadata.nlink(), 2)",
             "ReverseManifestCheckpoint::Link",
             "ReverseManifestCheckpoint::ParentFsync",
             "ReverseManifestCheckpoint::Reopen",
@@ -1332,8 +1337,10 @@ mutations = [
     ("launcher", "verify_recovery_binding(", "removed_binding_verify(", "recovery config/signer binding"),
     ("signing", "self.published = true;", "", "payload visibility state"),
     ("signing", "self.parent.sync_all().is_err()", "false", "first/final fsync uncertainty"),
-    ("signing", "container_metadata.nlink() != 2", "false", "exact empty cleanup identity"),
-    ("signing", "if !secure_directory(&container_metadata)\n            || container_metadata.nlink() != 2\n            || !enumerate_names(&self.container)", "if !secure_directory(&container_metadata)\n            || container_metadata.nlink() != 2\n            || !removed_container_enumeration()", "nonempty cleanup rejection"),
+    ("signing", "observed == 1 || observed == conventional", "observed == conventional", "portable signing directory links"),
+    ("inner", "observed == 1 || observed == conventional", "observed == conventional", "portable isolation directory links"),
+    ("signing", "!directory_nlink_matches(container_metadata.nlink(), 2)", "false", "exact empty cleanup identity"),
+    ("signing", "if !secure_directory(&container_metadata)\n            || !directory_nlink_matches(container_metadata.nlink(), 2)\n            || !enumerate_names(&self.container)", "if !secure_directory(&container_metadata)\n            || !directory_nlink_matches(container_metadata.nlink(), 2)\n            || !removed_container_enumeration()", "nonempty cleanup rejection"),
     ("signing", """let Some(mut file) = open_recovery_binding(parent, true)? else {
         return Err(output_rejected());
     };""", """let Some(mut file) = open_recovery_binding(parent, true)? else {
