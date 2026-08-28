@@ -7,6 +7,7 @@ members = [
   "crates/catalog-latest-transport",
   "crates/catalog-sign",
   "crates/catalog-publish",
+  "crates/catalog-wizard",
 ]
 
 [workspace.package]
