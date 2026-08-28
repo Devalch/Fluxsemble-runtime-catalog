@@ -3087,9 +3087,12 @@ def task11_errors(source, names, regular_identities):
     acquire = source["acquire"].decode()
     writer = source["writer"].decode()
     vector_test = source["vector_test"].decode()
-    for token in ["InputSourceKind::ReleaseIntent => SupportAcquisition::ExtractFromVerifiedRoot", "InputSourceKind::CatalogSource => SupportAcquisition::FetchPublishedObjects", "PublicBundleObject::from_extracted_bytes(", "fetch_immutable("]:
+    for token in ["InputSourceKind::ReleaseIntent => SupportAcquisition::ExtractFromVerifiedRoot", "InputSourceKind::CatalogSource => SupportAcquisition::ExtractFromVerifiedRoot", "PublicBundleObject::from_extracted_bytes("]:
         if token not in acquire:
             errors.append(f"bootstrap support policy missing: {token}")
+    for token in ["FetchPublishedObjects", "fetch_immutable("]:
+        if token in acquire:
+            errors.append(f"circular prepublication support fetch remains: {token}")
     for token in ["bytes.len() as u64 != size || sha256_bytes(bytes) != sha256", "libc::O_CREAT | libc::O_EXCL", "0o400", "Self::verified_file(reopened, source_url, size, sha256)"]:
         if token not in writer:
             errors.append(f"extracted support descriptor policy missing: {token}")
@@ -3153,6 +3156,7 @@ for name, old, new in [
     ("docs", b"2cd34eaba1a2e609719a69ddf1a628f7cadba9e76512132750e1559284ba18f8", b"0" * 64),
     ("ignore", b".release-work/", b"removed-release-work/"),
     ("acquire", b"InputSourceKind::ReleaseIntent => SupportAcquisition::ExtractFromVerifiedRoot", b"InputSourceKind::ReleaseIntent => SupportAcquisition::FetchPublishedObjects"),
+    ("acquire", b"InputSourceKind::CatalogSource => SupportAcquisition::ExtractFromVerifiedRoot", b"InputSourceKind::CatalogSource => SupportAcquisition::FetchPublishedObjects"),
     ("writer", b"bytes.len() as u64 != size || sha256_bytes(bytes) != sha256", b"false"),
     ("vector_test", b"assert!(verify_signed_catalog(ENVELOPE).is_err())", b"assert!(true)"),
     ("parity", b'if pointer_value(mutated, case["pointer"]) != case["after"]:', b"if False:"),
