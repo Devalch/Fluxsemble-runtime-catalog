@@ -1,6 +1,6 @@
-# First runtime catalog candidate
+# First runtime catalog release
 
-This document records public reproducibility evidence and the approved compatibility qualification for the unsigned sequence-1 candidate. It is not a production signature, publication, or remote-state receipt.
+This document records public reproducibility, qualification, production-signing, and publication evidence for catalog sequence 1. The canonical safe publication record is `qualifications/publication-receipt-sequence-1.json`; generated assets and durable remote workflow state remain outside Git.
 
 ## Approved intent
 
@@ -56,10 +56,25 @@ The release owner approved the exact public qualification input and then the res
 
 - Compatibility-input SHA-256: `308d4ea3990f7b856b3ac025b4be2cc3ecf96b246721bbe99354c23fd7390057`.
 - Qualification-record domain SHA-256: `27b5539f10ff306c56e1c0e38d284f6e47b52e38e567de4483099c7d6b645e2e`.
-- Qualification record: 1,145 bytes, raw SHA-256 `5eddfb0e5f6fa2e51eb98e5eba1d3584ccbb7a051233bc0cebb0c8f64899f5cb`.
+- Tracked qualification record: 1,145 bytes including one trailing LF, raw SHA-256 `5eddfb0e5f6fa2e51eb98e5eba1d3584ccbb7a051233bc0cebb0c8f64899f5cb`.
+- Published qualification asset: the exact same canonical JSON without the tracked file's trailing LF, 1,144 bytes, raw SHA-256 `dfe1e3ef1866c3c381e1a2dd64618b051974a4f32722e9a89d6d05c0ee4131b7`. Both representations verify to qualification domain SHA-256 `27b5539f10ff306c56e1c0e38d284f6e47b52e38e567de4483099c7d6b645e2e`.
 - Final source record: 56,421 bytes, raw SHA-256 `fd6912bb89356d5cdc9e3e8ec28919ee8c9e58ea05d7cec5f3a8fd7d1f380bc6`, domain-separated SHA-256 `2cf24067658991ee326ea5fe334568da09a8d3fdf8b5441ea70756ef2b774fb0`.
 - Final source freshness: `2026-08-28T11:10:00Z` through `2026-09-28T11:10:00Z`; it begins after exact qualification-digest approval, and only these excluded freshness fields differ from the frozen representative intent.
 - All required catalog conformance, managed installation, Node/Pi probe, Pi RPC readiness, activation, managed resolution, required-failure, and cancellation checks passed.
 - Residual scope: only the initial Pi/Linux tuple is qualified, and rollback publication is not qualified for sequence 1.
 
-No production key, credential, SSH state, remote mutation, production envelope, production tag, release, or publication was used or claimed.
+No production key, credential, SSH state, remote mutation, production envelope, production tag, release, or publication was used or claimed by the prepublication qualification described above.
+
+## Production signing
+
+The release owner signed the exact source commit `1b88ca0b36aaa0deadae2daec823c09fbe0fadbe` and source-tree SHA-256 `021bec4cdfd7600995a6f5a0621a8a3c2a14b194eaf7d3ae0bdbafbdb91d7342` through the audited offline ceremony. The public signed transfer SHA-256 is `4aedeae1b75575fdcee488b917e8066b6901b7afba3f4bc69845aa922fe3bf4b`; the production catalog envelope SHA-256 is `7c235f5c3a4e74251d525f7d1c24c19c25e773aae32a9717898bc2a9273628d5`; and the signed release-bundle manifest SHA-256 is `49ceeff0548dd4247b231fa1863856bdd62deda707dead02f20cd87ca1b0abeb`. The signer used key ID `runtime-catalog-ed25519-d1a64e2d55c8e5d8` and public key `t9wPqaH5olhFkcPEcH6QPHX9AsCcrwxiKdzQo8xjW2o`. The isolation-attestation SHA-256 is `3f9596442576de91b558a5540bbba95a3a64e95473ffd8ff3b8c547da380b068`, and the safe signing-receipt SHA-256 is `219b5103fcdd07d67589198b10de96972139f6a5ed71d19d0f6139d25613737e`. No private key bytes, path, environment, or credential entered retained output.
+
+## Production publication
+
+Release ID `378550795` published non-prerelease tag `catalog-v1-sequence-1` at `2026-08-28T15:06:08Z`. Its exact source target remains `1b88ca0b36aaa0deadae2daec823c09fbe0fadbe`; its public release URL is `https://github.com/Devalch/Fluxsemble-runtime-catalog/releases/tag/catalog-v1-sequence-1`; and the compiled consumer endpoint is `https://github.com/Devalch/Fluxsemble-runtime-catalog/releases/latest/download/catalog-v1.json`.
+
+The independently inspected draft receipt SHA-256 `905d559127fa8b51bfaf23dd8e89f498f7d5eb36e570d62ca0b8fd79f04b9645` was separately approved in record SHA-256 `464d95fca11fff33409ff524130d3d9bdbca22582f11c8fc309f1497c468d9ef`. Publication produced receipt SHA-256 `e332961996552a23867a82f98396364b440eaf729a95dda48fdb25001df0387e`; credential-free fixed-latest verification produced receipt SHA-256 `20d8dadecc98ddbacceb9544920f7a708f3d1f1f839eac0f352ffe4a2a7cad22` and returned the exact 56,015-byte catalog envelope.
+
+GitHub returned the existing exact asset set in a non-upload order during draft recovery. Tooling commit `b2fb89537b19dc3051e6f045fb681268fd7ed2a7` corrected reconciliation to use unique name/ID/size bindings while retaining support-first/catalog-last mutation authority and signed local receipt order. The correction passed its full producer gate and independent security review; it did not alter the signed source commit, tag, or any release asset.
+
+The canonical tracked publication receipt records all six public asset IDs, sizes, and SHA-256 digests. Task 21 owns the separate post-publication live-application evidence; it does not retroactively authorize signing or publication.
