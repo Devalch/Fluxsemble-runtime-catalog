@@ -1,0 +1,106 @@
+{
+  "schema_version": 1,
+  "receipt_id": "post-publication-live-endpoint-sequence-1",
+  "repository": "Devalch/Fluxsemble-runtime-catalog",
+  "producer_head_before_evidence": "cfbf59fbc29c4ef2873f7999d0c52d550f738b36",
+  "published_release": {
+    "release_id": "378550795",
+    "tag": "catalog-v1-sequence-1",
+    "source_commit": "1b88ca0b36aaa0deadae2daec823c09fbe0fadbe",
+    "published_at": "2026-08-28T15:06:08Z",
+    "latest_catalog_url": "https://github.com/Devalch/Fluxsemble-runtime-catalog/releases/latest/download/catalog-v1.json",
+    "payload_sha256": "f1587ddc20140f44f5a223cc8df7f7b998839408f66c52d54f2b77abfde5e4dc",
+    "envelope_sha256": "7c235f5c3a4e74251d525f7d1c24c19c25e773aae32a9717898bc2a9273628d5"
+  },
+  "qualified_consumer": {
+    "repository": "Devalch/Fluxsemble",
+    "implementation_commit": "e2c22e6bd5989fbc87793643f209967e8cd64dcd",
+    "application_sha256": "3c5e8d1961358a855f8eb86fde08a8471409a273b2a78def302a84db38e2dfa8",
+    "daemon_sha256": "90ff1cb9ba2a83e3fa929133edf69c2d744c8f4551b331a24628ffb68520f893",
+    "compatibility_profile_id": "builtin-pi-0.83.0-node-22.19.0-linux-x86_64-v1",
+    "compatibility_profile_sha256": "016f39ac96b41a78c5c394b67c5f2d058a59aa7e6891eed10322a061fc0921d5",
+    "build_binding_sha256": "6f6fd672d344eb91d837f92b4d447389a428d773ee548034a4a01d6ffd696d48",
+    "fixed_candidate_qualification_sha256": "76cf70cfa0515ecb841440ad071314800e96addbffc0b0f7ba62324a2100261c",
+    "fixed_candidate_tests": 7,
+    "fixed_candidate_checks": 8,
+    "all_fixed_candidate_outcomes_passed": true
+  },
+  "live_journeys": {
+    "clean_isolated_startup": "accepted_sequence_1",
+    "authenticated_check_now": "unchanged",
+    "reviewed_install": {
+      "outcome": "completed",
+      "provider": "builtin:pi",
+      "target": "linux_x86_64",
+      "pi_version": "0.83.0",
+      "node_version": "22.19.0",
+      "durable_stages": [
+        "queued",
+        "downloading",
+        "extracting",
+        "verifying",
+        "activating",
+        "completed"
+      ],
+      "published_health": "passed",
+      "active_after_reopen": true
+    },
+    "offline_failure_preservation": {
+      "safe_error_code": "catalog_network_unavailable",
+      "accepted_catalog_preserved": true,
+      "active_installation_preserved": true
+    },
+    "reconnect": {
+      "outcome": "unchanged",
+      "active_installation_preserved": true
+    },
+    "rollback": {
+      "outcome": "disabled",
+      "safe_reason_code": "no_rollback_candidate"
+    }
+  },
+  "external_evidence_sha256": {
+    "attempt_outcome": "d80e181761b4e0a16eb77f2c42afff83caf6b46def0b26e1eb44d59aa991a035",
+    "rollback_unavailable": "f6c9e5498208b1b0ff49d4742b6ef8906c633486f5575b86b35e8bd1829d6922",
+    "runtime_events_and_managed_transport": "7f67b6cd904f05119ddfdc288fd9fbcdbcafc46632800bcae1740eb8ce45a3c7",
+    "sanitized_connected_namespace": "38831a88e9cfb029e579d59e8f4c951c8fba7096b66c9bf42c15b74f9cba06c2",
+    "sanitized_offline_namespace": "0254016aefd4b7dad72fe4623f2e61cb9110930d0d59019e0581015d0e0622d5"
+  },
+  "boundary_evidence": {
+    "consumer_boundary_check": "passed",
+    "producer_dependency": "absent",
+    "publication_mutation_during_task_21": false,
+    "published_catalog_changed": false,
+    "production_signing_key_used": false,
+    "direct_daemon_substitution_claimed": false,
+    "ui_tauri_origin": "operator_observed_but_not_independently_reconstructable_from_durable_evidence"
+  },
+  "reviews": {
+    "closure_followup": {
+      "supported": "catalog, managed transport, install progression, activation, health, persistence, offline preservation, reconnect, rollback-unavailable, and producer exclusion",
+      "verdict": "blocked_for_complete_task_21_attestation"
+    },
+    "security_followup": {
+      "supported": "durable state, executable binding, isolated home, host-state absence, credential-socket absence, and directory-only Btrfs relaxation",
+      "verdict": "blocked_for_complete_task_21_attestation"
+    }
+  },
+  "verification": {
+    "consumer_fixed_candidate_qualification": "passed",
+    "consumer_boundary_check": "passed",
+    "consumer_full_gate": "not_run_user_prohibited_long_tests",
+    "producer_full_gate": "not_run_user_prohibited_long_tests"
+  },
+  "closure_status": "evidence_recorded_with_open_task_21_requirements",
+  "open_requirements": [
+    "The complete live keyboard, pointer, focus, live-region, disconnect-during-download, cursor-gap, and stale-event Task 21 Step 2 matrix is not independently evidenced.",
+    "Authenticated desktop/Tauri origin for historical mutations was operator-observed but is not independently reconstructable from durable evidence.",
+    "The current consumer and producer full gates were not run because the user prohibited long tests."
+  ],
+  "residual_risks": [
+    "Sequence 1 remains limited to builtin:pi 0.83.0 with Node 22.19.0 on linux_x86_64 for Fluxsemble 0.1.0.",
+    "No live rollback was attempted because a first installation has no rollback candidate.",
+    "Future Pi or Node tuples remain blocked pending a separately approved version-flexible-installer project.",
+    "This post-publication receipt does not retroactively authorize or mutate signing, publication, tags, releases, or assets."
+  ]
+}
