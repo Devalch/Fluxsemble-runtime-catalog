@@ -132,6 +132,7 @@ struct RecoveryBroker {
     next_asset: u64,
     fail: Option<(String, Failure)>,
     drift_after_upload: bool,
+    sort_assets_on_read: bool,
     tag_mutations: usize,
     draft_mutations: usize,
     upload_mutations: BTreeMap<String, usize>,
@@ -204,7 +205,15 @@ impl BrokerTransport for RecoveryBroker {
         _tag: &str,
     ) -> Result<Option<RemoteRelease>, RemoteBoundaryError> {
         self.boundary("read_draft")?;
-        Ok(self.release.clone())
+        let mut release = self.release.clone();
+        if self.sort_assets_on_read {
+            if let Some(release) = &mut release {
+                release
+                    .assets
+                    .sort_by(|left, right| left.name.cmp(&right.name));
+            }
+        }
+        Ok(release)
     }
 
     fn create_draft(
@@ -536,6 +545,39 @@ fn complete_per_asset_before_after_retry_matrix_resumes_only_exact_state() {
             "support-first/catalog-last order changed for {call}"
         );
     }
+}
+
+#[test]
+fn name_reordered_remote_assets_resume_without_reupload() {
+    let (_temp, state) = staged("name-reordered-assets");
+    let mut broker = RecoveryBroker {
+        sort_assets_on_read: true,
+        ..Default::default()
+    };
+
+    let _ = workflow::stage_remote_fixture_with(&state, &mut broker);
+    let release = broker.release.as_ref().unwrap();
+    assert_eq!(release.assets.len(), PRODUCTION_ASSETS.len());
+    let mutations = broker.upload_mutations.clone();
+
+    workflow::stage_remote_fixture_with(&state, &mut broker).unwrap();
+    assert_eq!(broker.upload_mutations, mutations);
+    for asset in PRODUCTION_ASSETS {
+        assert_eq!(broker.upload_mutations.get(*asset), Some(&1));
+    }
+
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&fs::read(state.join("latest/draft-receipt-v1.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        receipt["body"]["assets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|asset| asset["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        PRODUCTION_ASSETS
+    );
 }
 
 #[test]

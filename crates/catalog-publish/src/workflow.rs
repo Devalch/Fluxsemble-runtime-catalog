@@ -1326,7 +1326,7 @@ fn verify_and_upload_all(
         )?;
         require_asset_prefix(&before.assets, &operation.record.operation.assets)?;
         let remote_asset = if before.assets.len() > index {
-            before.assets[index].clone()
+            matching_remote_asset(&before.assets, &expected)?.clone()
         } else {
             if before.assets.len() != index {
                 return Err(mark_uncertain(state, operation));
@@ -1366,7 +1366,11 @@ fn verify_and_upload_all(
             if upload_result.is_err() && after.assets.len() != index + 1 {
                 return Err(mark_uncertain(state, operation));
             }
-            after.assets[index].clone()
+            matching_remote_asset(&after.assets, &expected)
+                .inspect_err(|_| {
+                    let _ = mark_operation_uncertain(state, operation);
+                })?
+                .clone()
         };
         verify_download(broker, REPOSITORY, &remote_asset, &expected).inspect_err(|_| {
             let _ = mark_operation_uncertain(state, operation);
@@ -1447,11 +1451,16 @@ fn require_asset_prefix(
     if remote.len() > expected.len() {
         return Err(recovery_required());
     }
+    let admitted = &expected[..remote.len()];
     let mut ids = BTreeSet::new();
-    for (actual, expected) in remote.iter().zip(expected) {
-        if actual.name != expected.name
-            || actual.size != expected.size
-            || !ids.insert(actual.asset_id.as_str())
+    let mut names = BTreeSet::new();
+    for actual in remote {
+        if !ids.insert(actual.asset_id.as_str())
+            || !names.insert(actual.name.as_str())
+            || admitted
+                .iter()
+                .find(|expected| expected.name == actual.name)
+                .is_none_or(|expected| expected.size != actual.size)
         {
             return Err(recovery_required());
         }
@@ -1459,17 +1468,40 @@ fn require_asset_prefix(
     Ok(())
 }
 
+fn matching_remote_asset<'a>(
+    remote: &'a [RemoteReleaseAsset],
+    expected: &RemoteAsset,
+) -> Result<&'a RemoteReleaseAsset, RemoteWorkflowError> {
+    let mut matches = remote.iter().filter(|asset| asset.name == expected.name);
+    let asset = matches.next().ok_or_else(recovery_required)?;
+    if matches.next().is_some() || asset.size != expected.size {
+        return Err(recovery_required());
+    }
+    Ok(asset)
+}
+
 fn require_single_new_asset(
     before: &[RemoteReleaseAsset],
     after: &[RemoteReleaseAsset],
     expected: &RemoteAsset,
 ) -> Result<(), RemoteWorkflowError> {
+    let new_asset = after
+        .iter()
+        .find(|asset| asset.name == expected.name)
+        .ok_or_else(uncertain)?;
     if after.len() != before.len() + 1
-        || after[..before.len()] != *before
-        || after.last().is_none_or(|asset| {
-            asset.name != expected.name
-                || asset.size != expected.size
-                || before.iter().any(|prior| prior.asset_id == asset.asset_id)
+        || new_asset.size != expected.size
+        || before.iter().any(|prior| prior.name == expected.name)
+        || before
+            .iter()
+            .any(|prior| prior.asset_id == new_asset.asset_id)
+        || before.iter().any(|prior| {
+            after
+                .iter()
+                .filter(|asset| asset.name == prior.name)
+                .count()
+                != 1
+                || after.iter().find(|asset| asset.name == prior.name) != Some(prior)
         })
     {
         return Err(uncertain());
@@ -1481,11 +1513,18 @@ fn require_complete_assets(
     remote: &[RemoteReleaseAsset],
     expected: &[RemoteReceiptAssetV1],
 ) -> Result<(), RemoteWorkflowError> {
+    let mut ids = BTreeSet::new();
+    let mut names = BTreeSet::new();
     if remote.len() != expected.len()
-        || remote.iter().zip(expected).any(|(actual, expected)| {
-            actual.asset_id != expected.asset_id
-                || actual.name != expected.name
-                || actual.size != expected.size
+        || remote.iter().any(|actual| {
+            !ids.insert(actual.asset_id.as_str())
+                || !names.insert(actual.name.as_str())
+                || expected
+                    .iter()
+                    .find(|expected| expected.name == actual.name)
+                    .is_none_or(|expected| {
+                        actual.asset_id != expected.asset_id || actual.size != expected.size
+                    })
         })
     {
         return Err(recovery_required());
@@ -1499,7 +1538,12 @@ fn redownload_receipt_assets(
     expected: &[RemoteReceiptAssetV1],
 ) -> Result<(), RemoteWorkflowError> {
     require_complete_assets(&release.assets, expected)?;
-    for (remote, expected) in release.assets.iter().zip(expected) {
+    for expected in expected {
+        let remote = release
+            .assets
+            .iter()
+            .find(|asset| asset.name == expected.name)
+            .ok_or_else(recovery_required)?;
         verify_download(
             broker,
             REPOSITORY,
