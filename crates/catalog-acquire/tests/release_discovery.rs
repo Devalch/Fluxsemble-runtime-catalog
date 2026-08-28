@@ -70,17 +70,28 @@ fn discovery_rejects_unsupported_target_without_fetching() {
 fn package_manifest_rejects_intent_semantic_mismatch() {
     let fixture = PublicReleaseFixture::new(Mutation::None);
     let discovered = fixture.discover(request()).unwrap();
-    let mut bytes: Value =
-        serde_json::from_slice(&discovered.package_inputs.canonical_bytes().unwrap()).unwrap();
-    bytes["root"]["version"] = Value::String("0.84.1".to_owned());
-    let mismatched =
-        catalog_acquire::PackageInputManifestV1::from_json(&serde_json::to_vec(&bytes).unwrap())
-            .unwrap();
+    let canonical = discovered.package_inputs.canonical_bytes().unwrap();
 
-    assert_eq!(
-        mismatched.validate_for_intent(&discovered.intent),
-        Err(AcquireError::Graph)
-    );
+    for (pointer, replacement) in [
+        ("/root/archive_sha256", Value::String("f".repeat(64))),
+        (
+            "/locked_packages/0/name",
+            Value::String("same-count-substitution".to_owned()),
+        ),
+    ] {
+        let mut bytes: Value = serde_json::from_slice(&canonical).unwrap();
+        *bytes.pointer_mut(pointer).unwrap() = replacement;
+        let mismatched = catalog_acquire::PackageInputManifestV1::from_json(
+            &serde_json::to_vec(&bytes).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            mismatched.validate_for_intent(&discovered.intent),
+            Err(AcquireError::Graph),
+            "intent binding accepted {pointer}"
+        );
+    }
 }
 
 fn assert_closed_rejection(mutation: Mutation) {

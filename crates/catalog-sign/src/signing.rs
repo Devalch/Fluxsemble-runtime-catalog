@@ -70,9 +70,12 @@ const NODE_ARTIFACT_SIZE: u64 = 30_479_988;
 const NODE_ARTIFACT_SHA256: &str =
     "c0649af18e6a24f6fe5535a3e86b341dd49a8e71117c8b68bde973ef834f16f2";
 const LOCKED_COUNT: usize = 139;
+#[cfg(test)]
 const PRE_PRUNE_COUNT: u16 = 131;
+#[cfg(test)]
 const APPLICABLE_COUNT: u16 = 130;
 
+#[cfg(test)]
 const PRUNED: [(&str, &[&str]); 9] = [
     (
         "node_modules/@mariozechner/clipboard-darwin-arm64",
@@ -543,6 +546,9 @@ fn last_finalization_stage_for_test() -> Option<FinalizationStage> {
 
 #[derive(Clone, Copy)]
 enum ReleaseAdmissionPolicy {
+    IntentStructural,
+    QualifiedProduction,
+    #[cfg(test)]
     Production,
     // This private test-only seam begins after exact production admission and enters the same
     // candidate/object/finalization body. It creates no production bypass or exported authority.
@@ -577,7 +583,7 @@ pub fn assemble_release_intent(
     bundle: &VerifiedTransferredBundle,
     intent: &InitialPiReleaseIntentV1,
 ) -> Result<UnsignedReleaseCandidateV1, SignError> {
-    assemble_release_intent_with_policy(bundle, intent, ReleaseAdmissionPolicy::Production)
+    assemble_release_intent_with_policy(bundle, intent, ReleaseAdmissionPolicy::IntentStructural)
 }
 
 fn assemble_release_intent_with_policy(
@@ -618,7 +624,7 @@ pub fn finalize_candidate(
         bundle,
         source,
         qualification,
-        ReleaseAdmissionPolicy::Production,
+        ReleaseAdmissionPolicy::QualifiedProduction,
     )
 }
 
@@ -739,7 +745,7 @@ fn assemble_common(
     final_bindings: Option<FinalBindings>,
     policy: ReleaseAdmissionPolicy,
 ) -> Result<UnsignedReleaseCandidateV1, SignError> {
-    require_first_tuple(intent)?;
+    require_supported_intent(intent)?;
     let package_inputs_bytes = bundle.record_bytes("package_inputs")?;
     let package_inputs = parse_package_inputs(&package_inputs_bytes)?;
     require_release_admission(intent, &package_inputs_bytes, policy)?;
@@ -1307,12 +1313,10 @@ fn catalog_payload_for_intent(
         .map_err(|_| candidate_rejected())
 }
 
-fn require_first_tuple(intent: &InitialPiReleaseIntentV1) -> Result<(), SignError> {
+fn require_supported_intent(intent: &InitialPiReleaseIntentV1) -> Result<(), SignError> {
     if intent.fluxsemble_requirement().as_str() != "=0.1.0"
         || intent.release().provider() != "builtin:pi"
         || intent.release().target().as_str() != "linux_x86_64"
-        || intent.release().pi_version().as_str() != ROOT_VERSION
-        || intent.release().node_version().as_str() != NODE_VERSION
         || intent.tag().as_str() != format!("catalog-v1-sequence-{}", intent.sequence())
         || intent.generated_at() >= intent.expires_at()
     {
@@ -1327,6 +1331,18 @@ fn require_release_admission(
     policy: ReleaseAdmissionPolicy,
 ) -> Result<(), SignError> {
     match policy {
+        ReleaseAdmissionPolicy::IntentStructural => Ok(()),
+        ReleaseAdmissionPolicy::QualifiedProduction => {
+            require_approved_production_tuple(intent)?;
+            if approved_package_input_digest(package_inputs_bytes)
+                != APPROVED_PACKAGE_INPUT_DOMAIN_SHA256
+                || approved_release_semantic_digest(intent)? != APPROVED_RELEASE_SEMANTIC_SHA256
+            {
+                return Err(candidate_rejected());
+            }
+            Ok(())
+        }
+        #[cfg(test)]
         ReleaseAdmissionPolicy::Production => {
             require_approved_production_tuple(intent)?;
             if approved_package_input_digest(package_inputs_bytes)
@@ -1548,7 +1564,7 @@ fn verify_complete_object_graph(
         .ok_or_else(candidate_rejected)?;
 
     if package_inputs.root.name != ROOT_NAME
-        || package_inputs.root.version != ROOT_VERSION
+        || package_inputs.root.version != intent.release().pi_version().as_str()
         || package_inputs.root.archive_size != pi.size_bytes().get()
         || package_inputs.root.archive_sha256 != pi.sha256().as_str()
         || package_inputs.root.manifest_size != metadata.root_package_manifest().size_bytes().get()
@@ -1557,7 +1573,7 @@ fn verify_complete_object_graph(
             != metadata.shipped_shrinkwrap().artifact().size_bytes().get()
         || package_inputs.root.shrinkwrap_sha256
             != metadata.shipped_shrinkwrap().artifact().sha256().as_str()
-        || metadata.shipped_shrinkwrap().locked_packages().len() != LOCKED_COUNT
+        || metadata.shipped_shrinkwrap().locked_packages().is_empty()
         || metadata.shipped_shrinkwrap().locked_packages().len()
             != package_inputs.locked_packages.len()
         || package_inputs.root.archive_member_count == 0
@@ -1749,48 +1765,74 @@ fn parse_package_inputs(bytes: &[u8]) -> Result<PackageInputManifestV1, SignErro
     }
     let manifest: PackageInputManifestV1 =
         serde_json::from_slice(bytes).map_err(|_| candidate_rejected())?;
+    let applicable = manifest
+        .locked_packages
+        .iter()
+        .filter(|record| matches!(record.applicability, LinuxApplicability::Applicable))
+        .count();
     if serde_jcs::to_vec(&manifest).map_err(|_| candidate_rejected())? != bytes
         || manifest.schema_version != 1
         || manifest.target_os != "linux"
         || manifest.target_cpu != "x64"
         || manifest.target_libc != "glibc"
         || manifest.root.name != ROOT_NAME
-        || manifest.root.version != ROOT_VERSION
-        || manifest.locked_packages.len() != LOCKED_COUNT
-        || manifest.pre_prune_package_count != PRE_PRUNE_COUNT
-        || manifest.applicable_package_count != APPLICABLE_COUNT
+        || manifest.root.version.is_empty()
+        || manifest.root.archive_size == 0
+        || manifest.root.archive_size > MAX_ENTRY_BYTES
+        || manifest.root.manifest_size == 0
+        || manifest.root.manifest_size > MAX_MANIFEST_BYTES
+        || manifest.root.shrinkwrap_size == 0
+        || manifest.root.shrinkwrap_size > MAX_MANIFEST_BYTES
+        || manifest.root.archive_member_count == 0
+        || !valid_sha256(&manifest.root.archive_sha256)
+        || !valid_sha256(&manifest.root.manifest_sha256)
+        || !valid_sha256(&manifest.root.shrinkwrap_sha256)
+        || manifest.locked_packages.is_empty()
+        || manifest.locked_packages.len() > MAX_ENTRIES.saturating_sub(4)
+        || usize::from(manifest.pre_prune_package_count) != applicable + 1
+        || usize::from(manifest.applicable_package_count) != applicable
         || manifest
             .locked_packages
             .windows(2)
             .any(|pair| pair[0].locator >= pair[1].locator)
-        || manifest
-            .locked_packages
-            .iter()
-            .filter(|record| matches!(record.applicability, LinuxApplicability::Applicable))
-            .count()
-            != usize::from(APPLICABLE_COUNT)
     {
         return Err(candidate_rejected());
     }
-    let pruned = manifest
-        .locked_packages
-        .iter()
-        .filter_map(|record| match &record.applicability {
-            LinuxApplicability::Applicable => None,
-            LinuxApplicability::Pruned { reasons } => {
-                Some((record.locator.as_str(), reasons.as_slice()))
-            }
-        })
-        .collect::<Vec<_>>();
-    if pruned.len() != PRUNED.len()
-        || pruned.iter().zip(PRUNED).any(|(actual, expected)| {
-            actual.0 != expected.0
-                || actual.1.iter().map(String::as_str).collect::<Vec<_>>() != expected.1
-        })
-    {
-        return Err(candidate_rejected());
+    for record in &manifest.locked_packages {
+        if !safe_package_locator(&record.locator)
+            || record.name.is_empty()
+            || record.version.is_empty()
+            || !record
+                .resolved_url
+                .starts_with("https://registry.npmjs.org/")
+            || record.resolved_url.contains(['?', '#', '\\'])
+            || record.registry_integrity.len() != 95
+            || !record.registry_integrity.starts_with("sha512-")
+            || record.archive_size == 0
+            || record.archive_size > MAX_ENTRY_BYTES
+            || !valid_sha256(&record.archive_sha256)
+            || !valid_sha256(&record.declaration_sha256)
+            || record.archive_member_count == 0
+            || matches!(&record.applicability, LinuxApplicability::Pruned { reasons }
+                if reasons.is_empty()
+                    || reasons.windows(2).any(|pair| pair[0] >= pair[1])
+                    || reasons.iter().any(|reason| !matches!(reason.as_str(),
+                        "declaration.cpu" | "declaration.libc" | "declaration.os"
+                        | "lock.cpu" | "lock.libc" | "lock.os")))
+        {
+            return Err(candidate_rejected());
+        }
     }
     Ok(manifest)
+}
+
+fn safe_package_locator(value: &str) -> bool {
+    value.len() <= 1024
+        && value.starts_with("node_modules/")
+        && !value.contains('\\')
+        && value
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
 fn intent_semantic_digest(intent: &InitialPiReleaseIntentV1) -> Result<String, SignError> {
@@ -3820,15 +3862,13 @@ mod tests {
     }
 
     #[test]
-    fn public_production_entry_points_reject_synthetic_tuples_before_key_open() {
+    fn structural_intent_assembly_stays_non_signable_and_production_rejects_synthetic_tuple() {
         let fixture = CandidateFixture::new();
         let intent_bundle = verify_transferred_bundle(&fixture.intent_bundle).unwrap();
         let final_bundle = verify_transferred_bundle(&fixture.final_bundle).unwrap();
         reset_key_open_count();
-        assert_eq!(
-            assemble_release_intent(&intent_bundle, &fixture.intent),
-            Err(SignError::CandidateRejected)
-        );
+        let intent_candidate = assemble_release_intent(&intent_bundle, &fixture.intent).unwrap();
+        assert!(!intent_candidate.is_production_signable());
         assert_eq!(
             finalize_candidate(&final_bundle, &fixture.source, &fixture.qualification),
             Err(SignError::CandidateRejected)
@@ -3846,6 +3886,39 @@ mod tests {
         ));
         assert_eq!(key_open_count(), 0);
         assert!(!output.exists());
+    }
+
+    #[test]
+    fn version_driven_sequence_two_inputs_assemble_but_remain_unqualified_for_signing() {
+        let root = TempDirectory::new();
+        let (intent_value, package_inputs, objects) = version_driven_intent_fixture();
+        let intent =
+            InitialPiReleaseIntentV1::from_json(&serde_jcs::to_vec(&intent_value).unwrap())
+                .unwrap();
+        let bundle_path = root.path.join("version-driven-intent-bundle");
+        write_transfer(
+            &bundle_path,
+            InputSourceKind::ReleaseIntent,
+            encode_hex(&initial_release_intent_digest(&intent).unwrap()),
+            intent_semantic_digest(&intent).unwrap(),
+            None,
+            vec![
+                ("package_inputs".to_owned(), package_inputs.clone()),
+                (
+                    "release_intent".to_owned(),
+                    serde_jcs::to_vec(&intent).unwrap(),
+                ),
+            ],
+            &objects,
+        );
+        let bundle = verify_transferred_bundle(&bundle_path).unwrap();
+
+        let candidate = assemble_release_intent(&bundle, &intent).unwrap();
+        assert!(!candidate.is_production_signable());
+        assert_eq!(
+            require_release_admission(&intent, &package_inputs, ReleaseAdmissionPolicy::Production,),
+            Err(SignError::CandidateRejected),
+        );
     }
 
     #[test]
@@ -5791,6 +5864,51 @@ mod tests {
     }
 
     type FixtureObjects = BTreeMap<String, (String, Vec<u8>)>;
+
+    fn version_driven_intent_fixture() -> (Value, Vec<u8>, FixtureObjects) {
+        let (mut intent, package_inputs, mut objects) = intent_fixture();
+        intent["sequence"] = json!("2");
+        intent["tag"] = json!("catalog-v1-sequence-2");
+        intent["generated_at"] = json!("2026-09-01T00:00:00Z");
+        intent["expires_at"] = json!("2026-10-01T00:00:00Z");
+        for pointer in [
+            "/release/release/version",
+            "/release/release/components/1/version",
+            "/release/release/provider_extension/metadata/approved_package/version",
+            "/release/release/provider_extension/metadata/shipped_shrinkwrap/root_package/version",
+        ] {
+            *intent.pointer_mut(pointer).unwrap() = json!("0.84.0");
+        }
+        intent["release"]["release"]["components"][0]["version"] = json!("22.20.0");
+        let node_url = "https://nodejs.org/dist/v22.20.0/node-v22.20.0-linux-x64.tar.xz";
+        let root_url = "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/pi-coding-agent-0.84.0.tgz";
+        *intent
+            .pointer_mut("/release/release/components/0/artifacts/0/url")
+            .unwrap() = json!(node_url);
+        *intent
+            .pointer_mut("/release/release/components/1/artifacts/0/url")
+            .unwrap() = json!(root_url);
+        for pointer in [
+            "/release/release/provider_extension/metadata/root_package_manifest/url",
+            "/release/release/provider_extension/metadata/shipped_shrinkwrap/artifact/url",
+        ] {
+            let prior = intent.pointer(pointer).unwrap().as_str().unwrap();
+            *intent.pointer_mut(pointer).unwrap() =
+                json!(prior.replace("catalog-v1-sequence-1", "catalog-v1-sequence-2"));
+        }
+        for (url, _) in objects.values_mut() {
+            if url.starts_with("https://nodejs.org/dist/") {
+                *url = node_url.to_owned();
+            } else if url.contains("pi-coding-agent-0.83.0.tgz") {
+                *url = root_url.to_owned();
+            } else if url.starts_with("https://github.com/") {
+                *url = url.replace("catalog-v1-sequence-1", "catalog-v1-sequence-2");
+            }
+        }
+        let mut manifest: Value = serde_json::from_slice(&package_inputs).unwrap();
+        manifest["root"]["version"] = json!("0.84.0");
+        (intent, serde_jcs::to_vec(&manifest).unwrap(), objects)
+    }
 
     fn intent_fixture() -> (Value, Vec<u8>, FixtureObjects) {
         let mut payload: Value = serde_json::from_slice(include_bytes!(

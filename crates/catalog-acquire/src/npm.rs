@@ -540,15 +540,38 @@ impl PackageInputManifestV1 {
         intent: &InitialPiReleaseIntentV1,
     ) -> Result<(), AcquireError> {
         self.validate()?;
+        let metadata = pi_metadata(intent)?;
+        let root_artifact = pi_artifact(intent, metadata)?;
         if intent.release().target().as_str() != "linux_x86_64"
             || intent.release().pi_version().as_str() != self.root.version
-            || pi_metadata(intent)?
-                .shipped_shrinkwrap()
-                .locked_packages()
-                .len()
-                != self.locked_packages.len()
+            || self.root.name != metadata.approved_package().name().as_str()
+            || self.root.version != metadata.approved_package().version().as_str()
+            || self.root.archive_size != root_artifact.size_bytes().get()
+            || self.root.archive_sha256 != root_artifact.sha256().as_str()
+            || self.root.manifest_size != metadata.root_package_manifest().size_bytes().get()
+            || self.root.manifest_sha256 != metadata.root_package_manifest().sha256().as_str()
+            || self.root.shrinkwrap_size
+                != metadata.shipped_shrinkwrap().artifact().size_bytes().get()
+            || self.root.shrinkwrap_sha256
+                != metadata.shipped_shrinkwrap().artifact().sha256().as_str()
+            || metadata.shipped_shrinkwrap().locked_packages().len() != self.locked_packages.len()
         {
             return Err(AcquireError::Graph);
+        }
+        for (observed, declared) in self
+            .locked_packages
+            .iter()
+            .zip(metadata.shipped_shrinkwrap().locked_packages())
+        {
+            if observed.locator != declared.locator().as_str()
+                || observed.name != declared.name().as_str()
+                || observed.version != declared.version().as_str()
+                || observed.resolved_url != declared.resolved_url().as_str()
+                || observed.registry_integrity != declared.registry_integrity().as_str()
+                || observed.archive_sha256 != declared.archive_sha256().as_str()
+            {
+                return Err(AcquireError::Graph);
+            }
         }
         Ok(())
     }
