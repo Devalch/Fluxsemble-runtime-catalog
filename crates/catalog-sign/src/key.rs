@@ -9,8 +9,12 @@ use std::{
     path::Path,
 };
 
-use catalog_core::{ProductionKeyIdentity, derive_runtime_catalog_key_id, production_key_identity};
+use catalog_core::{
+    ProductionKeyIdentity, active_production_key_identity, derive_runtime_catalog_key_id,
+};
 use ed25519_dalek::SigningKey as DalekSigningKey;
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -67,9 +71,28 @@ impl<'a> From<&'a ProductionKeyIdentity> for ExpectedIdentity<'a> {
     }
 }
 
-/// Reads the one production key form. This capability deliberately remains crate-private.
+/// Reads only the active reviewed production signing key. This capability remains crate-private.
 pub(crate) fn read_production_signing_key(path: &Path) -> Result<Zeroizing<SigningKey>, SignError> {
-    read_signing_key(path, production_key_identity())
+    read_signing_key(path, active_production_key_identity())
+}
+
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct InspectedSigningKey {
+    pub(crate) key_id: String,
+    pub(crate) public_key: String,
+    pub(crate) fingerprint: String,
+}
+
+/// Derives safe public identity without admitting the key for signing.
+pub(crate) fn inspect_signing_key(path: &Path) -> Result<InspectedSigningKey, SignError> {
+    let key = read_signing_key_material(path, || {})?;
+    let public_key = key.verifying_key().to_bytes();
+    Ok(InspectedSigningKey {
+        key_id: derive_runtime_catalog_key_id(&public_key),
+        public_key: encode_base64url_no_pad(&public_key),
+        fingerprint: format!("{:x}", Sha256::digest(public_key)),
+    })
 }
 
 fn read_signing_key(
@@ -82,6 +105,22 @@ fn read_signing_key(
 fn read_signing_key_for_identity(
     path: &Path,
     expected: ExpectedIdentity<'_>,
+    before_named_reopen: impl FnOnce(),
+) -> Result<Zeroizing<SigningKey>, SignError> {
+    let key = read_signing_key_material(path, before_named_reopen)?;
+    let actual_public = key.verifying_key().to_bytes();
+    let actual_key_id = derive_runtime_catalog_key_id(&actual_public);
+    let public_match = actual_public.ct_eq(expected.public_key);
+    let id_match = actual_key_id.len() == expected.key_id.len()
+        && bool::from(actual_key_id.as_bytes().ct_eq(expected.key_id.as_bytes()));
+    if !bool::from(public_match) || !id_match {
+        return Err(rejected());
+    }
+    Ok(key)
+}
+
+fn read_signing_key_material(
+    path: &Path,
     before_named_reopen: impl FnOnce(),
 ) -> Result<Zeroizing<SigningKey>, SignError> {
     validate_key_path(path)?;
@@ -118,15 +157,6 @@ fn read_signing_key_for_identity(
     );
     let key = Zeroizing::new(SigningKey::from_bytes(&seed));
     seed.zeroize();
-
-    let actual_public = key.verifying_key().to_bytes();
-    let actual_key_id = derive_runtime_catalog_key_id(&actual_public);
-    let public_match = actual_public.ct_eq(expected.public_key);
-    let id_match = actual_key_id.len() == expected.key_id.len()
-        && bool::from(actual_key_id.as_bytes().ct_eq(expected.key_id.as_bytes()));
-    if !bool::from(public_match) || !id_match {
-        return Err(rejected());
-    }
     Ok(key)
 }
 
@@ -354,6 +384,28 @@ fn encode_standard_base64(bytes: &[u8]) -> Zeroizing<String> {
     output
 }
 
+fn encode_base64url_no_pad(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        output.push(char::from(ALPHABET[usize::from(chunk[0] >> 2)]));
+        output.push(char::from(
+            ALPHABET
+                [usize::from(((chunk[0] & 3) << 4) | (chunk.get(1).copied().unwrap_or(0) >> 4))],
+        ));
+        if let Some(second) = chunk.get(1) {
+            output.push(char::from(
+                ALPHABET
+                    [usize::from(((second & 15) << 2) | (chunk.get(2).copied().unwrap_or(0) >> 6))],
+            ));
+        }
+        if let Some(third) = chunk.get(2) {
+            output.push(char::from(ALPHABET[usize::from(third & 63)]));
+        }
+    }
+    output
+}
+
 fn standard_base64_value(byte: u8) -> Option<u8> {
     match byte {
         b'A'..=b'Z' => Some(byte - b'A'),
@@ -479,7 +531,7 @@ mod tests {
 
         let wrong_public_key = ExpectedIdentity {
             key_id: fixture_identity().key_id,
-            public_key: production_key_identity().public_key_bytes(),
+            public_key: active_production_key_identity().public_key_bytes(),
         };
         assert!(read_signing_key_for_identity(&valid, wrong_public_key, || {}).is_err());
         let wrong_key_id = ExpectedIdentity {

@@ -1,13 +1,17 @@
-use catalog_core::production_key_identity;
+use catalog_core::active_production_key_identity;
+use catalog_sign::IsolationMode;
 
 fn main() {
     let isolation = match catalog_sign::enter_signer_isolation() {
         Ok(isolation) => isolation,
         Err(_) => fail(),
     };
-    let _compiled_identity = production_key_identity();
+    let _compiled_identity = active_production_key_identity();
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
     match catalog_sign::run_isolated_cli(&isolation, &arguments) {
+        Ok(summary) if isolation.attestation().mode() == IsolationMode::InspectKey => {
+            println!("{summary}");
+        }
         Ok(summary) => match catalog_sign::emit_reverse_transfer_manifest(&isolation) {
             Ok(()) => println!("{summary}"),
             Err(_) => fail(),

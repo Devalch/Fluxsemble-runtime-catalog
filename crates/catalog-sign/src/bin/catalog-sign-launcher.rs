@@ -39,6 +39,7 @@ enum Ceremony {
     Finalize,
     Sign,
     RecoverSign,
+    InspectKey,
     IsolationProbe,
 }
 
@@ -49,6 +50,7 @@ impl Ceremony {
             Self::Finalize => "finalize",
             Self::Sign => "sign",
             Self::RecoverSign => "recover-sign",
+            Self::InspectKey => "inspect-key",
             Self::IsolationProbe => "isolation-probe",
         }
     }
@@ -57,9 +59,9 @@ impl Ceremony {
 struct Request {
     ceremony: Ceremony,
     config: PathBuf,
-    input: PathBuf,
+    input: Option<PathBuf>,
     key: Option<PathBuf>,
-    output: PathBuf,
+    output: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -95,7 +97,8 @@ struct VerifiedExecutable {
 fn main() {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     match parse_request(&arguments).and_then(launch) {
-        Ok(()) => println!("catalog signer completed"),
+        Ok(Some(identity)) => println!("{identity}"),
+        Ok(None) => println!("catalog signer completed"),
         Err(_) => fail(),
     }
 }
@@ -142,9 +145,9 @@ fn parse_request(args: &[std::ffi::OsString]) -> Result<Request, SignError> {
                     Ceremony::IsolationProbe
                 },
                 config: value(2)?,
-                input: value(4)?,
+                input: Some(value(4)?),
                 key: None,
-                output: value(6)?,
+                output: Some(value(6)?),
             })
         }
         Some("sign") if args.len() == 9 => {
@@ -158,9 +161,21 @@ fn parse_request(args: &[std::ffi::OsString]) -> Result<Request, SignError> {
             Ok(Request {
                 ceremony: Ceremony::Sign,
                 config: value(2)?,
-                input: value(4)?,
+                input: Some(value(4)?),
                 key: Some(value(6)?),
-                output: value(8)?,
+                output: Some(value(8)?),
+            })
+        }
+        Some("inspect-key") if args.len() == 5 => {
+            if args[1] != "--config" || args[3] != "--key" {
+                return Err(rejected());
+            }
+            Ok(Request {
+                ceremony: Ceremony::InspectKey,
+                config: value(2)?,
+                input: None,
+                key: Some(value(4)?),
+                output: None,
             })
         }
         _ => Err(rejected()),
@@ -180,12 +195,12 @@ struct NoopTestCheckpoints;
 impl LauncherTestCheckpoints for NoopTestCheckpoints {}
 
 #[cfg(not(test))]
-fn launch(request: Request) -> Result<(), SignError> {
+fn launch(request: Request) -> Result<Option<String>, SignError> {
     launch_impl(request)
 }
 
 #[cfg(test)]
-fn launch(request: Request) -> Result<(), SignError> {
+fn launch(request: Request) -> Result<Option<String>, SignError> {
     launch_impl(request, &mut NoopTestCheckpoints)
 }
 
@@ -195,13 +210,13 @@ pub(crate) fn launch_with_test_checkpoints(
     arguments: &[std::ffi::OsString],
     checkpoints: &mut dyn LauncherTestCheckpoints,
 ) -> Result<(), SignError> {
-    launch_impl(parse_request(arguments)?, checkpoints)
+    launch_impl(parse_request(arguments)?, checkpoints).map(|_| ())
 }
 
 fn launch_impl(
     request: Request,
     #[cfg(test)] checkpoints: &mut dyn LauncherTestCheckpoints,
-) -> Result<(), SignError> {
+) -> Result<Option<String>, SignError> {
     let (config, config_file, config_identity, config_sha256) = read_config(&request.config)?;
     let bwrap = verify_bwrap(&config)?;
     #[cfg(test)]
@@ -217,15 +232,27 @@ fn launch_impl(
     )?;
     verify_descriptor_digest(&config_file, config_identity.size, &config_sha256)?;
 
-    let input_path = require_canonical_absolute(&request.input)?;
-    let verified_input = verify_transferred_bundle(&input_path)?;
-    let (input, input_transfer_sha256) = verified_input.isolated_launch_capability()?;
-    let input_identity = Identity::from_metadata(&input.metadata().map_err(|_| rejected())?);
+    let input_capability = request
+        .input
+        .as_ref()
+        .map(|path| {
+            let input_path = require_canonical_absolute(path)?;
+            let verified = verify_transferred_bundle(&input_path)?;
+            let (file, digest) = verified.isolated_launch_capability()?;
+            let identity = Identity::from_metadata(&file.metadata().map_err(|_| rejected())?);
+            Ok((verified, file, digest, identity))
+        })
+        .transpose()?;
+    let input_transfer_sha256 = input_capability
+        .as_ref()
+        .map_or_else(|| "00".repeat(32), |(_, _, digest, _)| digest.clone());
 
     // Every public input and executable substitution check precedes any key descriptor open.
     rebind_executable(&bwrap, FilePolicy::Bwrap)?;
     rebind_executable(&signer, FilePolicy::Signer)?;
-    verified_input.isolated_launch_capability()?;
+    if let Some((verified, _, _, _)) = &input_capability {
+        verified.isolated_launch_capability()?;
+    }
 
     // This process and every later exec inherit an irreversible no-core boundary before the key
     // is opened. The inner signer separately resets dumpability because exec may restore it.
@@ -235,29 +262,45 @@ fn launch_impl(
         .as_ref()
         .map(|path| open_key_capability(path))
         .transpose()?;
-    if (request.ceremony == Ceremony::Sign) != key.is_some() {
+    if matches!(request.ceremony, Ceremony::Sign | Ceremony::InspectKey) != key.is_some() {
         return Err(rejected());
     }
 
-    // Final named-identity checkpoints happen before the fresh output becomes visible.
+    // Final named-identity checkpoints happen before any fresh output becomes visible.
     rebind_executable(&bwrap, FilePolicy::Bwrap)?;
     rebind_executable(&signer, FilePolicy::Signer)?;
-    verify_input_capability(&input, input_identity)?;
+    if let Some((_, input, _, identity)) = &input_capability {
+        verify_input_capability(input, *identity)?;
+    }
     if let Some((path, file, identity)) = &key {
         rebind_exact(path, file, *identity, FilePolicy::Key)?;
     }
 
-    let output = if request.ceremony == Ceremony::RecoverSign {
-        open_existing_output(&request.output)?
-    } else {
-        create_fresh_output(&request.output)?
-    };
-    let output_identity = Identity::from_metadata(&output.metadata().map_err(|_| rejected())?);
-    verify_output_capability(&output, output_identity)?;
+    let output = request
+        .output
+        .as_ref()
+        .map(|path| {
+            if request.ceremony == Ceremony::RecoverSign {
+                open_existing_output(path)
+            } else {
+                create_fresh_output(path)
+            }
+        })
+        .transpose()?;
+    let output_identity = output
+        .as_ref()
+        .map(|output| {
+            let identity = Identity::from_metadata(&output.metadata().map_err(|_| rejected())?);
+            verify_output_capability(output, identity)?;
+            Ok(identity)
+        })
+        .transpose()?;
     rebind_executable(&bwrap, FilePolicy::Bwrap)?;
     rebind_executable(&signer, FilePolicy::Signer)?;
-    verified_input.isolated_launch_capability()?;
-    verify_input_capability(&input, input_identity)?;
+    if let Some((verified, input, _, identity)) = &input_capability {
+        verified.isolated_launch_capability()?;
+        verify_input_capability(input, *identity)?;
+    }
     if let Some((path, file, identity)) = &key {
         rebind_exact(path, file, *identity, FilePolicy::Key)?;
     }
@@ -266,14 +309,14 @@ fn launch_impl(
     rebind_executable(&signer, FilePolicy::Signer)?;
     if request.ceremony == Ceremony::Sign {
         write_recovery_binding(
-            &output,
+            output.as_ref().ok_or_else(rejected)?,
             &config_sha256,
             &signer.sha256,
             &input_transfer_sha256,
         )?;
     } else if request.ceremony == Ceremony::RecoverSign {
         verify_recovery_binding(
-            &output,
+            output.as_ref().ok_or_else(rejected)?,
             &config_sha256,
             &signer.sha256,
             &input_transfer_sha256,
@@ -283,8 +326,10 @@ fn launch_impl(
     let seccomp = create_launcher_seccomp()?;
     let inherited = [
         Some(signer.file.as_raw_fd()),
-        Some(input.as_raw_fd()),
-        Some(output.as_raw_fd()),
+        input_capability
+            .as_ref()
+            .map(|(_, input, _, _)| input.as_raw_fd()),
+        output.as_ref().map(OutputCapability::as_raw_fd),
         key.as_ref().map(|(_, file, _)| file.as_raw_fd()),
         Some(seccomp.as_raw_fd()),
     ];
@@ -298,7 +343,11 @@ fn launch_impl(
     command
         .env_clear()
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(if request.ceremony == Ceremony::InspectKey {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stderr(Stdio::null())
         .args([
             "--unshare-all",
@@ -362,13 +411,13 @@ fn launch_impl(
             "--ro-bind-fd",
             &signer.file.as_raw_fd().to_string(),
             "/bin/catalog-sign",
-            "--ro-bind-fd",
-            &input.as_raw_fd().to_string(),
-            "/input",
-            "--bind-fd",
-            &output.as_raw_fd().to_string(),
-            "/output",
         ]);
+    if let Some((_, input, _, _)) = &input_capability {
+        command.args(["--ro-bind-fd", &input.as_raw_fd().to_string(), "/input"]);
+    }
+    if let Some(output) = &output {
+        command.args(["--bind-fd", &output.as_raw_fd().to_string(), "/output"]);
+    }
     if let Some((_, key, _)) = &key {
         command.args([
             "--dir",
@@ -435,25 +484,113 @@ fn launch_impl(
                 "/output/signed-release-bundle",
             ]);
         }
+        Ceremony::InspectKey => {
+            command.args(["inspect-key", "--key", "/key/runtime-catalog-private.pem"]);
+        }
         Ceremony::IsolationProbe => {
             command.arg("__isolation-probe");
         }
     }
 
-    let status = command.status().map_err(|_| rejected())?;
+    let (status, inspection_stdout) = if request.ceremony == Ceremony::InspectKey {
+        let mut child = command.spawn().map_err(|_| rejected())?;
+        let mut stdout = child.stdout.take().ok_or_else(rejected)?;
+        let mut bytes = Vec::with_capacity(513);
+        (&mut stdout)
+            .take(513)
+            .read_to_end(&mut bytes)
+            .map_err(|_| rejected())?;
+        let status = child.wait().map_err(|_| rejected())?;
+        (status, Some(bytes))
+    } else {
+        (command.status().map_err(|_| rejected())?, None)
+    };
     if !status.success() {
         if request.ceremony == Ceremony::Sign {
-            settle_previsibility_recovery_binding(&output)?;
+            settle_previsibility_recovery_binding(output.as_ref().ok_or_else(rejected)?)?;
         }
         return Err(rejected());
     }
-    verify_output_capability(&output, output_identity)?;
+    if let Some(stdout) = inspection_stdout {
+        return validate_inspection_output(&stdout).map(Some);
+    }
+    let output = output.as_ref().ok_or_else(rejected)?;
+    verify_output_capability(output, output_identity.ok_or_else(rejected)?)?;
     let manifest = output.join_path("transfer-manifest-v1.json")?;
     let metadata = manifest.metadata().map_err(|_| rejected())?;
     if !secure_regular(&metadata, current_euid(), 0o400, MAX_CONFIG_BYTES * 64) {
         return Err(rejected());
     }
-    Ok(())
+    Ok(None)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InspectedKeyIdentity {
+    key_id: String,
+    public_key: String,
+    fingerprint: String,
+}
+
+fn validate_inspection_output(bytes: &[u8]) -> Result<String, SignError> {
+    let canonical = bytes.strip_suffix(b"\n").ok_or_else(rejected)?;
+    if canonical.is_empty() || canonical.len() > 512 || canonical.contains(&b'\n') {
+        return Err(rejected());
+    }
+    let identity: InspectedKeyIdentity =
+        serde_json::from_slice(canonical).map_err(|_| rejected())?;
+    if serde_jcs::to_vec(&serde_json::json!({
+        "key_id": identity.key_id,
+        "public_key": identity.public_key,
+        "fingerprint": identity.fingerprint,
+    }))
+    .map_err(|_| rejected())?
+        != canonical
+    {
+        return Err(rejected());
+    }
+    let public_key = decode_public_key(&identity.public_key)?;
+    let digest = Sha256::digest(public_key);
+    let expected_id = format!("runtime-catalog-ed25519-{}", lower_hex(&digest[..8]));
+    if identity.key_id != expected_id || identity.fingerprint != lower_hex(&digest) {
+        return Err(rejected());
+    }
+    String::from_utf8(canonical.to_vec()).map_err(|_| rejected())
+}
+
+fn decode_public_key(value: &str) -> Result<[u8; 32], SignError> {
+    if value.len() != 43 || value.contains('=') {
+        return Err(rejected());
+    }
+    let decode = |byte| match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'-' => Some(62),
+        b'_' => Some(63),
+        _ => None,
+    };
+    let mut output = Vec::with_capacity(32);
+    for chunk in value.as_bytes().chunks(4) {
+        let a = decode(chunk[0]).ok_or_else(rejected)?;
+        let b = decode(chunk[1]).ok_or_else(rejected)?;
+        output.push((a << 2) | (b >> 4));
+        if chunk.len() >= 3 {
+            let c = decode(chunk[2]).ok_or_else(rejected)?;
+            output.push((b << 4) | (c >> 2));
+            if chunk.len() == 4 {
+                let d = decode(chunk[3]).ok_or_else(rejected)?;
+                output.push((c << 6) | d);
+            } else if c & 0x03 != 0 {
+                return Err(rejected());
+            }
+        }
+    }
+    output.try_into().map_err(|_| rejected())
+}
+
+fn lower_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 #[derive(Clone, Copy)]
@@ -1357,7 +1494,43 @@ const fn rejected() -> SignError {
 
 #[cfg(test)]
 mod tests {
-    use super::authorized_recovery_mode_combination;
+    use std::ffi::OsString;
+
+    use super::{Ceremony, authorized_recovery_mode_combination, parse_request};
+
+    #[test]
+    fn inspection_ceremony_accepts_only_config_and_key() {
+        let arguments = [
+            "inspect-key",
+            "--config",
+            "/secure/launcher.json",
+            "--key",
+            "/secure/private.pem",
+        ]
+        .map(OsString::from);
+        let request = parse_request(&arguments).unwrap();
+        assert!(request.ceremony == Ceremony::InspectKey);
+        assert!(request.input.is_none());
+        assert!(request.output.is_none());
+        assert!(request.key.is_some());
+
+        let mut with_output = arguments.to_vec();
+        with_output.extend([OsString::from("--output"), OsString::from("/tmp/out")]);
+        assert!(parse_request(&with_output).is_err());
+    }
+
+    #[test]
+    fn inspection_output_is_canonical_bounded_public_identity_only() {
+        let identity = b"{\"fingerprint\":\"66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925\",\"key_id\":\"runtime-catalog-ed25519-66687aadf862bd77\",\"public_key\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"}\n";
+        assert_eq!(
+            super::validate_inspection_output(identity)
+                .unwrap()
+                .as_bytes(),
+            &identity[..identity.len() - 1]
+        );
+        assert!(super::validate_inspection_output(b"{}\n").is_err());
+        assert!(super::validate_inspection_output(&vec![b'A'; 513]).is_err());
+    }
 
     #[test]
     fn recovery_mode_combinations_are_exact() {

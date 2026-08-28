@@ -78,6 +78,29 @@ fn direct_and_exact_marker_only_sign_fail_before_key_open_or_output() {
             "rejected inner execution opened the fixture key"
         );
     }
+
+    let inspection_witness = InotifyKeyOpenWitness::new(&key);
+    let direct_inspection = Command::new(env!("CARGO_BIN_EXE_catalog-sign"))
+        .env_clear()
+        .args(["inspect-key", "--key", key.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!direct_inspection.status.success());
+    assert!(direct_inspection.stdout.is_empty());
+    assert_eq!(direct_inspection.stderr, b"catalog signing failed\n");
+    assert!(
+        !inspection_witness.observed_open(),
+        "direct inspection opened the key before isolation"
+    );
+}
+
+#[test]
+fn inspection_mode_has_a_key_mount_but_no_input_or_output_mount() {
+    let source =
+        fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/isolation.rs")).unwrap();
+    assert!(source.contains("IsolationMode::InspectKey"));
+    assert!(source.contains("mode.requires_input()"));
+    assert!(source.contains("mode.requires_output()"));
 }
 
 #[test]
@@ -230,7 +253,7 @@ fn isolation_entry_is_the_first_operation_in_inner_main() {
     assert!(
         source.find("enter_signer_isolation").unwrap()
             < source
-                .find("let _compiled_identity = production_key_identity()")
+                .find("let _compiled_identity = active_production_key_identity()")
                 .unwrap()
     );
     assert!(

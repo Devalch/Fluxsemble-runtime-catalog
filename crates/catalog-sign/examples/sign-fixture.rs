@@ -5,7 +5,7 @@ use std::{
     path::Path,
 };
 
-use catalog_core::production_key_identity;
+use catalog_core::active_production_key_identity;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -36,7 +36,7 @@ fn main() {
 
 fn run() -> Result<(), ()> {
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
-    if arguments.len() != 1 || FIXTURE_KEY_ID == production_key_identity().key_id() {
+    if arguments.len() != 1 || FIXTURE_KEY_ID == active_production_key_identity().key_id() {
         return Err(());
     }
     let root = Path::new(&arguments[0]);

@@ -21,12 +21,6 @@ const MAX_JSON_NESTING_DEPTH: usize = 128;
 const SIGNED_CATALOG_ENVELOPE_VERSION: u16 = 1;
 const SIGNATURE_ALGORITHM: &str = "ed25519";
 const PRODUCTION_KEY_ID_PREFIX: &str = "runtime-catalog-ed25519-";
-const PRODUCTION_KEY_ID: &str = "runtime-catalog-ed25519-d1a64e2d55c8e5d8";
-const PRODUCTION_PUBLIC_KEY_BASE64URL: &str = "t9wPqaH5olhFkcPEcH6QPHX9AsCcrwxiKdzQo8xjW2o";
-const PRODUCTION_PUBLIC_KEY: [u8; 32] = [
-    0xb7, 0xdc, 0x0f, 0xa9, 0xa1, 0xf9, 0xa2, 0x58, 0x45, 0x91, 0xc3, 0xc4, 0x70, 0x7e, 0x90, 0x3c,
-    0x75, 0xfd, 0x02, 0xc0, 0x9c, 0xaf, 0x0c, 0x62, 0x29, 0xdc, 0xd0, 0xa3, 0xcc, 0x63, 0x5b, 0x6a,
-];
 
 #[cfg(feature = "fixture-tools")]
 const FIXTURE_KEY_ID: &str = "catalog-test-key-v1";
@@ -36,15 +30,30 @@ const FIXTURE_PUBLIC_KEY: [u8; 32] = [
     0x67, 0xe4, 0xd6, 0x30, 0x9b, 0xa5, 0x0d, 0x5f, 0x1d, 0xdc, 0x86, 0x64, 0x12, 0x55, 0x31, 0xb8,
 ];
 
-/// The one repository-compiled production verification identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProductionKeyStatus {
+    ActiveForSigning,
+    VerificationOnly,
+    Retired,
+}
+
+/// One immutable identity from the repository-reviewed, build-time embedded production keyring.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProductionKeyIdentity {
+    generation: u32,
     key_id: &'static str,
     public_key_base64url: &'static str,
     public_key: [u8; 32],
+    status: ProductionKeyStatus,
+    activated_at: &'static str,
 }
 
 impl ProductionKeyIdentity {
+    #[must_use]
+    pub const fn generation(&self) -> u32 {
+        self.generation
+    }
+
     #[must_use]
     pub const fn key_id(&self) -> &'static str {
         self.key_id
@@ -59,17 +68,90 @@ impl ProductionKeyIdentity {
     pub const fn public_key_bytes(&self) -> &[u8; 32] {
         &self.public_key
     }
+
+    #[must_use]
+    pub const fn status(&self) -> ProductionKeyStatus {
+        self.status
+    }
+
+    #[must_use]
+    pub const fn activated_at(&self) -> &'static str {
+        self.activated_at
+    }
+
+    #[must_use]
+    pub const fn is_active_for_signing(&self) -> bool {
+        matches!(self.status, ProductionKeyStatus::ActiveForSigning)
+    }
+
+    #[must_use]
+    pub const fn is_verification_only(&self) -> bool {
+        matches!(self.status, ProductionKeyStatus::VerificationOnly)
+    }
+
+    #[must_use]
+    pub const fn is_retired(&self) -> bool {
+        matches!(self.status, ProductionKeyStatus::Retired)
+    }
 }
 
-static PRODUCTION_IDENTITY: ProductionKeyIdentity = ProductionKeyIdentity {
-    key_id: PRODUCTION_KEY_ID,
-    public_key_base64url: PRODUCTION_PUBLIC_KEY_BASE64URL,
-    public_key: PRODUCTION_PUBLIC_KEY,
+include!(concat!(env!("OUT_DIR"), "/production_signing_keyring.rs"));
+
+#[derive(Debug)]
+pub struct ProductionKeyringV1 {
+    entries: &'static [ProductionKeyIdentity],
+    sha256: &'static str,
+}
+
+impl ProductionKeyringV1 {
+    #[must_use]
+    pub const fn schema_version(&self) -> u16 {
+        1
+    }
+
+    #[must_use]
+    pub const fn entries(&self) -> &'static [ProductionKeyIdentity] {
+        self.entries
+    }
+
+    #[must_use]
+    pub fn active_signing_identity(&self) -> &'static ProductionKeyIdentity {
+        self.entries
+            .iter()
+            .find(|entry| entry.is_active_for_signing())
+            .expect("build script enforces exactly one active production signing key")
+    }
+
+    #[must_use]
+    pub fn verification_identity(&self, key_id: &str) -> Option<&'static ProductionKeyIdentity> {
+        self.entries.iter().find(|entry| {
+            entry.key_id() == key_id
+                && matches!(
+                    entry.status(),
+                    ProductionKeyStatus::ActiveForSigning | ProductionKeyStatus::VerificationOnly
+                )
+        })
+    }
+
+    #[must_use]
+    pub const fn sha256(&self) -> &'static str {
+        self.sha256
+    }
+}
+
+static PRODUCTION_KEYRING: ProductionKeyringV1 = ProductionKeyringV1 {
+    entries: EMBEDDED_PRODUCTION_KEYS,
+    sha256: EMBEDDED_KEYRING_SHA256,
 };
 
 #[must_use]
-pub fn production_key_identity() -> &'static ProductionKeyIdentity {
-    &PRODUCTION_IDENTITY
+pub const fn production_keyring() -> &'static ProductionKeyringV1 {
+    &PRODUCTION_KEYRING
+}
+
+#[must_use]
+pub fn active_production_key_identity() -> &'static ProductionKeyIdentity {
+    production_keyring().active_signing_identity()
 }
 
 #[must_use]
@@ -140,18 +222,28 @@ impl VerifiedReleaseBundleManifestV1 {
     }
 }
 
-/// Verifies an envelope using only the repository-compiled production identity.
+/// Verifies an envelope using only a matching entry in the embedded reviewed production keyring.
 pub fn verify_signed_catalog(bytes: &[u8]) -> Result<VerifiedCatalogV1, CatalogSignatureError> {
-    verify_signed_catalog_with_identity(bytes, production_identity())
+    let spans = scan_signed_envelope(bytes)?;
+    let key_id: String = parse_scalar(bytes, &spans.key_id)?;
+    let identity = production_keyring()
+        .verification_identity(&key_id)
+        .map(VerificationIdentity::from)
+        .ok_or_else(invalid_catalog)?;
+    verify_signed_catalog_with_identity(bytes, identity)
 }
 
-/// Verifies a release-bundle manifest using only the compiled production identity.
+/// Verifies a release-bundle manifest using a matching embedded reviewed production key.
 pub fn verify_signed_release_bundle_manifest(
     bytes: &[u8],
 ) -> Result<VerifiedReleaseBundleManifestV1, CatalogSignatureError> {
     let manifest =
         SignedReleaseBundleManifestV1::from_json(bytes).map_err(|_| invalid_release_bundle())?;
-    verify_release_manifest_with_identity(&manifest, production_identity())?;
+    let identity = production_keyring()
+        .verification_identity(manifest.signature().key_id().as_str())
+        .map(VerificationIdentity::from)
+        .ok_or_else(invalid_release_bundle)?;
+    verify_release_manifest_with_identity(&manifest, identity)?;
     Ok(VerifiedReleaseBundleManifestV1 { manifest })
 }
 
@@ -188,10 +280,12 @@ struct VerificationIdentity {
     public_key: [u8; 32],
 }
 
-const fn production_identity() -> VerificationIdentity {
-    VerificationIdentity {
-        key_id: PRODUCTION_KEY_ID,
-        public_key: PRODUCTION_PUBLIC_KEY,
+impl From<&'static ProductionKeyIdentity> for VerificationIdentity {
+    fn from(identity: &'static ProductionKeyIdentity) -> Self {
+        Self {
+            key_id: identity.key_id(),
+            public_key: *identity.public_key_bytes(),
+        }
     }
 }
 
@@ -722,14 +816,63 @@ mod tests {
     }
 
     #[test]
-    fn production_identity_is_exact_and_canonical() {
-        assert_eq!(
-            encode_base64url_no_pad(PRODUCTION_IDENTITY.public_key_bytes()),
-            PRODUCTION_PUBLIC_KEY_BASE64URL
+    fn verification_only_identity_is_eligible_for_verification_but_not_active_signing() {
+        static TRANSITION_KEYS: [ProductionKeyIdentity; 3] = [
+            ProductionKeyIdentity {
+                generation: 1,
+                key_id: "runtime-catalog-ed25519-old",
+                public_key_base64url: "old-public-key",
+                public_key: [1; 32],
+                status: ProductionKeyStatus::VerificationOnly,
+                activated_at: "2026-01-01T00:00:00Z",
+            },
+            ProductionKeyIdentity {
+                generation: 2,
+                key_id: "runtime-catalog-ed25519-new",
+                public_key_base64url: "new-public-key",
+                public_key: [2; 32],
+                status: ProductionKeyStatus::ActiveForSigning,
+                activated_at: "2026-08-28T00:00:00Z",
+            },
+            ProductionKeyIdentity {
+                generation: 3,
+                key_id: "runtime-catalog-ed25519-retired",
+                public_key_base64url: "retired-public-key",
+                public_key: [3; 32],
+                status: ProductionKeyStatus::Retired,
+                activated_at: "2026-09-01T00:00:00Z",
+            },
+        ];
+        let keyring = ProductionKeyringV1 {
+            entries: &TRANSITION_KEYS,
+            sha256: "fixture",
+        };
+        assert!(
+            keyring
+                .verification_identity("runtime-catalog-ed25519-old")
+                .is_some()
         );
         assert_eq!(
-            derive_runtime_catalog_key_id(PRODUCTION_IDENTITY.public_key_bytes()),
-            PRODUCTION_KEY_ID
+            keyring.active_signing_identity().key_id(),
+            "runtime-catalog-ed25519-new"
+        );
+        assert!(
+            keyring
+                .verification_identity("runtime-catalog-ed25519-retired")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn active_production_identity_is_exact_and_canonical() {
+        let identity = active_production_key_identity();
+        assert_eq!(
+            encode_base64url_no_pad(identity.public_key_bytes()),
+            identity.public_key_base64url()
+        );
+        assert_eq!(
+            derive_runtime_catalog_key_id(identity.public_key_bytes()),
+            identity.key_id()
         );
     }
 }

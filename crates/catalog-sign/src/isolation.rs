@@ -29,6 +29,7 @@ pub enum IsolationMode {
     Finalize,
     Sign,
     RecoverSign,
+    InspectKey,
     IsolationProbe,
 }
 
@@ -39,13 +40,22 @@ impl IsolationMode {
             "finalize" => Ok(Self::Finalize),
             "sign" => Ok(Self::Sign),
             "recover-sign" => Ok(Self::RecoverSign),
+            "inspect-key" => Ok(Self::InspectKey),
             "isolation-probe" => Ok(Self::IsolationProbe),
             _ => Err(rejected()),
         }
     }
 
     fn requires_key(self) -> bool {
-        self == Self::Sign
+        matches!(self, Self::Sign | Self::InspectKey)
+    }
+
+    fn requires_input(self) -> bool {
+        self != Self::InspectKey
+    }
+
+    fn requires_output(self) -> bool {
+        self != Self::InspectKey
     }
 }
 
@@ -100,7 +110,7 @@ impl IsolationAttestationV1 {
 /// ```
 pub struct SignerIsolation {
     attestation: IsolationAttestationV1,
-    verified_transfer: VerifiedTransferredBundle,
+    verified_transfer: Option<VerifiedTransferredBundle>,
 }
 
 impl SignerIsolation {
@@ -109,8 +119,8 @@ impl SignerIsolation {
         &self.attestation
     }
 
-    pub(crate) fn verified_transfer(&self) -> &VerifiedTransferredBundle {
-        &self.verified_transfer
+    pub(crate) fn verified_transfer(&self) -> Result<&VerifiedTransferredBundle, SignError> {
+        self.verified_transfer.as_ref().ok_or_else(rejected)
     }
 }
 
@@ -171,11 +181,16 @@ pub fn enter_signer_isolation() -> Result<SignerIsolation, SignError> {
     verify_network_namespace()?;
     verify_capabilities_and_kernel_status()?;
     verify_open_descriptors()?;
-    let verified_transfer = verify_transferred_bundle(Path::new("/input"))?;
-    let input_transfer_sha256 = verified_transfer.transfer_manifest_sha256().to_owned();
-    if input_transfer_sha256 != expected_input_digest {
-        return Err(rejected());
-    }
+    let verified_transfer = if mode.requires_input() {
+        let transfer = verify_transferred_bundle(Path::new("/input"))?;
+        if transfer.transfer_manifest_sha256() != expected_input_digest {
+            return Err(rejected());
+        }
+        Some(transfer)
+    } else {
+        None
+    };
+    let input_transfer_sha256 = expected_input_digest.to_owned();
 
     install_inner_seccomp_filter()?;
     // SAFETY: PR_GET_SECCOMP has no pointer argument.
@@ -384,11 +399,15 @@ fn verify_mounts(mode: IsolationMode) -> Result<Vec<String>, SignError> {
         "/dev/tty",
         "/dev/urandom",
         "/dev/zero",
-        "/input",
-        "/output",
         "/proc",
         "/tmp",
     ]);
+    if mode.requires_input() {
+        expected.insert("/input");
+    }
+    if mode.requires_output() {
+        expected.insert("/output");
+    }
     if mode.requires_key() {
         expected.insert("/key/runtime-catalog-private.pem");
     }
@@ -396,15 +415,15 @@ fn verify_mounts(mode: IsolationMode) -> Result<Vec<String>, SignError> {
         return Err(rejected());
     }
     verify_private_root_topology(&mounts)?;
-    for path in ["/bin/catalog-sign", "/input"] {
-        if !mount_is_read_only(&mounts, path) {
-            return Err(rejected());
-        }
+    if !mount_is_read_only(&mounts, "/bin/catalog-sign")
+        || (mode.requires_input() && !mount_is_read_only(&mounts, "/input"))
+    {
+        return Err(rejected());
     }
     if mode.requires_key() && !mount_is_read_only(&mounts, "/key/runtime-catalog-private.pem") {
         return Err(rejected());
     }
-    if mount_is_read_only(&mounts, "/output")
+    if (mode.requires_output() && mount_is_read_only(&mounts, "/output"))
         || mounts
             .get("/proc")
             .is_none_or(|mount| mount.filesystem != "proc")
@@ -910,6 +929,7 @@ pub fn emit_reverse_transfer_manifest(isolation: &SignerIsolation) -> Result<(),
     let expected_top = match attestation.mode {
         IsolationMode::AssembleIntent | IsolationMode::Finalize => "candidate.json",
         IsolationMode::Sign | IsolationMode::RecoverSign => "signed-release-bundle",
+        IsolationMode::InspectKey => return Err(rejected()),
         IsolationMode::IsolationProbe => "isolation-probe-v1.json",
     };
     let output = Path::new("/output");
@@ -1085,6 +1105,7 @@ fn verify_existing_reverse_manifest(
             historical_original == "finalize" && historical_mode == "finalize"
         }
         IsolationMode::Sign => historical_original == "sign" && historical_mode == "sign",
+        IsolationMode::InspectKey => false,
         IsolationMode::IsolationProbe => {
             historical_original == "isolation-probe" && historical_mode == "isolation-probe"
         }

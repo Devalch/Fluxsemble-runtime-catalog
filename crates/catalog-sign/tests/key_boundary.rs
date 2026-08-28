@@ -18,7 +18,7 @@ fn key_reader_is_private_and_production_cli_has_no_fixture_authority() {
     assert!(!key_source.contains("pub fn read_signing_key("));
     assert!(key_source.contains("fn encode_standard_base64(bytes: &[u8]) -> Zeroizing<String>"));
     assert!(!key_source.contains("fn encode_standard_base64(bytes: &[u8]) -> String"));
-    assert!(main_source.contains("production_key_identity"));
+    assert!(main_source.contains("active_production_key_identity"));
     assert!(!main_source.contains("catalog-test-key-v1"));
     assert!(!main_source.contains("fixture-tools"));
 
@@ -29,6 +29,10 @@ fn key_reader_is_private_and_production_cli_has_no_fixture_authority() {
         include_str!("../src/signing.rs"),
     ]
     .concat();
+    assert!(key_source.contains("fn inspect_signing_key("));
+    assert!(key_source.contains("active_production_key_identity()"));
+    assert!(!key_source.contains("read_signing_key(path, production_key_identity())"));
+
     for forbidden in [
         "std::net",
         "TcpStream",

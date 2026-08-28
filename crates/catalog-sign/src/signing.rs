@@ -16,8 +16,8 @@ use std::{
 use catalog_core::{
     BundleInventoryV1, CatalogPayloadV1, CatalogSourceV1, CompatibilityQualificationV1,
     InitialPiReleaseIntentV1, InputSourceKind, ProviderExtensionV1, SignedReleaseBundleManifestV1,
-    VerifiedInputBundleV1, canonical_catalog_payload, catalog_source_digest,
-    compatibility_input_digest, initial_release_intent_digest, production_key_identity,
+    VerifiedInputBundleV1, active_production_key_identity, canonical_catalog_payload,
+    catalog_source_digest, compatibility_input_digest, initial_release_intent_digest,
     qualification_record_digest, release_bundle_signing_bytes, verify_qualification,
     verify_signed_catalog, verify_signed_release_bundle_manifest, verify_signed_release_inventory,
 };
@@ -798,7 +798,7 @@ fn sign_release(request: SignReleaseRequest<'_>) -> Result<SignedReleaseBundleV1
     let signed_bytes = sign_candidate(
         &candidate,
         signing_key.as_dalek(),
-        production_key_identity().key_id(),
+        active_production_key_identity().key_id(),
     )?;
     drop(signing_key);
     verify_signed_bytes(&signed_bytes, SignatureVerificationPolicy::Production)?;
@@ -3282,7 +3282,7 @@ fn secure_candidate_file(metadata: &fs::Metadata, mode: u32, links: u64) -> bool
 #[cfg(feature = "fixture-tools")]
 pub fn generate_fixture_envelope(payload_bytes: &[u8]) -> Result<Vec<u8>, SignError> {
     const FIXTURE_KEY_ID: &str = "catalog-test-key-v1";
-    if FIXTURE_KEY_ID == production_key_identity().key_id() {
+    if FIXTURE_KEY_ID == active_production_key_identity().key_id() {
         return Err(SignError::SigningKeyRejected);
     }
     let payload = CatalogPayloadV1::from_json(payload_bytes).map_err(|_| candidate_rejected())?;

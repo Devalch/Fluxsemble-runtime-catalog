@@ -83,16 +83,28 @@ pub fn run_isolated_cli(isolation: &SignerIsolation, args: &[String]) -> Result<
             "--output",
             "/output/signed-release-bundle",
         ][..],
+        IsolationMode::InspectKey => {
+            &["inspect-key", "--key", "/key/runtime-catalog-private.pem"][..]
+        }
         IsolationMode::IsolationProbe => &["__isolation-probe"][..],
     };
     if args.iter().map(String::as_str).ne(expected.iter().copied()) {
         return Err(SignError::ArgumentRejected);
     }
-    if isolation.attestation().mode() == IsolationMode::IsolationProbe {
-        isolation::run_isolation_probe(isolation)?;
-        Ok("isolation probe complete".to_owned())
-    } else {
-        signing::run_isolated_cli(isolation.verified_transfer(), args)
+    match isolation.attestation().mode() {
+        IsolationMode::IsolationProbe => {
+            isolation::run_isolation_probe(isolation)?;
+            Ok("isolation probe complete".to_owned())
+        }
+        IsolationMode::InspectKey => {
+            let inspected =
+                key::inspect_signing_key(Path::new("/key/runtime-catalog-private.pem"))?;
+            String::from_utf8(
+                serde_jcs::to_vec(&inspected).map_err(|_| SignError::VerificationFailed)?,
+            )
+            .map_err(|_| SignError::VerificationFailed)
+        }
+        _ => signing::run_isolated_cli(isolation.verified_transfer()?, args),
     }
 }
 
@@ -103,7 +115,7 @@ pub fn recover_production_isolated_output(isolation: &SignerIsolation) -> Result
     ) {
         return Err(SignError::ArgumentRejected);
     }
-    signing::recover_production_isolated_output(isolation.verified_transfer())
+    signing::recover_production_isolated_output(isolation.verified_transfer()?)
 }
 
 #[cfg(feature = "fixture-tools")]
@@ -133,7 +145,7 @@ pub fn run_fixture_isolated_cli(
     if args.iter().map(String::as_str).ne(expected.iter().copied()) {
         return Err(SignError::ArgumentRejected);
     }
-    signing::run_fixture_isolated_cli(isolation.verified_transfer(), args)
+    signing::run_fixture_isolated_cli(isolation.verified_transfer()?, args)
 }
 
 #[cfg(feature = "fixture-tools")]
@@ -144,7 +156,7 @@ pub fn recover_fixture_isolated_output(isolation: &SignerIsolation) -> Result<()
     ) {
         return Err(SignError::ArgumentRejected);
     }
-    signing::recover_fixture_isolated_output(isolation.verified_transfer())
+    signing::recover_fixture_isolated_output(isolation.verified_transfer()?)
 }
 
 #[must_use]
