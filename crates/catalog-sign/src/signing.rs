@@ -5330,6 +5330,7 @@ mod tests {
             let mut qualification_value = json!({
                 "schema_version": 1,
                 "compatibility_input_sha256": compatibility,
+                "trusted_signing_keyring_sha256": catalog_core::production_keyring().sha256(),
                 "fluxsemble": build_value,
                 "provider": "builtin:pi",
                 "target": "linux_x86_64",
@@ -5533,6 +5534,7 @@ mod tests {
             let qualification_value = json!({
                 "schema_version": 1,
                 "compatibility_input_sha256": compatibility,
+                "trusted_signing_keyring_sha256": catalog_core::production_keyring().sha256(),
                 "fluxsemble": build_value,
                 "provider": "builtin:pi",
                 "target": "linux_x86_64",

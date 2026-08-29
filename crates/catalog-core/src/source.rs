@@ -419,11 +419,22 @@ impl CatalogTag {
     }
 }
 
-/// Domain-separated compatibility digest over runtime semantics and exact final build/profile only.
+/// Domain-separated compatibility digest over runtime semantics, final build/profile, and the
+/// reviewed producer keyring that the consumer must trust.
 pub fn compatibility_input_digest(
     intent: &InitialPiReleaseIntentV1,
     build: &FluxsembleBuildBindingV1,
 ) -> Result<[u8; 32], CoreError> {
+    compatibility_input_digest_with_keyring(intent, build, crate::production_keyring().sha256())
+}
+
+pub fn compatibility_input_digest_with_keyring(
+    intent: &InitialPiReleaseIntentV1,
+    build: &FluxsembleBuildBindingV1,
+    trusted_signing_keyring_sha256: &str,
+) -> Result<[u8; 32], CoreError> {
+    let trusted_signing_keyring_sha256 =
+        Sha256Hex::parse(trusted_signing_keyring_sha256.to_owned())?;
     let mut release = serde_json::to_value(&intent.release).map_err(|_| invalid())?;
     release
         .pointer_mut("/release")
@@ -437,6 +448,7 @@ pub fn compatibility_input_digest(
         fluxsemble_requirement: &'a ExactVersionRequirement,
         release: Value,
         build: &'a FluxsembleBuildBindingV1,
+        trusted_signing_keyring_sha256: &'a Sha256Hex,
     }
     domain_digest(
         COMPATIBILITY_INPUT_DOMAIN,
@@ -445,6 +457,7 @@ pub fn compatibility_input_digest(
             fluxsemble_requirement: &intent.fluxsemble_requirement,
             release,
             build,
+            trusted_signing_keyring_sha256: &trusted_signing_keyring_sha256,
         },
     )
 }

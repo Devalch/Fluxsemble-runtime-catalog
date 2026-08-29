@@ -1,13 +1,20 @@
 use crate::{WizardError, cli::RunMode};
 use serde::{Deserialize, Serialize};
-use std::{fs, io::ErrorKind, path::Path};
+use std::{
+    fs,
+    io::ErrorKind,
+    path::{Path, PathBuf},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ReleasePhase {
     Planned,
     InputsDiscovered,
     Acquired,
     CandidateAssembled,
+    AwaitingQualification,
+    QualificationImported,
     Qualified,
     Signed,
     LocalStaged,
@@ -26,6 +33,9 @@ pub struct WizardState {
     pub mode: RunMode,
     pub phase: ReleasePhase,
     pub signing_key_generation: u32,
+    pub catalog_source_commit: String,
+    pub catalog_source_tree_sha256: String,
+    pub work_dir: PathBuf,
 }
 
 impl WizardState {
@@ -70,8 +80,16 @@ mod tests {
             mode: RunMode::PublishCapable,
             phase: ReleasePhase::Qualified,
             signing_key_generation: 2,
+            catalog_source_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            catalog_source_tree_sha256: "11".repeat(32),
+            work_dir: PathBuf::from(".release-work/sequence-2"),
         };
         let bytes = serde_json::to_vec(&state).unwrap();
+        assert!(
+            std::str::from_utf8(&bytes)
+                .unwrap()
+                .contains("\"phase\":\"qualified\"")
+        );
         let decoded: WizardState = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(decoded, state);
     }
@@ -89,6 +107,9 @@ mod tests {
             mode: RunMode::DryRun,
             phase: ReleasePhase::Planned,
             signing_key_generation: 1,
+            catalog_source_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            catalog_source_tree_sha256: "11".repeat(32),
+            work_dir: directory.clone(),
         };
 
         state.save(&path).unwrap();

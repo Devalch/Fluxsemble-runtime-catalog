@@ -341,6 +341,25 @@ mod tests {
     }
 
     #[test]
+    fn resume_parses_qualification_handoff_path() {
+        let parsed = parse_args(&args(&[
+            "resume",
+            "--qualification",
+            "/safe/returned-handoff",
+        ]))
+        .unwrap();
+        match parsed {
+            Command::Resume(options) => {
+                assert_eq!(
+                    options.qualification.as_deref(),
+                    Some("/safe/returned-handoff")
+                );
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
     fn release_rejects_dry_run_and_publish_together() {
         assert!(matches!(
             parse_args(&args(&["release", "--dry-run", "--publish"])),

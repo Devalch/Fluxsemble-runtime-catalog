@@ -4,6 +4,7 @@ pub mod intent;
 pub mod key_rotation;
 pub mod npm;
 pub mod prompt;
+pub mod qualification;
 pub mod sequence;
 pub mod state;
 
@@ -15,5 +16,6 @@ pub enum WizardError {
     State,
     ExternalCommand,
     Discovery,
+    Qualification,
     UserDeclined,
 }

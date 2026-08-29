@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     BoundedId, CatalogSourceV1, CatalogTarget, CatalogTimestamp, CoreError, ExactVersion,
-    FluxsembleBuildBindingV1, Sha256Hex, compatibility_input_digest,
+    FluxsembleBuildBindingV1, Sha256Hex, compatibility_input_digest_with_keyring,
     source::{domain_digest, invalid, require, require_bounded_json},
 };
 
@@ -26,6 +26,7 @@ const QUALIFICATION_DOMAIN: &[u8] = b"fluxsemble:runtime-catalog-qualification:v
 pub struct CompatibilityQualificationV1 {
     schema_version: u16,
     compatibility_input_sha256: Sha256Hex,
+    trusted_signing_keyring_sha256: Sha256Hex,
     fluxsemble: FluxsembleBuildBindingV1,
     provider: BoundedId,
     target: CatalogTarget,
@@ -50,6 +51,7 @@ impl CompatibilityQualificationV1 {
         Ok(Self {
             schema_version: wire.schema_version,
             compatibility_input_sha256: Sha256Hex::parse(wire.compatibility_input_sha256)?,
+            trusted_signing_keyring_sha256: Sha256Hex::parse(wire.trusted_signing_keyring_sha256)?,
             fluxsemble,
             provider,
             target: CatalogTarget::parse(&wire.target)?,
@@ -74,6 +76,11 @@ impl CompatibilityQualificationV1 {
     #[must_use]
     pub fn compatibility_input_sha256(&self) -> &Sha256Hex {
         &self.compatibility_input_sha256
+    }
+
+    #[must_use]
+    pub fn trusted_signing_keyring_sha256(&self) -> &Sha256Hex {
+        &self.trusted_signing_keyring_sha256
     }
 
     #[must_use]
@@ -183,7 +190,7 @@ impl QualificationChecksV1 {
         self.cancellation
     }
 
-    fn all_passed(&self) -> bool {
+    pub fn all_passed(&self) -> bool {
         [
             self.catalog_v1_conformance,
             self.managed_installation,
@@ -254,7 +261,14 @@ pub fn verify_qualification(
     require(record.pi_version == *source.intent().release().pi_version())?;
     require(record.node_version == *source.intent().release().node_version())?;
 
-    let expected_input = compatibility_input_digest(source.intent(), source.build())?;
+    require(
+        record.trusted_signing_keyring_sha256.as_str() == crate::production_keyring().sha256(),
+    )?;
+    let expected_input = compatibility_input_digest_with_keyring(
+        source.intent(),
+        source.build(),
+        record.trusted_signing_keyring_sha256.as_str(),
+    )?;
     require(record.compatibility_input_sha256.as_str() == encode_hex(&expected_input))?;
     let expected_record = qualification_record_digest(record)?;
     require(source.qualification().sha256().as_str() == encode_hex(&expected_record))
@@ -275,6 +289,7 @@ fn encode_hex(bytes: &[u8; 32]) -> String {
 struct QualificationWire {
     schema_version: u16,
     compatibility_input_sha256: String,
+    trusted_signing_keyring_sha256: String,
     fluxsemble: serde_json::Value,
     provider: String,
     target: String,

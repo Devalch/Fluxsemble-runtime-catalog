@@ -1,6 +1,6 @@
 use catalog_core::{
     CatalogSourceV1, CompatibilityQualificationV1, FluxsembleBuildBindingV1,
-    InitialPiReleaseIntentV1, compatibility_input_digest, qualification_record_digest,
+    InitialPiReleaseIntentV1, compatibility_input_digest_with_keyring, qualification_record_digest,
     verify_qualification,
 };
 use serde_json::{Value, json};
@@ -9,6 +9,7 @@ const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const SHA_C: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 const COMMIT_A: &str = "0123456789abcdef0123456789abcdef01234567";
+const KEYRING_SHA256: &str = "9a59bf1adcb6692853918b6a5a743877e44c2b5c96b12e034506afd960300793";
 
 fn intent_value() -> Value {
     let payload: Value = serde_json::from_slice(include_bytes!(
@@ -43,6 +44,7 @@ fn qualification_value(compatibility_input_sha256: String) -> Value {
     json!({
         "schema_version": 1,
         "compatibility_input_sha256": compatibility_input_sha256,
+        "trusted_signing_keyring_sha256": KEYRING_SHA256,
         "fluxsemble": build_value(),
         "provider": "builtin:pi",
         "target": "linux_x86_64",
@@ -70,7 +72,9 @@ fn bound_fixture() -> (Value, Value) {
         InitialPiReleaseIntentV1::from_json(&serde_json::to_vec(&intent_value()).unwrap()).unwrap();
     let build =
         FluxsembleBuildBindingV1::from_json(&serde_json::to_vec(&build_value()).unwrap()).unwrap();
-    let compatibility = hex::encode(compatibility_input_digest(&intent, &build).unwrap());
+    let compatibility = hex::encode(
+        compatibility_input_digest_with_keyring(&intent, &build, KEYRING_SHA256).unwrap(),
+    );
     let qualification = qualification_value(compatibility);
     let record =
         CompatibilityQualificationV1::from_json(&serde_json::to_vec(&qualification).unwrap())
@@ -101,6 +105,7 @@ fn exact_qualification_binds_source_build_profile_tuple_and_input_digest() {
 
     for (pointer, replacement) in [
         ("/compatibility_input_sha256", json!(SHA_A)),
+        ("/trusted_signing_keyring_sha256", json!(SHA_A)),
         ("/fluxsemble/application_sha256", json!(SHA_C)),
         ("/fluxsemble/compatibility_profile_sha256", json!(SHA_A)),
         ("/provider", json!("builtin:codex")),
@@ -147,6 +152,41 @@ fn every_named_qualification_check_must_have_passed() {
             "accepted failed {check} check"
         );
     }
+}
+
+#[test]
+fn qualification_keyring_binding_is_required_and_well_formed() {
+    let (_, qualification) = bound_fixture();
+    assert_eq!(
+        parse_record(&qualification)
+            .trusted_signing_keyring_sha256()
+            .as_str(),
+        KEYRING_SHA256
+    );
+
+    let mut missing = qualification.clone();
+    missing
+        .as_object_mut()
+        .unwrap()
+        .remove("trusted_signing_keyring_sha256");
+    assert!(
+        CompatibilityQualificationV1::from_json(&serde_json::to_vec(&missing).unwrap()).is_err()
+    );
+
+    let mut malformed = qualification;
+    malformed["trusted_signing_keyring_sha256"] = json!("unknown");
+    assert!(
+        CompatibilityQualificationV1::from_json(&serde_json::to_vec(&malformed).unwrap()).is_err()
+    );
+
+    let intent =
+        InitialPiReleaseIntentV1::from_json(&serde_json::to_vec(&intent_value()).unwrap()).unwrap();
+    let build =
+        FluxsembleBuildBindingV1::from_json(&serde_json::to_vec(&build_value()).unwrap()).unwrap();
+    assert_ne!(
+        compatibility_input_digest_with_keyring(&intent, &build, KEYRING_SHA256).unwrap(),
+        compatibility_input_digest_with_keyring(&intent, &build, SHA_A).unwrap(),
+    );
 }
 
 #[test]
