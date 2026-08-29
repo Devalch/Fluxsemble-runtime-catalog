@@ -129,6 +129,7 @@ pub fn export_request(
     validate_state_identity(state)?;
     let candidate = catalog_acquire::verify_transferred_bundle(candidate_dir)
         .map_err(|_| WizardError::Qualification)?;
+    candidate_intent_for_state(state, candidate_dir)?;
     let keyring_sha256 = production_keyring().sha256();
     let request = QualificationRequest {
         schema_version: 1,
@@ -196,7 +197,7 @@ pub fn import_handoff(
         return Err(WizardError::Qualification);
     }
 
-    let names = exact_directory_names(handoff_dir)?;
+    let names = exact_directory_names(handoff_dir, 2)?;
     let expected = BTreeSet::from([BUILD_BINDING_NAME.to_owned(), QUALIFICATION_NAME.to_owned()]);
     if names != expected {
         return Err(WizardError::Qualification);
@@ -218,14 +219,10 @@ pub fn import_handoff(
     {
         return Err(WizardError::Qualification);
     }
-    let intent = read_candidate_intent(&state.work_dir.join("qualification-request/candidate"))?;
-    if intent.sequence().get() != state.sequence
-        || intent.release().target().as_str() != state.target
-        || intent.release().pi_version().as_str() != state.pi_version
-        || intent.release().node_version().as_str() != state.node_version
-    {
-        return Err(WizardError::Qualification);
-    }
+    let intent = candidate_intent_for_state(
+        state,
+        &state.work_dir.join("qualification-request/candidate"),
+    )?;
     let expected_compatibility =
         compatibility_input_digest_with_keyring(&intent, &build, keyring_sha256)
             .map_err(|_| WizardError::Qualification)?;
@@ -251,20 +248,7 @@ pub fn import_handoff(
     };
     let receipt_bytes = serde_jcs::to_vec(&receipt).map_err(|_| WizardError::Qualification)?;
     let output = state.work_dir.join("imported-qualification");
-    let stage = create_stage(&output, "imported-qualification")?;
-    let result = (|| {
-        write_immutable(&stage.join(BUILD_BINDING_NAME), &build_bytes)?;
-        write_immutable(&stage.join(QUALIFICATION_NAME), &qualification_bytes)?;
-        write_immutable(&stage.join(IMPORT_RECEIPT_NAME), &receipt_bytes)?;
-        fs::set_permissions(&stage, fs::Permissions::from_mode(0o500))
-            .map_err(|_| WizardError::Io)?;
-        rename_no_replace(&stage, &output)
-    })();
-    if result.is_err() {
-        let _ = make_tree_writable(&stage);
-        let _ = fs::remove_dir_all(&stage);
-    }
-    result?;
+    ensure_imported_output(&output, &build_bytes, &qualification_bytes, &receipt_bytes)?;
 
     let mut advanced = state.clone();
     advanced.phase = ReleasePhase::QualificationImported;
@@ -304,11 +288,28 @@ pub fn resume_qualification(
     };
     match import_handoff(state, handoff, keyring_sha256) {
         Ok(imported) => Ok(imported),
-        Err(_) => {
+        Err(WizardError::Qualification) => {
             prompter.say("The returned qualification does not match this release.")?;
             Err(WizardError::Qualification)
         }
+        Err(error) => Err(error),
     }
+}
+
+fn candidate_intent_for_state(
+    state: &WizardState,
+    candidate_dir: &Path,
+) -> Result<InitialPiReleaseIntentV1, WizardError> {
+    let intent = read_candidate_intent(candidate_dir)?;
+    if intent.sequence().get() != state.sequence
+        || intent.release().provider() != "builtin:pi"
+        || intent.release().target().as_str() != state.target
+        || intent.release().pi_version().as_str() != state.pi_version
+        || intent.release().node_version().as_str() != state.node_version
+    {
+        return Err(WizardError::Qualification);
+    }
+    Ok(intent)
 }
 
 fn read_candidate_intent(candidate_dir: &Path) -> Result<InitialPiReleaseIntentV1, WizardError> {
@@ -383,6 +384,11 @@ fn validate_sha256(value: &str) -> Result<(), WizardError> {
     }
 }
 
+fn current_euid() -> u32 {
+    // SAFETY: geteuid has no preconditions or side effects.
+    unsafe { libc::geteuid() }
+}
+
 fn lower_hex(value: &str) -> bool {
     value
         .bytes()
@@ -401,7 +407,83 @@ where
     }
 }
 
-fn exact_directory_names(path: &Path) -> Result<BTreeSet<String>, WizardError> {
+fn ensure_imported_output(
+    output: &Path,
+    build_bytes: &[u8],
+    qualification_bytes: &[u8],
+    receipt_bytes: &[u8],
+) -> Result<(), WizardError> {
+    match fs::symlink_metadata(output) {
+        Ok(_) => {
+            return validate_imported_output(
+                output,
+                build_bytes,
+                qualification_bytes,
+                receipt_bytes,
+            );
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(WizardError::Io),
+    }
+
+    let stage = create_stage(output, "imported-qualification")?;
+    let publication = (|| {
+        write_immutable(&stage.join(BUILD_BINDING_NAME), build_bytes)?;
+        write_immutable(&stage.join(QUALIFICATION_NAME), qualification_bytes)?;
+        write_immutable(&stage.join(IMPORT_RECEIPT_NAME), receipt_bytes)?;
+        fs::set_permissions(&stage, fs::Permissions::from_mode(0o500))
+            .map_err(|_| WizardError::Io)?;
+        rename_no_replace(&stage, output)
+    })();
+    if publication.is_err() {
+        let _ = make_tree_writable(&stage);
+        let _ = fs::remove_dir_all(&stage);
+    }
+    match publication {
+        Ok(()) => validate_imported_output(output, build_bytes, qualification_bytes, receipt_bytes),
+        Err(error) => match fs::symlink_metadata(output) {
+            Ok(_) => {
+                validate_imported_output(output, build_bytes, qualification_bytes, receipt_bytes)
+            }
+            Err(not_found) if not_found.kind() == std::io::ErrorKind::NotFound => Err(error),
+            Err(_) => Err(WizardError::Io),
+        },
+    }
+}
+
+fn validate_imported_output(
+    output: &Path,
+    build_bytes: &[u8],
+    qualification_bytes: &[u8],
+    receipt_bytes: &[u8],
+) -> Result<(), WizardError> {
+    let metadata = fs::symlink_metadata(output).map_err(|_| WizardError::Qualification)?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != current_euid()
+        || metadata.permissions().mode() & 0o7777 != 0o500
+    {
+        return Err(WizardError::Qualification);
+    }
+    let expected_names = BTreeSet::from([
+        BUILD_BINDING_NAME.to_owned(),
+        IMPORT_RECEIPT_NAME.to_owned(),
+        QUALIFICATION_NAME.to_owned(),
+    ]);
+    if exact_directory_names(output, 3)? != expected_names
+        || read_immutable_regular(&output.join(BUILD_BINDING_NAME))? != build_bytes
+        || read_immutable_regular(&output.join(QUALIFICATION_NAME))? != qualification_bytes
+        || read_immutable_regular(&output.join(IMPORT_RECEIPT_NAME))? != receipt_bytes
+    {
+        return Err(WizardError::Qualification);
+    }
+    Ok(())
+}
+
+fn exact_directory_names(
+    path: &Path,
+    maximum_names: usize,
+) -> Result<BTreeSet<String>, WizardError> {
     let metadata = fs::symlink_metadata(path).map_err(|_| WizardError::Qualification)?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return Err(WizardError::Qualification);
@@ -413,14 +495,26 @@ fn exact_directory_names(path: &Path) -> Result<BTreeSet<String>, WizardError> {
             .file_name()
             .into_string()
             .map_err(|_| WizardError::Qualification)?;
-        if !names.insert(name) || names.len() > 2 {
+        if !names.insert(name) || names.len() > maximum_names {
             return Err(WizardError::Qualification);
         }
     }
     Ok(names)
 }
 
+fn read_immutable_regular(path: &Path) -> Result<Vec<u8>, WizardError> {
+    read_bounded_regular_with_mode(path, true, Some(0o400))
+}
+
 fn read_bounded_regular(path: &Path, require_one_link: bool) -> Result<Vec<u8>, WizardError> {
+    read_bounded_regular_with_mode(path, require_one_link, None)
+}
+
+fn read_bounded_regular_with_mode(
+    path: &Path,
+    require_one_link: bool,
+    required_mode: Option<u32>,
+) -> Result<Vec<u8>, WizardError> {
     let mut options = OpenOptions::new();
     options
         .read(true)
@@ -429,6 +523,7 @@ fn read_bounded_regular(path: &Path, require_one_link: bool) -> Result<Vec<u8>, 
     let before = file.metadata().map_err(|_| WizardError::Qualification)?;
     if !before.is_file()
         || (require_one_link && before.nlink() != 1)
+        || required_mode.is_some_and(|mode| before.permissions().mode() & 0o7777 != mode)
         || before.len() == 0
         || before.len() > MAX_HANDOFF_FILE_BYTES
     {
@@ -445,6 +540,7 @@ fn read_bounded_regular(path: &Path, require_one_link: bool) -> Result<Vec<u8>, 
         || before.ino() != after.ino()
         || before.len() != after.len()
         || (require_one_link && after.nlink() != 1)
+        || required_mode.is_some_and(|mode| after.permissions().mode() & 0o7777 != mode)
     {
         return Err(WizardError::Qualification);
     }
@@ -690,6 +786,24 @@ mod tests {
     }
 
     #[test]
+    fn export_rejects_state_tuple_that_does_not_match_candidate_without_output() {
+        let fixture = Fixture::matching();
+        let mut wrong_state = fixture.state.clone();
+        wrong_state.pi_version = "0.84.0".to_owned();
+        let output = fixture.root.join("mismatched-request");
+
+        assert!(
+            export_request(
+                &wrong_state,
+                &fixture.root.join("qualification-request/candidate"),
+                &output,
+            )
+            .is_err()
+        );
+        assert!(!output.exists());
+    }
+
+    #[test]
     fn matching_handoff_is_imported_for_the_exact_release() {
         let fixture = Fixture::matching();
         let imported = import_handoff(&fixture.state, &fixture.handoff, KEYRING).unwrap();
@@ -783,6 +897,34 @@ mod tests {
         assert_eq!(
             prompter.said,
             ["The returned qualification does not match this release."]
+        );
+    }
+
+    #[test]
+    fn state_save_failure_after_import_publication_is_retryable_and_not_a_mismatch() {
+        let fixture = Fixture::matching();
+        let state_path = fixture.root.join("wizard-state.json");
+        fs::remove_file(&state_path).unwrap();
+        fs::create_dir(&state_path).unwrap();
+        let mut prompter = RecordingPrompter::default();
+
+        assert!(matches!(
+            resume_qualification(
+                &fixture.state,
+                Some(&fixture.handoff),
+                KEYRING,
+                &mut prompter,
+            ),
+            Err(WizardError::State)
+        ));
+        assert!(prompter.said.is_empty());
+        assert!(fixture.root.join("imported-qualification").is_dir());
+
+        fs::remove_dir(&state_path).unwrap();
+        import_handoff(&fixture.state, &fixture.handoff, KEYRING).unwrap();
+        assert_eq!(
+            WizardState::load(&state_path).unwrap().unwrap().phase,
+            ReleasePhase::QualificationImported
         );
     }
 
