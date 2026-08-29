@@ -1,8 +1,10 @@
 use std::{
     collections::BTreeSet,
+    ffi::CString,
     fs::{self, OpenOptions},
     io::{Read, Write},
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    os::unix::ffi::OsStrExt,
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Command,
     time::{Duration, SystemTime},
@@ -19,7 +21,7 @@ use reqwest::{
     header::{LINK, USER_AGENT},
     redirect::Policy,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
@@ -54,10 +56,13 @@ const GITHUB_RELEASES_URL: &str =
 const REPOSITORY: &str = "Devalch/Fluxsemble-runtime-catalog";
 const EVIDENCE_COMPLETION_NAME: &str = "evidence-complete-v1";
 const EVIDENCE_COMPLETION_BYTES: &[u8] = b"catalog-wizard-evidence-complete-v1\n";
-const MAX_PUBLIC_RECEIPT_ASSETS: usize = 64;
-const MAX_PUBLIC_FIELD_BYTES: usize = 512;
+const MAX_PUBLIC_RECEIPT_ASSETS: usize = 128;
+const DRAFT_RECEIPT_DOMAIN: &[u8] = b"fluxsemble:runtime-catalog-draft-receipt:v1\0";
+const APPROVAL_DOMAIN: &[u8] = b"fluxsemble:runtime-catalog-release-approval:v1\0";
+const PUBLICATION_DOMAIN: &[u8] = b"fluxsemble:runtime-catalog-publication-receipt:v1\0";
+const LATEST_DOMAIN: &[u8] = b"fluxsemble:runtime-catalog-latest-receipt:v1\0";
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PublicReceiptAssetV1 {
     asset_id: String,
@@ -66,7 +71,55 @@ struct PublicReceiptAssetV1 {
     sha256: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublicDraftReceiptBodyV1 {
+    repository: String,
+    release_id: String,
+    tag: String,
+    tag_commit: String,
+    target_commitish: String,
+    source_tree_sha256: String,
+    title: String,
+    notes: String,
+    draft: bool,
+    prerelease: bool,
+    local_operation_id: String,
+    remote_operation_id: String,
+    signed_transfer_sha256: String,
+    broker_client_config_sha256: String,
+    broker_executable_sha256: String,
+    publisher_broker_config_sha256: String,
+    assets: Vec<PublicReceiptAssetV1>,
+    phase: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublicDraftReceiptV1 {
+    schema_version: u16,
+    receipt_id: String,
+    body: PublicDraftReceiptBodyV1,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublicReleaseApprovalV1 {
+    schema_version: u16,
+    approval_id: String,
+    status: String,
+    draft_receipt_sha256: String,
+    draft_receipt_id: String,
+    repository: String,
+    release_id: String,
+    tag: String,
+    source_commit: String,
+    local_operation_id: String,
+    remote_operation_id: String,
+    assets: Vec<PublicReceiptAssetV1>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PublicPublicationReceiptV1 {
     schema_version: u16,
@@ -81,7 +134,7 @@ struct PublicPublicationReceiptV1 {
     assets: Vec<PublicReceiptAssetV1>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PublicLatestCatalogV1 {
     name: String,
@@ -89,7 +142,7 @@ struct PublicLatestCatalogV1 {
     sha256: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PublicLatestReceiptV1 {
     schema_version: u16,
@@ -681,66 +734,147 @@ fn generate_public_receipts(
     state: &WizardState,
 ) -> Result<Vec<PathBuf>, WizardError> {
     let source_root = state.work_dir.join("publish-state/latest");
+    let draft = read_bounded_regular(&source_root.join("draft-receipt-v1.json"), 8 * 1024 * 1024)?;
+    let approval = read_bounded_regular(
+        &source_root.join("release-approval-v1.json"),
+        8 * 1024 * 1024,
+    )?;
     let publication = read_bounded_regular(
         &source_root.join("publication-receipt-v1.json"),
         8 * 1024 * 1024,
     )?;
     let latest =
         read_bounded_regular(&source_root.join("latest-receipt-v1.json"), 8 * 1024 * 1024)?;
-    validate_public_receipts(state, &publication, &latest)?;
+    validate_public_receipts(state, &draft, &approval, &publication, &latest)?;
 
     let receipt_root = state.work_dir.join("receipts");
     let generated = vec![
         receipt_root.join("publication-receipt-v1.json"),
         receipt_root.join("latest-receipt-v1.json"),
     ];
-    require_absent_or_exact(&generated[0], &publication)?;
-    require_absent_or_exact(&generated[1], &latest)?;
-    write_exact_or_verify(&generated[0], &publication)?;
-    write_exact_or_verify(&generated[1], &latest)?;
+    require_absent_or_exact_prefix(&generated[0], &publication)?;
+    require_absent_or_exact_prefix(&generated[1], &latest)?;
+    write_recoverable_evidence(&generated[0], &publication)?;
+    write_recoverable_evidence(&generated[1], &latest)?;
     Ok(generated)
 }
 
 fn validate_public_receipts(
     state: &WizardState,
+    draft_bytes: &[u8],
+    approval_bytes: &[u8],
     publication_bytes: &[u8],
     latest_bytes: &[u8],
 ) -> Result<(), WizardError> {
+    let draft_contract: catalog_publish::DraftReceiptV1 =
+        serde_json::from_slice(draft_bytes).map_err(|_| WizardError::State)?;
+    let approval_contract: catalog_publish::ReleaseApprovalV1 =
+        serde_json::from_slice(approval_bytes).map_err(|_| WizardError::State)?;
     let publication_contract: catalog_publish::PublicationReceiptV1 =
         serde_json::from_slice(publication_bytes).map_err(|_| WizardError::State)?;
     let latest_contract: catalog_publish::LatestReceiptV1 =
         serde_json::from_slice(latest_bytes).map_err(|_| WizardError::State)?;
-    if serde_jcs::to_vec(&publication_contract).map_err(|_| WizardError::State)?
-        != publication_bytes
+    if serde_jcs::to_vec(&draft_contract).map_err(|_| WizardError::State)? != draft_bytes
+        || serde_jcs::to_vec(&approval_contract).map_err(|_| WizardError::State)? != approval_bytes
+        || serde_jcs::to_vec(&publication_contract).map_err(|_| WizardError::State)?
+            != publication_bytes
         || serde_jcs::to_vec(&latest_contract).map_err(|_| WizardError::State)? != latest_bytes
     {
         return Err(WizardError::State);
     }
+    let draft: PublicDraftReceiptV1 =
+        serde_json::from_slice(draft_bytes).map_err(|_| WizardError::State)?;
+    let approval: PublicReleaseApprovalV1 =
+        serde_json::from_slice(approval_bytes).map_err(|_| WizardError::State)?;
     let publication: PublicPublicationReceiptV1 =
         serde_json::from_slice(publication_bytes).map_err(|_| WizardError::State)?;
     let latest: PublicLatestReceiptV1 =
         serde_json::from_slice(latest_bytes).map_err(|_| WizardError::State)?;
 
     let expected_tag = format!("catalog-v1-sequence-{}", state.sequence);
+    let approval_body = (
+        approval.draft_receipt_sha256.as_str(),
+        &approval.draft_receipt_id,
+        &approval.repository,
+        &approval.release_id,
+        &approval.tag,
+        &approval.source_commit,
+        &approval.local_operation_id,
+        &approval.remote_operation_id,
+        &approval.assets,
+        approval.status.as_str(),
+    );
+    let publication_body = (
+        publication.approval_sha256.as_str(),
+        publication.draft_receipt_sha256.as_str(),
+        &publication.repository,
+        &publication.release_id,
+        &publication.tag,
+        &publication.source_commit,
+        &publication.assets,
+        publication.phase.as_str(),
+    );
+    let latest_body = (
+        latest.publication_sha256.as_str(),
+        &latest.repository,
+        &latest.release_id,
+        &latest.tag,
+        &latest.catalog,
+        latest.phase.as_str(),
+    );
     if state.phase != ReleasePhase::Published
+        || draft.schema_version != 1
+        || draft.receipt_id != receipt_domain_digest(DRAFT_RECEIPT_DOMAIN, &draft.body)?
+        || draft.body.repository != REPOSITORY
+        || !valid_remote_id(&draft.body.release_id)
+        || draft.body.tag != expected_tag
+        || draft.body.tag_commit != state.catalog_source_commit
+        || draft.body.target_commitish != state.catalog_source_commit
+        || draft.body.source_tree_sha256 != state.catalog_source_tree_sha256
+        || draft.body.title.is_empty()
+        || draft.body.title.len() > 256
+        || draft.body.notes.len() > 16 * 1024
+        || !draft.body.draft
+        || draft.body.prerelease
+        || !valid_sha256(&draft.body.local_operation_id)
+        || !valid_sha256(&draft.body.remote_operation_id)
+        || !valid_sha256(&draft.body.signed_transfer_sha256)
+        || !valid_sha256(&draft.body.broker_client_config_sha256)
+        || !valid_sha256(&draft.body.broker_executable_sha256)
+        || !valid_sha256(&draft.body.publisher_broker_config_sha256)
+        || draft.body.phase != "draft_verified"
+        || approval.schema_version != 1
+        || approval.approval_id != receipt_domain_digest(APPROVAL_DOMAIN, &approval_body)?
+        || approval.status != "approved"
+        || approval.draft_receipt_sha256 != format!("{:x}", Sha256::digest(draft_bytes))
+        || approval.draft_receipt_id != draft.receipt_id
+        || approval.repository != draft.body.repository
+        || approval.release_id != draft.body.release_id
+        || approval.tag != draft.body.tag
+        || approval.source_commit != draft.body.tag_commit
+        || approval.local_operation_id != draft.body.local_operation_id
+        || approval.remote_operation_id != draft.body.remote_operation_id
+        || approval.assets != draft.body.assets
         || publication.schema_version != 1
+        || publication.publication_id
+            != receipt_domain_digest(PUBLICATION_DOMAIN, &publication_body)?
         || publication.phase != "published_latest_pending"
-        || publication.repository != REPOSITORY
-        || publication.tag != expected_tag
-        || publication.source_commit != state.catalog_source_commit
-        || !valid_sha256(&publication.publication_id)
-        || !valid_sha256(&publication.approval_sha256)
-        || !valid_sha256(&publication.draft_receipt_sha256)
-        || !valid_remote_id(&publication.release_id)
+        || publication.approval_sha256 != format!("{:x}", Sha256::digest(approval_bytes))
+        || publication.draft_receipt_sha256 != format!("{:x}", Sha256::digest(draft_bytes))
+        || publication.repository != approval.repository
+        || publication.release_id != approval.release_id
+        || publication.tag != approval.tag
+        || publication.source_commit != approval.source_commit
+        || publication.assets != approval.assets
         || publication.assets.is_empty()
         || publication.assets.len() > MAX_PUBLIC_RECEIPT_ASSETS
         || latest.schema_version != 1
+        || latest.latest_id != receipt_domain_digest(LATEST_DOMAIN, &latest_body)?
         || latest.phase != "latest_verified"
         || latest.publication_sha256 != format!("{:x}", Sha256::digest(publication_bytes))
         || latest.repository != publication.repository
         || latest.release_id != publication.release_id
         || latest.tag != publication.tag
-        || !valid_sha256(&latest.latest_id)
         || latest.catalog.name != "catalog-v1.json"
         || latest.catalog.size == 0
         || !valid_sha256(&latest.catalog.sha256)
@@ -771,14 +905,23 @@ fn validate_public_receipts(
     Ok(())
 }
 
+fn receipt_domain_digest(domain: &[u8], value: &impl Serialize) -> Result<String, WizardError> {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update(serde_jcs::to_vec(value).map_err(|_| WizardError::State)?);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 fn valid_sha256(value: &str) -> bool {
     value.len() == 64 && lower_hex(value)
 }
 
 fn valid_remote_id(value: &str) -> bool {
     !value.is_empty()
-        && value.len() <= MAX_PUBLIC_FIELD_BYTES
+        && value.len() <= 19
+        && !value.starts_with('0')
         && value.bytes().all(|byte| byte.is_ascii_digit())
+        && value.parse::<u64>().is_ok_and(|value| value > 0)
 }
 
 fn valid_public_asset_name(value: &str) -> bool {
@@ -793,17 +936,32 @@ fn valid_public_asset_name(value: &str) -> bool {
 fn evidence_complete(state: &WizardState) -> Result<bool, WizardError> {
     let path = state.work_dir.join(EVIDENCE_COMPLETION_NAME);
     match fs::symlink_metadata(&path) {
-        Ok(_) => Ok(read_bounded_regular(&path, 128)? == EVIDENCE_COMPLETION_BYTES),
+        Ok(_) => {
+            let actual = read_recoverable_file(&path, EVIDENCE_COMPLETION_BYTES.len() as u64)?;
+            if EVIDENCE_COMPLETION_BYTES.starts_with(&actual) {
+                Ok(actual == EVIDENCE_COMPLETION_BYTES)
+            } else {
+                Err(WizardError::State)
+            }
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(_) => Err(WizardError::State),
     }
 }
 
 fn mark_evidence_complete(state: &WizardState) -> Result<(), WizardError> {
-    write_exact_or_verify(
+    write_recoverable_evidence(
         &state.work_dir.join(EVIDENCE_COMPLETION_NAME),
         EVIDENCE_COMPLETION_BYTES,
     )
+}
+
+fn read_low_level_receipt_bindings(state: &WizardState) -> Result<(Vec<u8>, Vec<u8>), WizardError> {
+    let root = state.work_dir.join("publish-state/latest");
+    Ok((
+        read_bounded_regular(&root.join("draft-receipt-v1.json"), 8 * 1024 * 1024)?,
+        read_bounded_regular(&root.join("release-approval-v1.json"), 8 * 1024 * 1024)?,
+    ))
 }
 
 fn commit_public_evidence(
@@ -818,13 +976,20 @@ fn commit_public_evidence(
         .iter()
         .map(|source| read_bounded_regular(source, 8 * 1024 * 1024))
         .collect::<Result<Vec<_>, _>>()?;
-    validate_public_receipts(state, &receipt_bytes[0], &receipt_bytes[1])?;
+    let (draft, approval) = read_low_level_receipt_bindings(state)?;
+    validate_public_receipts(
+        state,
+        &draft,
+        &approval,
+        &receipt_bytes[0],
+        &receipt_bytes[1],
+    )?;
     let outputs = public_evidence_outputs(repo, state, &receipt_bytes);
     for (destination, bytes) in &outputs {
-        require_absent_or_exact(destination, bytes)?;
+        require_absent_or_exact_prefix(destination, bytes)?;
     }
     for (destination, bytes) in &outputs {
-        write_exact_or_verify(destination, bytes)?;
+        write_recoverable_evidence(destination, bytes)?;
     }
     Ok(())
 }
@@ -879,7 +1044,8 @@ fn require_clean_or_exact_pending_evidence(
             .join("publish-state/latest/latest-receipt-v1.json"),
         8 * 1024 * 1024,
     )?;
-    validate_public_receipts(state, &publication, &latest)?;
+    let (draft, approval) = read_low_level_receipt_bindings(state)?;
+    validate_public_receipts(state, &draft, &approval, &publication, &latest)?;
     let outputs = public_evidence_outputs(repo, state, &[publication, latest]);
 
     let staged = Command::new("git")
@@ -907,28 +1073,168 @@ fn require_clean_or_exact_pending_evidence(
             return Err(WizardError::Config);
         }
         let relative = std::str::from_utf8(&record[3..]).map_err(|_| WizardError::Config)?;
-        let Some((path, expected)) = outputs.iter().find(|(path, _)| {
-            path.strip_prefix(repo)
-                .ok()
-                .and_then(Path::to_str)
-                .is_some_and(|candidate| candidate == relative)
+        let Some((path, expected)) = outputs.iter().find_map(|(path, expected)| {
+            let temporary = evidence_temporary_path(path).ok()?;
+            [path, &temporary]
+                .into_iter()
+                .find(|candidate| {
+                    candidate
+                        .strip_prefix(repo)
+                        .ok()
+                        .and_then(Path::to_str)
+                        .is_some_and(|candidate| candidate == relative)
+                })
+                .map(|matched| (matched.to_owned(), expected))
         }) else {
             return Err(WizardError::Config);
         };
-        if read_bounded_regular(path, 8 * 1024 * 1024)? != *expected {
+        let actual = read_recoverable_file(&path, 8 * 1024 * 1024)?;
+        if !expected.starts_with(&actual) {
             return Err(WizardError::Config);
         }
     }
     Ok(())
 }
 
-fn require_absent_or_exact(path: &Path, bytes: &[u8]) -> Result<(), WizardError> {
+fn require_absent_or_exact_prefix(path: &Path, bytes: &[u8]) -> Result<(), WizardError> {
     match fs::symlink_metadata(path) {
-        Ok(_) if read_bounded_regular(path, 8 * 1024 * 1024)? == bytes => Ok(()),
+        Ok(_) if bytes.starts_with(&read_recoverable_file(path, bytes.len() as u64)?) => Ok(()),
         Ok(_) => Err(WizardError::State),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(_) => Err(WizardError::Io),
     }
+}
+
+fn write_recoverable_evidence(path: &Path, bytes: &[u8]) -> Result<(), WizardError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            complete_exact_prefix(path, bytes, 0o400)?;
+            fs::File::open(path.parent().ok_or(WizardError::Io)?)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|_| WizardError::Io)?;
+            return Ok(());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(WizardError::Io),
+    }
+    let parent = path.parent().ok_or(WizardError::Io)?;
+    fs::create_dir_all(parent).map_err(|_| WizardError::Io)?;
+    let temporary = evidence_temporary_path(path)?;
+    if fs::symlink_metadata(&temporary).is_err() {
+        let mut options = OpenOptions::new();
+        options
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let file = options.open(&temporary).map_err(|_| WizardError::Io)?;
+        file.sync_all().map_err(|_| WizardError::Io)?;
+    }
+    complete_exact_prefix(&temporary, bytes, 0o600)?;
+    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o400))
+        .map_err(|_| WizardError::Io)?;
+    fs::File::open(&temporary)
+        .and_then(|file| file.sync_all())
+        .map_err(|_| WizardError::Io)?;
+    let old = CString::new(temporary.as_os_str().as_bytes()).map_err(|_| WizardError::Io)?;
+    let new = CString::new(path.as_os_str().as_bytes()).map_err(|_| WizardError::Io)?;
+    // SAFETY: both C strings are valid path bytes and RENAME_NOREPLACE atomically preserves an
+    // existing destination instead of replacing it.
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            old.as_ptr(),
+            libc::AT_FDCWD,
+            new.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::AlreadyExists
+            || read_recoverable_file(path, bytes.len() as u64)? != bytes
+        {
+            return Err(WizardError::State);
+        }
+        fs::remove_file(&temporary).map_err(|_| WizardError::Io)?;
+    }
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| WizardError::Io)?;
+    if read_recoverable_file(path, bytes.len() as u64)? == bytes {
+        Ok(())
+    } else {
+        Err(WizardError::State)
+    }
+}
+
+fn evidence_temporary_path(path: &Path) -> Result<PathBuf, WizardError> {
+    let parent = path.parent().ok_or(WizardError::Io)?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(WizardError::Io)?;
+    Ok(parent.join(format!(".{name}.catalog-wizard-evidence.tmp")))
+}
+
+fn complete_exact_prefix(path: &Path, bytes: &[u8], final_mode: u32) -> Result<(), WizardError> {
+    let actual = read_recoverable_file(path, bytes.len() as u64)?;
+    if !bytes.starts_with(&actual) {
+        return Err(WizardError::State);
+    }
+    if actual != bytes {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(|_| WizardError::Io)?;
+        let mut options = OpenOptions::new();
+        options
+            .append(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let mut file = options.open(path).map_err(|_| WizardError::Io)?;
+        file.write_all(&bytes[actual.len()..])
+            .map_err(|_| WizardError::Io)?;
+        file.sync_all().map_err(|_| WizardError::Io)?;
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(final_mode))
+        .map_err(|_| WizardError::Io)?;
+    if read_recoverable_file(path, bytes.len() as u64)? == bytes {
+        Ok(())
+    } else {
+        Err(WizardError::State)
+    }
+}
+
+fn read_recoverable_file(path: &Path, maximum: u64) -> Result<Vec<u8>, WizardError> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| WizardError::Io)?;
+    let mode = metadata.mode() & 0o7777;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > maximum
+        || metadata.nlink() != 1
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || !matches!(mode, 0o400 | 0o600)
+    {
+        return Err(WizardError::Io);
+    }
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let mut file = options.open(path).map_err(|_| WizardError::Io)?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    (&mut file)
+        .take(maximum + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| WizardError::Io)?;
+    let after = file.metadata().map_err(|_| WizardError::Io)?;
+    if bytes.len() as u64 != metadata.len()
+        || metadata.dev() != after.dev()
+        || metadata.ino() != after.ino()
+        || metadata.len() != after.len()
+        || after.nlink() != 1
+    {
+        return Err(WizardError::Io);
+    }
+    Ok(bytes)
 }
 
 fn build_catalog_source(state: &WizardState) -> Result<PathBuf, WizardError> {
@@ -1450,7 +1756,6 @@ fn encode_sha256(bytes: &[u8; 32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     struct ReleaseHarness {
         phase: ReleasePhase,
@@ -1597,49 +1902,151 @@ mod tests {
         drive_release(harness)
     }
 
-    fn public_receipt_fixture(state: &WizardState) -> (serde_json::Value, serde_json::Value) {
-        let publication = json!({
-            "schema_version": 1,
-            "publication_id": "33".repeat(32),
-            "phase": "published_latest_pending",
-            "approval_sha256": "44".repeat(32),
-            "draft_receipt_sha256": "55".repeat(32),
-            "repository": REPOSITORY,
-            "release_id": "12345",
-            "tag": format!("catalog-v1-sequence-{}", state.sequence),
-            "source_commit": state.catalog_source_commit,
-            "assets": [{
-                "asset_id": "67890",
-                "name": "catalog-v1.json",
-                "size": 20,
-                "sha256": "66".repeat(32),
-            }],
-        });
+    fn public_receipt_fixture(
+        state: &WizardState,
+    ) -> (
+        serde_json::Value,
+        serde_json::Value,
+        serde_json::Value,
+        serde_json::Value,
+    ) {
+        let asset = PublicReceiptAssetV1 {
+            asset_id: "67890".to_owned(),
+            name: "catalog-v1.json".to_owned(),
+            size: 20,
+            sha256: "66".repeat(32),
+        };
+        let draft_body = PublicDraftReceiptBodyV1 {
+            repository: REPOSITORY.to_owned(),
+            release_id: "12345".to_owned(),
+            tag: format!("catalog-v1-sequence-{}", state.sequence),
+            tag_commit: state.catalog_source_commit.clone(),
+            target_commitish: state.catalog_source_commit.clone(),
+            source_tree_sha256: state.catalog_source_tree_sha256.clone(),
+            title: "Pi 0.84.0".to_owned(),
+            notes: "Approved managed Pi release.".to_owned(),
+            draft: true,
+            prerelease: false,
+            local_operation_id: "77".repeat(32),
+            remote_operation_id: "88".repeat(32),
+            signed_transfer_sha256: "99".repeat(32),
+            broker_client_config_sha256: "aa".repeat(32),
+            broker_executable_sha256: "bb".repeat(32),
+            publisher_broker_config_sha256: "cc".repeat(32),
+            assets: vec![asset.clone()],
+            phase: "draft_verified".to_owned(),
+        };
+        let draft = PublicDraftReceiptV1 {
+            schema_version: 1,
+            receipt_id: receipt_domain_digest(DRAFT_RECEIPT_DOMAIN, &draft_body).unwrap(),
+            body: draft_body,
+        };
+        let draft_bytes = serde_jcs::to_vec(&draft).unwrap();
+        let mut approval = PublicReleaseApprovalV1 {
+            schema_version: 1,
+            approval_id: String::new(),
+            status: "approved".to_owned(),
+            draft_receipt_sha256: format!("{:x}", Sha256::digest(&draft_bytes)),
+            draft_receipt_id: draft.receipt_id.clone(),
+            repository: draft.body.repository.clone(),
+            release_id: draft.body.release_id.clone(),
+            tag: draft.body.tag.clone(),
+            source_commit: draft.body.tag_commit.clone(),
+            local_operation_id: draft.body.local_operation_id.clone(),
+            remote_operation_id: draft.body.remote_operation_id.clone(),
+            assets: draft.body.assets.clone(),
+        };
+        approval.approval_id = receipt_domain_digest(
+            APPROVAL_DOMAIN,
+            &(
+                approval.draft_receipt_sha256.as_str(),
+                &approval.draft_receipt_id,
+                &approval.repository,
+                &approval.release_id,
+                &approval.tag,
+                &approval.source_commit,
+                &approval.local_operation_id,
+                &approval.remote_operation_id,
+                &approval.assets,
+                approval.status.as_str(),
+            ),
+        )
+        .unwrap();
+        let approval_bytes = serde_jcs::to_vec(&approval).unwrap();
+        let mut publication = PublicPublicationReceiptV1 {
+            schema_version: 1,
+            publication_id: String::new(),
+            phase: "published_latest_pending".to_owned(),
+            approval_sha256: format!("{:x}", Sha256::digest(&approval_bytes)),
+            draft_receipt_sha256: format!("{:x}", Sha256::digest(&draft_bytes)),
+            repository: approval.repository.clone(),
+            release_id: approval.release_id.clone(),
+            tag: approval.tag.clone(),
+            source_commit: approval.source_commit.clone(),
+            assets: approval.assets.clone(),
+        };
+        publication.publication_id = receipt_domain_digest(
+            PUBLICATION_DOMAIN,
+            &(
+                publication.approval_sha256.as_str(),
+                publication.draft_receipt_sha256.as_str(),
+                &publication.repository,
+                &publication.release_id,
+                &publication.tag,
+                &publication.source_commit,
+                &publication.assets,
+                publication.phase.as_str(),
+            ),
+        )
+        .unwrap();
         let publication_bytes = serde_jcs::to_vec(&publication).unwrap();
-        let latest = json!({
-            "schema_version": 1,
-            "latest_id": "77".repeat(32),
-            "phase": "latest_verified",
-            "publication_sha256": format!("{:x}", Sha256::digest(&publication_bytes)),
-            "repository": REPOSITORY,
-            "release_id": "12345",
-            "tag": format!("catalog-v1-sequence-{}", state.sequence),
-            "catalog": {
-                "name": "catalog-v1.json",
-                "size": 20,
-                "sha256": "66".repeat(32),
+        let mut latest = PublicLatestReceiptV1 {
+            schema_version: 1,
+            latest_id: String::new(),
+            phase: "latest_verified".to_owned(),
+            publication_sha256: format!("{:x}", Sha256::digest(&publication_bytes)),
+            repository: publication.repository.clone(),
+            release_id: publication.release_id.clone(),
+            tag: publication.tag.clone(),
+            catalog: PublicLatestCatalogV1 {
+                name: asset.name,
+                size: asset.size,
+                sha256: asset.sha256,
             },
-        });
-        (publication, latest)
+        };
+        latest.latest_id = receipt_domain_digest(
+            LATEST_DOMAIN,
+            &(
+                latest.publication_sha256.as_str(),
+                &latest.repository,
+                &latest.release_id,
+                &latest.tag,
+                &latest.catalog,
+                latest.phase.as_str(),
+            ),
+        )
+        .unwrap();
+        (
+            serde_json::to_value(draft).unwrap(),
+            serde_json::to_value(approval).unwrap(),
+            serde_json::to_value(publication).unwrap(),
+            serde_json::to_value(latest).unwrap(),
+        )
     }
 
     fn write_public_receipt_fixture(
         latest_root: &Path,
+        draft: &serde_json::Value,
+        approval: &serde_json::Value,
         publication: &serde_json::Value,
         latest: &serde_json::Value,
     ) -> (Vec<u8>, Vec<u8>) {
+        let draft_bytes = serde_jcs::to_vec(draft).unwrap();
+        let approval_bytes = serde_jcs::to_vec(approval).unwrap();
         let publication_bytes = serde_jcs::to_vec(publication).unwrap();
         let latest_bytes = serde_jcs::to_vec(latest).unwrap();
+        fs::write(latest_root.join("draft-receipt-v1.json"), draft_bytes).unwrap();
+        fs::write(latest_root.join("release-approval-v1.json"), approval_bytes).unwrap();
         fs::write(
             latest_root.join("publication-receipt-v1.json"),
             &publication_bytes,
@@ -1926,13 +2333,23 @@ mod tests {
             catalog_source_tree_sha256: "22".repeat(32),
             work_dir: work_dir.clone(),
         };
-        let (mut publication, mut latest) = public_receipt_fixture(&state);
+        let (draft, approval, mut publication, mut latest) = public_receipt_fixture(&state);
+        fs::write(
+            latest_root.join("draft-receipt-v1.json"),
+            serde_jcs::to_vec(&draft).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            latest_root.join("release-approval-v1.json"),
+            serde_jcs::to_vec(&approval).unwrap(),
+        )
+        .unwrap();
         publication["assets"][0]["name"] = json!("/private/release.key");
         let path_publication = serde_jcs::to_vec(&publication).unwrap();
         latest["publication_sha256"] = json!(format!("{:x}", Sha256::digest(&path_publication)));
         let path_latest = serde_jcs::to_vec(&latest).unwrap();
 
-        let (mut wrong_publication, mut wrong_latest) = public_receipt_fixture(&state);
+        let (_, _, mut wrong_publication, mut wrong_latest) = public_receipt_fixture(&state);
         wrong_publication["tag"] = json!("catalog-v1-sequence-3");
         let wrong_publication = serde_jcs::to_vec(&wrong_publication).unwrap();
         wrong_latest["tag"] = json!("catalog-v1-sequence-3");
@@ -1963,6 +2380,48 @@ mod tests {
     }
 
     #[test]
+    fn valid_looking_receipts_without_exact_low_level_binding_are_rejected() {
+        let repo = std::env::temp_dir().join(format!(
+            "catalog-wizard-unbound-evidence-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let work_dir = repo.join(".release-work/sequence-2");
+        let latest = work_dir.join("publish-state/latest");
+        fs::create_dir_all(&latest).unwrap();
+        let state = WizardState {
+            schema_version: 1,
+            sequence: 2,
+            pi_version: "0.84.0".to_owned(),
+            node_version: "22.20.0".to_owned(),
+            target: TARGET.to_owned(),
+            mode: RunMode::PublishCapable,
+            phase: ReleasePhase::Published,
+            signing_key_generation: 1,
+            catalog_source_commit: "11".repeat(20),
+            catalog_source_tree_sha256: "22".repeat(32),
+            work_dir,
+        };
+        let (_, _, publication, latest_receipt) = public_receipt_fixture(&state);
+        fs::write(
+            latest.join("publication-receipt-v1.json"),
+            serde_jcs::to_vec(&publication).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            latest.join("latest-receipt-v1.json"),
+            serde_jcs::to_vec(&latest_receipt).unwrap(),
+        )
+        .unwrap();
+
+        assert!(generate_public_receipts(&repo, &state).is_err());
+        assert!(!repo.join("qualifications").exists());
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
     fn generated_receipts_and_committed_evidence_are_deterministic() {
         let repo = std::env::temp_dir().join(format!(
             "catalog-wizard-evidence-{}",
@@ -1987,9 +2446,9 @@ mod tests {
             catalog_source_tree_sha256: "22".repeat(32),
             work_dir,
         };
-        let (publication, latest_receipt) = public_receipt_fixture(&state);
+        let (draft, approval, publication, latest_receipt) = public_receipt_fixture(&state);
         let (publication_bytes, latest_bytes) =
-            write_public_receipt_fixture(&latest, &publication, &latest_receipt);
+            write_public_receipt_fixture(&latest, &draft, &approval, &publication, &latest_receipt);
 
         let receipts = generate_public_receipts(&repo, &state).unwrap();
         commit_public_evidence(&repo, &state, &receipts).unwrap();
@@ -2009,6 +2468,34 @@ mod tests {
             "# Runtime catalog release sequence 2\n\nPublic release evidence:\n\n- `qualifications/publication-receipt-sequence-2.json`\n- `qualifications/latest-receipt-sequence-2.json`\n"
         );
         fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn recoverable_evidence_writer_settles_partial_temp_before_final_visibility() {
+        let root = std::env::temp_dir().join(format!(
+            "catalog-wizard-atomic-evidence-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let destination = root.join("publication-receipt-sequence-2.json");
+        let temporary =
+            root.join(".publication-receipt-sequence-2.json.catalog-wizard-evidence.tmp");
+        let expected = b"canonical-public-evidence";
+        fs::write(&temporary, &expected[..8]).unwrap();
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600)).unwrap();
+
+        write_recoverable_evidence(&destination, expected).unwrap();
+
+        assert_eq!(fs::read(&destination).unwrap(), expected);
+        assert_eq!(
+            fs::metadata(&destination).unwrap().permissions().mode() & 0o7777,
+            0o400
+        );
+        assert!(!temporary.exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2036,15 +2523,27 @@ mod tests {
             catalog_source_tree_sha256: "22".repeat(32),
             work_dir,
         };
-        let (publication, latest_receipt) = public_receipt_fixture(&state);
-        write_public_receipt_fixture(&latest, &publication, &latest_receipt);
+        let (draft, approval, publication, latest_receipt) = public_receipt_fixture(&state);
+        write_public_receipt_fixture(&latest, &draft, &approval, &publication, &latest_receipt);
         let receipts = generate_public_receipts(&repo, &state).unwrap();
-        fs::set_permissions(&receipts[0], fs::Permissions::from_mode(0o600)).unwrap();
-        fs::write(
-            &receipts[0],
-            br#"{"private_key_path":"/private/release.key"}"#,
-        )
-        .unwrap();
+        let mut replacement_publication: serde_json::Value =
+            serde_json::from_slice(&fs::read(&receipts[0]).unwrap()).unwrap();
+        replacement_publication["publication_id"] = json!("ff".repeat(32));
+        let replacement_publication = serde_jcs::to_vec(&replacement_publication).unwrap();
+        let mut replacement_latest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&receipts[1]).unwrap()).unwrap();
+        replacement_latest["publication_sha256"] =
+            json!(format!("{:x}", Sha256::digest(&replacement_publication)));
+        replacement_latest["latest_id"] = json!("ee".repeat(32));
+        let replacement_latest = serde_jcs::to_vec(&replacement_latest).unwrap();
+        for (path, bytes) in receipts
+            .iter()
+            .zip([replacement_publication, replacement_latest])
+        {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+            fs::write(path, bytes).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o400)).unwrap();
+        }
 
         assert!(commit_public_evidence(&repo, &state, &receipts).is_err());
         assert!(!repo.join("qualifications").exists());
@@ -2111,14 +2610,31 @@ mod tests {
             catalog_source_tree_sha256: "22".repeat(32),
             work_dir,
         };
-        let (publication, latest_receipt) = public_receipt_fixture(&state);
+        let (draft, approval, publication, latest_receipt) = public_receipt_fixture(&state);
         let (publication_bytes, latest_bytes) =
-            write_public_receipt_fixture(&latest, &publication, &latest_receipt);
+            write_public_receipt_fixture(&latest, &draft, &approval, &publication, &latest_receipt);
         let outputs = public_evidence_outputs(&repo, &state, &[publication_bytes, latest_bytes]);
         fs::create_dir_all(outputs[0].0.parent().unwrap()).unwrap();
-        fs::write(&outputs[0].0, &outputs[0].1).unwrap();
+        fs::write(&outputs[0].0, &outputs[0].1[..outputs[0].1.len() / 2]).unwrap();
+        fs::set_permissions(&outputs[0].0, fs::Permissions::from_mode(0o400)).unwrap();
+        let partial_temporary = evidence_temporary_path(&outputs[1].0).unwrap();
+        fs::create_dir_all(partial_temporary.parent().unwrap()).unwrap();
+        fs::write(&partial_temporary, &outputs[1].1[..outputs[1].1.len() / 2]).unwrap();
+        fs::set_permissions(&partial_temporary, fs::Permissions::from_mode(0o600)).unwrap();
 
         require_clean_or_exact_pending_evidence(&repo, &state).unwrap();
+        commit_public_evidence(
+            &repo,
+            &state,
+            &[
+                latest.join("publication-receipt-v1.json"),
+                latest.join("latest-receipt-v1.json"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(fs::read(&outputs[0].0).unwrap(), outputs[0].1);
+        assert_eq!(fs::read(&outputs[1].0).unwrap(), outputs[1].1);
+        assert!(!partial_temporary.exists());
         fs::write(repo.join("unrelated.txt"), "not approved evidence").unwrap();
         assert!(require_clean_or_exact_pending_evidence(&repo, &state).is_err());
         fs::remove_dir_all(repo).unwrap();
