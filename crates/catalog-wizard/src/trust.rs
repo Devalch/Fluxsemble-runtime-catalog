@@ -158,7 +158,7 @@ pub fn trust_machine(
     }
 
     let private_key_path = PathBuf::from(prompter.ask("Existing private signing key path: ")?);
-    let launcher_config = PathBuf::from(prompter.ask("Isolated signer launcher config path: ")?);
+    let launcher_config = local_launcher_config_path(local_profiles_dir)?;
     let inspected = inspect_key_with_isolated_signer(&private_key_path, &launcher_config)?;
     let active = active_production_key_identity();
     if inspected.key_id != active.key_id() || inspected.public_key != active.public_key_base64url()
@@ -231,6 +231,21 @@ fn valid_facts(facts: &MachineFacts) -> bool {
         && facts.hostname.len() <= MAX_FIELD_BYTES
         && facts.user.len() <= MAX_FIELD_BYTES
         && facts.repo_root.is_absolute()
+}
+
+fn local_launcher_config_path(local_profiles_dir: &Path) -> Result<PathBuf, WizardError> {
+    let config_dir = local_profiles_dir.parent().ok_or(WizardError::Config)?;
+    if !local_profiles_dir.is_absolute()
+        || local_profiles_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            != Some("trusted-machines")
+        || config_dir.file_name().and_then(|name| name.to_str())
+            != Some("fluxsemble-runtime-catalog")
+    {
+        return Err(WizardError::Config);
+    }
+    Ok(config_dir.join("launcher-config-v1.json"))
 }
 
 fn optional_expiry(value: &str) -> Result<Option<String>, WizardError> {
@@ -450,6 +465,30 @@ mod tests {
         assert_eq!(
             profile_matches(&profile, &facts, &[MachineRole::Preparer]),
             Err(TrustError::FactsDoNotMatch)
+        );
+    }
+
+    #[test]
+    fn inspection_uses_fixed_local_launcher_config_without_prompt() {
+        let profiles =
+            PathBuf::from("/home/release/.config/fluxsemble-runtime-catalog/trusted-machines");
+        assert_eq!(
+            local_launcher_config_path(&profiles).unwrap(),
+            PathBuf::from(
+                "/home/release/.config/fluxsemble-runtime-catalog/launcher-config-v1.json"
+            )
+        );
+
+        let mut prompter = crate::prompt::ScriptedPrompter::new([
+            "release-machine",
+            "yes",
+            "release-owner",
+            "",
+            "/missing/signing.key",
+        ]);
+        assert_eq!(
+            trust_machine(&mut prompter, Path::new("/"), &profiles),
+            Err(WizardError::ExternalCommand)
         );
     }
 }
