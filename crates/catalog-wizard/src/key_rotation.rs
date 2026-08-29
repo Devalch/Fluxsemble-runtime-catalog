@@ -128,6 +128,27 @@ pub fn inspect_key_with_isolated_signer(
     Ok(identity)
 }
 
+pub fn verify_active_signing_key(
+    private_key_path: &Path,
+    launcher_config: &Path,
+) -> Result<ActiveSigningKey, WizardError> {
+    let inspected = inspect_key_with_isolated_signer(private_key_path, launcher_config)?;
+    bind_active_signing_identity(inspected)
+}
+
+fn bind_active_signing_identity(
+    mut inspected: ActiveSigningKey,
+) -> Result<ActiveSigningKey, WizardError> {
+    let active = catalog_core::active_production_key_identity();
+    if inspected.key_id != active.key_id() || inspected.public_key != active.public_key_base64url()
+    {
+        return Err(WizardError::Config);
+    }
+    inspected.generation = active.generation();
+    inspected.keyring_sha256 = production_keyring().sha256().to_owned();
+    Ok(inspected)
+}
+
 pub fn verify_signed_bundle_key(
     bundle_dir: &Path,
     expected: &ActiveSigningKey,
@@ -401,6 +422,30 @@ fn lower_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn derived_signing_identity_must_match_the_compiled_active_key() {
+        let active = catalog_core::active_production_key_identity();
+        let matching = ActiveSigningKey {
+            key_id: active.key_id().to_owned(),
+            public_key: active.public_key_base64url().to_owned(),
+            generation: 0,
+            fingerprint: lower_hex(&Sha256::digest(active.public_key_bytes())),
+            keyring_sha256: String::new(),
+        };
+        let bound = bind_active_signing_identity(matching).unwrap();
+        assert_eq!(bound.generation, active.generation());
+        assert_eq!(bound.keyring_sha256, production_keyring().sha256());
+
+        let wrong = ActiveSigningKey {
+            key_id: "runtime-catalog-ed25519-wrong".to_owned(),
+            public_key: active.public_key_base64url().to_owned(),
+            generation: 0,
+            fingerprint: String::new(),
+            keyring_sha256: String::new(),
+        };
+        assert!(bind_active_signing_identity(wrong).is_err());
+    }
 
     #[test]
     fn signed_bundle_key_must_match_active_key() {

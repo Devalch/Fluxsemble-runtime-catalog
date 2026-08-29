@@ -27,16 +27,18 @@ use crate::{
     cli::{ReleaseOptions, ResumeOptions, RunMode},
     commands::{
         CommandPlan, build_acquire_intent, build_acquire_source, build_assemble_intent,
-        build_finalize_candidate,
+        build_finalize_candidate, build_publish, build_publish_approve, build_publish_stage_local,
+        build_publish_stage_remote, build_sign,
     },
-    config::WizardConfig,
+    config::{PrivateSigningConfig, WizardConfig},
     intent::{GenerateReleaseInputsRequest, generate_release_inputs},
+    key_rotation::{verify_active_signing_key, verify_signed_bundle_key},
     npm::{
         NodeDistributionVersionSource, NodeVersionSource, NpmPiVersionSource, PiVersionSource,
         choose_pi_version, suggest_node_version,
     },
-    prompt::{Prompter, confirm_yes_no},
-    qualification,
+    prompt::{Prompter, confirm_yes_no, require_phrase},
+    qualification::{self, verify_consumer_keyring_readiness},
     sequence::{compare_sequences, local_latest_sequence},
     state::{ReleasePhase, WizardState},
     trust::{self, MachineRole},
@@ -234,6 +236,15 @@ trait ReleaseMachine {
     fn qualification_available(&self) -> bool;
     fn import_qualification(&mut self) -> Result<(), WizardError>;
     fn finalize_qualified_candidate(&mut self) -> Result<(), WizardError>;
+    fn prepare_signing(&mut self) -> Result<(), WizardError>;
+    fn require_exact_phrase(&mut self, phrase: &str) -> Result<(), WizardError>;
+    fn sign(&mut self) -> Result<(), WizardError>;
+    fn verify_signed_bundle(&mut self) -> Result<(), WizardError>;
+    fn stage_local(&mut self) -> Result<(), WizardError>;
+    fn stage_remote(&mut self) -> Result<(), WizardError>;
+    fn approve_draft(&mut self) -> Result<(), WizardError>;
+    fn publish(&mut self) -> Result<(), WizardError>;
+    fn update_docs_and_evidence(&mut self) -> Result<(), WizardError>;
     fn say(&mut self, message: &str) -> Result<(), WizardError>;
 }
 
@@ -271,12 +282,39 @@ fn drive_release(release: &mut dyn ReleaseMachine) -> Result<(), WizardError> {
             ReleasePhase::Qualified => {
                 if release.mode() == RunMode::DryRun {
                     release.say("Dry run complete; no signing or publishing was performed.")?;
-                } else {
-                    release.say("Qualified candidate is ready; no signing or publishing was performed without approval.")?;
+                    return Ok(());
                 }
+                release.prepare_signing()?;
+                release.require_exact_phrase("SIGN")?;
+                release.sign()?;
+                release.verify_signed_bundle()?;
+                release.save_phase(ReleasePhase::Signed)?;
+            }
+            ReleasePhase::Signed => {
+                release.verify_signed_bundle()?;
+                release.stage_local()?;
+                release.save_phase(ReleasePhase::LocalStaged)?;
+            }
+            ReleasePhase::LocalStaged => {
+                release.require_exact_phrase("CREATE TAG")?;
+                release.require_exact_phrase("CREATE DRAFT")?;
+                release.require_exact_phrase("UPLOAD ASSETS")?;
+                release.stage_remote()?;
+                release.save_phase(ReleasePhase::RemoteDraftStaged)?;
+            }
+            ReleasePhase::RemoteDraftStaged => {
+                release.approve_draft()?;
+                release.save_phase(ReleasePhase::Approved)?;
+            }
+            ReleasePhase::Approved => {
+                release.require_exact_phrase("PUBLISH")?;
+                release.publish()?;
+                release.save_phase(ReleasePhase::Published)?;
+            }
+            ReleasePhase::Published => {
+                release.update_docs_and_evidence()?;
                 return Ok(());
             }
-            _ => return Err(WizardError::State),
         }
     }
 }
@@ -442,8 +480,206 @@ impl ReleaseMachine for ProductionRelease<'_> {
         Ok(())
     }
 
+    fn prepare_signing(&mut self) -> Result<(), WizardError> {
+        match verified_signing_context(&self.state, &self.launcher_config) {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                self.prompter.say(
+                    "Signing stopped: the approved qualification or active signing key does not match this release.",
+                )?;
+                Err(error)
+            }
+        }
+    }
+
+    fn require_exact_phrase(&mut self, phrase: &str) -> Result<(), WizardError> {
+        require_phrase(
+            self.prompter,
+            &format!("Type {phrase} to continue: "),
+            phrase,
+        )
+    }
+
+    fn sign(&mut self) -> Result<(), WizardError> {
+        let config = match verified_signing_context(&self.state, &self.launcher_config) {
+            Ok((config, _)) => config,
+            Err(error) => {
+                self.prompter.say(
+                    "Signing stopped: the approved qualification or active signing key does not match this release.",
+                )?;
+                return Err(error);
+            }
+        };
+        let output = self.state.work_dir.join("signed-release-bundle");
+        if output.exists() {
+            return self.verify_signed_bundle();
+        }
+        self.execute(&build_sign(
+            &self.launcher_config,
+            &self.state.work_dir.join("final-acquired-transfer"),
+            &config.private_key_path,
+            &output,
+        ))
+    }
+
+    fn verify_signed_bundle(&mut self) -> Result<(), WizardError> {
+        let result =
+            verified_signing_context(&self.state, &self.launcher_config).and_then(|(_, active)| {
+                verify_signed_bundle_key(
+                    &self.state.work_dir.join("signed-release-bundle"),
+                    &active,
+                )
+            });
+        if let Err(error) = result {
+            self.prompter.say(
+                "Publishing stopped: the signed bundle does not use the approved active signing key.",
+            )?;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn stage_local(&mut self) -> Result<(), WizardError> {
+        self.execute(&build_publish_stage_local(
+            &self.state.work_dir.join("signed-release-bundle"),
+            &self.state.work_dir.join("publish-state"),
+        ))
+    }
+
+    fn stage_remote(&mut self) -> Result<(), WizardError> {
+        self.execute(&build_publish_stage_remote(
+            &self.state.work_dir.join("publish-state"),
+            &publisher_broker_config()?,
+        ))
+    }
+
+    fn approve_draft(&mut self) -> Result<(), WizardError> {
+        let publish_state = self.state.work_dir.join("publish-state");
+        let receipt = read_bounded_regular(
+            &publish_state.join("latest/draft-receipt-v1.json"),
+            8 * 1024 * 1024,
+        )?;
+        let digest = format!("{:x}", Sha256::digest(receipt));
+        self.execute(&build_publish_approve(&publish_state, &digest))
+    }
+
+    fn publish(&mut self) -> Result<(), WizardError> {
+        let publish_state = self.state.work_dir.join("publish-state");
+        self.execute(&build_publish(
+            &publish_state,
+            &publish_state.join("latest/release-approval-v1.json"),
+            &publisher_broker_config()?,
+        ))
+    }
+
+    fn update_docs_and_evidence(&mut self) -> Result<(), WizardError> {
+        let receipt_paths = generate_public_receipts(&self.repo, &self.state)?;
+        let answer = self
+            .prompter
+            .ask("Update docs and evidence files now? [Y/n]")?;
+        if matches!(answer.as_str(), "" | "y" | "Y" | "yes" | "YES") {
+            commit_public_evidence(&self.repo, &self.state, &receipt_paths)
+        } else if matches!(answer.as_str(), "n" | "N" | "no" | "NO") {
+            for path in receipt_paths {
+                self.prompter
+                    .say(&format!("Generated receipt: {}", path.display()))?;
+            }
+            Ok(())
+        } else {
+            Err(WizardError::UserDeclined)
+        }
+    }
+
     fn say(&mut self, message: &str) -> Result<(), WizardError> {
         self.prompter.say(message)
+    }
+}
+
+fn verified_signing_context(
+    state: &WizardState,
+    launcher_config: &Path,
+) -> Result<(PrivateSigningConfig, crate::key_rotation::ActiveSigningKey), WizardError> {
+    let qualification_bytes = read_bounded_regular(
+        &state
+            .work_dir
+            .join("imported-qualification/qualification-v1.json"),
+        8 * 1024 * 1024,
+    )?;
+    let approved = catalog_core::CompatibilityQualificationV1::from_json(&qualification_bytes)
+        .map_err(|_| WizardError::Qualification)?;
+    verify_consumer_keyring_readiness(&approved, production_keyring().sha256())?;
+
+    let config = PrivateSigningConfig::load(&private_config_root()?.join("signing-key.json"))?;
+    let active = verify_active_signing_key(&config.private_key_path, launcher_config)?;
+    if config.signing_key_generation != state.signing_key_generation
+        || active.generation != state.signing_key_generation
+        || active.keyring_sha256 != production_keyring().sha256()
+    {
+        return Err(WizardError::Config);
+    }
+    Ok((config, active))
+}
+
+fn generate_public_receipts(
+    _repo: &Path,
+    state: &WizardState,
+) -> Result<Vec<PathBuf>, WizardError> {
+    let source_root = state.work_dir.join("publish-state/latest");
+    let receipt_root = state.work_dir.join("receipts");
+    let mut generated = Vec::new();
+    for name in ["publication-receipt-v1.json", "latest-receipt-v1.json"] {
+        let bytes = read_bounded_regular(&source_root.join(name), 8 * 1024 * 1024)?;
+        let destination = receipt_root.join(name);
+        write_exact_or_verify(&destination, &bytes)?;
+        generated.push(destination);
+    }
+    Ok(generated)
+}
+
+fn commit_public_evidence(
+    repo: &Path,
+    state: &WizardState,
+    receipt_paths: &[PathBuf],
+) -> Result<(), WizardError> {
+    if receipt_paths.len() != 2 {
+        return Err(WizardError::State);
+    }
+    let destinations = [
+        repo.join(format!(
+            "qualifications/publication-receipt-sequence-{}.json",
+            state.sequence
+        )),
+        repo.join(format!(
+            "qualifications/latest-receipt-sequence-{}.json",
+            state.sequence
+        )),
+    ];
+    let receipt_bytes = receipt_paths
+        .iter()
+        .map(|source| read_bounded_regular(source, 8 * 1024 * 1024))
+        .collect::<Result<Vec<_>, _>>()?;
+    let document = format!(
+        "# Runtime catalog release sequence {}\n\nPublic release evidence:\n\n- `qualifications/publication-receipt-sequence-{}.json`\n- `qualifications/latest-receipt-sequence-{}.json`\n",
+        state.sequence, state.sequence, state.sequence
+    );
+    let document_path = repo.join(format!("docs/release-sequence-{}.md", state.sequence));
+
+    for (destination, bytes) in destinations.iter().zip(receipt_bytes.iter()) {
+        require_absent_or_exact(destination, bytes)?;
+    }
+    require_absent_or_exact(&document_path, document.as_bytes())?;
+    for (destination, bytes) in destinations.iter().zip(receipt_bytes.iter()) {
+        write_exact_or_verify(destination, bytes)?;
+    }
+    write_exact_or_verify(&document_path, document.as_bytes())
+}
+
+fn require_absent_or_exact(path: &Path, bytes: &[u8]) -> Result<(), WizardError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) if read_bounded_regular(path, 8 * 1024 * 1024)? == bytes => Ok(()),
+        Ok(_) => Err(WizardError::State),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(WizardError::Io),
     }
 }
 
@@ -975,6 +1211,8 @@ mod tests {
         saved_phases: Vec<ReleasePhase>,
         messages: Vec<String>,
         parity_verified: bool,
+        answers: std::collections::VecDeque<String>,
+        required_phrases: Vec<String>,
     }
 
     impl ReleaseHarness {
@@ -987,6 +1225,26 @@ mod tests {
                 saved_phases: Vec::new(),
                 messages: Vec::new(),
                 parity_verified: false,
+                answers: std::collections::VecDeque::new(),
+                required_phrases: Vec::new(),
+            }
+        }
+
+        fn publish_fixture_with_answers<I, S>(answers: I) -> Self
+        where
+            I: IntoIterator<Item = S>,
+            S: Into<String>,
+        {
+            Self {
+                phase: ReleasePhase::Qualified,
+                mode: RunMode::PublishCapable,
+                qualification_available: true,
+                executed: Vec::new(),
+                saved_phases: Vec::new(),
+                messages: Vec::new(),
+                parity_verified: true,
+                answers: answers.into_iter().map(Into::into).collect(),
+                required_phrases: Vec::new(),
             }
         }
     }
@@ -1035,6 +1293,50 @@ mod tests {
                 .push("catalog-sign-launcher finalize --input final-transfer".to_owned());
             self.parity_verified = true;
             Ok(())
+        }
+        fn prepare_signing(&mut self) -> Result<(), WizardError> {
+            self.executed.push("verify-signing-readiness".to_owned());
+            Ok(())
+        }
+        fn require_exact_phrase(&mut self, phrase: &str) -> Result<(), WizardError> {
+            self.required_phrases.push(phrase.to_owned());
+            if self.answers.pop_front().as_deref() == Some(phrase) {
+                Ok(())
+            } else {
+                Err(WizardError::UserDeclined)
+            }
+        }
+        fn sign(&mut self) -> Result<(), WizardError> {
+            self.executed
+                .push("catalog-sign-launcher sign --input final-transfer".to_owned());
+            Ok(())
+        }
+        fn verify_signed_bundle(&mut self) -> Result<(), WizardError> {
+            self.executed.push("verify-signed-bundle-key".to_owned());
+            Ok(())
+        }
+        fn stage_local(&mut self) -> Result<(), WizardError> {
+            self.executed.push("catalog-publish stage-local".to_owned());
+            Ok(())
+        }
+        fn stage_remote(&mut self) -> Result<(), WizardError> {
+            self.executed
+                .push("catalog-publish stage-remote".to_owned());
+            Ok(())
+        }
+        fn approve_draft(&mut self) -> Result<(), WizardError> {
+            self.executed.push("catalog-publish approve".to_owned());
+            Ok(())
+        }
+        fn publish(&mut self) -> Result<(), WizardError> {
+            self.executed.push("catalog-publish publish".to_owned());
+            Ok(())
+        }
+        fn update_docs_and_evidence(&mut self) -> Result<(), WizardError> {
+            match self.answers.pop_front().as_deref() {
+                Some("" | "y" | "Y" | "yes" | "YES" | "n" | "N" | "no" | "NO") => Ok(()),
+                _ => Err(WizardError::UserDeclined),
+            }
         }
         fn say(&mut self, message: &str) -> Result<(), WizardError> {
             self.messages.push(message.to_owned());
@@ -1206,6 +1508,117 @@ mod tests {
             resume_config_path(repo, None),
             PathBuf::from("/repo/catalog-wizard.toml")
         );
+    }
+
+    #[test]
+    fn publish_capable_run_requires_all_exact_phrases_in_order() {
+        let mut harness = ReleaseHarness::publish_fixture_with_answers([
+            "SIGN",
+            "CREATE TAG",
+            "CREATE DRAFT",
+            "UPLOAD ASSETS",
+            "PUBLISH",
+            "n",
+        ]);
+        run_release_with_harness(&mut harness).unwrap();
+        assert_eq!(
+            harness.required_phrases,
+            vec![
+                "SIGN",
+                "CREATE TAG",
+                "CREATE DRAFT",
+                "UPLOAD ASSETS",
+                "PUBLISH",
+            ]
+        );
+        assert_eq!(harness.phase, ReleasePhase::Published);
+        assert_eq!(
+            harness.executed,
+            vec![
+                "verify-signing-readiness",
+                "catalog-sign-launcher sign --input final-transfer",
+                "verify-signed-bundle-key",
+                "verify-signed-bundle-key",
+                "catalog-publish stage-local",
+                "catalog-publish stage-remote",
+                "catalog-publish approve",
+                "catalog-publish publish",
+            ]
+        );
+    }
+
+    #[test]
+    fn declined_remote_approval_stops_before_any_remote_mutation() {
+        let mut harness =
+            ReleaseHarness::publish_fixture_with_answers(["SIGN", "wrong tag approval"]);
+        assert_eq!(
+            run_release_with_harness(&mut harness),
+            Err(WizardError::UserDeclined)
+        );
+        assert!(
+            !harness
+                .executed
+                .iter()
+                .any(|command| command == "catalog-publish stage-remote")
+        );
+        assert!(
+            !harness
+                .executed
+                .iter()
+                .any(|command| command == "catalog-publish publish")
+        );
+    }
+
+    #[test]
+    fn generated_receipts_and_committed_evidence_are_deterministic() {
+        let repo = std::env::temp_dir().join(format!(
+            "catalog-wizard-evidence-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let work_dir = repo.join(".release-work/sequence-2");
+        let latest = work_dir.join("publish-state/latest");
+        fs::create_dir_all(&latest).unwrap();
+        fs::write(
+            latest.join("publication-receipt-v1.json"),
+            b"{\"publication\":true}",
+        )
+        .unwrap();
+        fs::write(latest.join("latest-receipt-v1.json"), b"{\"latest\":true}").unwrap();
+        let state = WizardState {
+            schema_version: 1,
+            sequence: 2,
+            pi_version: "0.84.0".to_owned(),
+            node_version: "22.20.0".to_owned(),
+            target: TARGET.to_owned(),
+            mode: RunMode::PublishCapable,
+            phase: ReleasePhase::Published,
+            signing_key_generation: 1,
+            catalog_source_commit: "11".repeat(20),
+            catalog_source_tree_sha256: "22".repeat(32),
+            work_dir,
+        };
+
+        let receipts = generate_public_receipts(&repo, &state).unwrap();
+        commit_public_evidence(&repo, &state, &receipts).unwrap();
+        generate_public_receipts(&repo, &state).unwrap();
+        commit_public_evidence(&repo, &state, &receipts).unwrap();
+
+        assert_eq!(
+            fs::read(repo.join("qualifications/publication-receipt-sequence-2.json")).unwrap(),
+            b"{\"publication\":true}"
+        );
+        assert_eq!(
+            fs::read(repo.join("qualifications/latest-receipt-sequence-2.json")).unwrap(),
+            b"{\"latest\":true}"
+        );
+        assert_eq!(
+            fs::read_to_string(repo.join("docs/release-sequence-2.md")).unwrap(),
+            "# Runtime catalog release sequence 2\n\nPublic release evidence:\n\n- `qualifications/publication-receipt-sequence-2.json`\n- `qualifications/latest-receipt-sequence-2.json`\n"
+        );
+        fs::remove_dir_all(repo).unwrap();
     }
 
     #[test]

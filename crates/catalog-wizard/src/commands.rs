@@ -71,6 +71,47 @@ pub fn build_publish_stage_local(bundle: &Path, state: &Path) -> CommandPlan {
     )
 }
 
+pub fn build_publish_stage_remote(state: &Path, broker_config: &Path) -> CommandPlan {
+    plan(
+        "catalog-publish",
+        [
+            "stage-remote".to_owned(),
+            "--state".to_owned(),
+            path(state),
+            "--broker-config".to_owned(),
+            path(broker_config),
+        ],
+    )
+}
+
+pub fn build_publish_approve(state: &Path, draft_receipt_sha256: &str) -> CommandPlan {
+    plan(
+        "catalog-publish",
+        [
+            "approve".to_owned(),
+            "--state".to_owned(),
+            path(state),
+            "--draft-receipt-sha256".to_owned(),
+            draft_receipt_sha256.to_owned(),
+        ],
+    )
+}
+
+pub fn build_publish(state: &Path, approval: &Path, broker_config: &Path) -> CommandPlan {
+    plan(
+        "catalog-publish",
+        [
+            "publish".to_owned(),
+            "--state".to_owned(),
+            path(state),
+            "--approval".to_owned(),
+            path(approval),
+            "--broker-config".to_owned(),
+            path(broker_config),
+        ],
+    )
+}
+
 fn signer_plan(
     ceremony: &str,
     config: &Path,
@@ -230,6 +271,43 @@ mod tests {
                 "signed",
                 "--state",
                 "publish-state"
+            ]
+        );
+        assert_eq!(
+            build_publish_stage_remote(Path::new("publish-state"), Path::new("broker.json")).args,
+            vec![
+                "stage-remote",
+                "--state",
+                "publish-state",
+                "--broker-config",
+                "broker.json"
+            ]
+        );
+        assert_eq!(
+            build_publish_approve(Path::new("publish-state"), &"11".repeat(32)).args,
+            vec![
+                "approve",
+                "--state",
+                "publish-state",
+                "--draft-receipt-sha256",
+                &"11".repeat(32)
+            ]
+        );
+        assert_eq!(
+            build_publish(
+                Path::new("publish-state"),
+                Path::new("approval.json"),
+                Path::new("broker.json")
+            )
+            .args,
+            vec![
+                "publish",
+                "--state",
+                "publish-state",
+                "--approval",
+                "approval.json",
+                "--broker-config",
+                "broker.json"
             ]
         );
     }
