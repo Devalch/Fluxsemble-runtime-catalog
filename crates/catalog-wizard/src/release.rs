@@ -13,7 +13,12 @@ use catalog_core::{
     production_keyring, qualification_record_digest,
 };
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use reqwest::{StatusCode, blocking::Client, header::USER_AGENT, redirect::Policy};
+use reqwest::{
+    StatusCode,
+    blocking::Client,
+    header::{LINK, USER_AGENT},
+    redirect::Policy,
+};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
@@ -40,7 +45,7 @@ use crate::{
 const TARGET: &str = "linux_x86_64";
 const STATE_ROOT: &str = ".release-work";
 const MAX_GITHUB_RESPONSE_BYTES: u64 = 1024 * 1024;
-const GITHUB_TAGS_URL: &str = "https://api.github.com/repos/Devalch/Fluxsemble-runtime-catalog/git/matching-refs/tags/catalog-v1-sequence-";
+const GITHUB_TAGS_URL: &str = "https://api.github.com/repos/Devalch/Fluxsemble-runtime-catalog/git/matching-refs/tags/catalog-v1-sequence-?per_page=100";
 const GITHUB_RELEASES_URL: &str =
     "https://api.github.com/repos/Devalch/Fluxsemble-runtime-catalog/releases?per_page=100";
 const REPOSITORY: &str = "Devalch/Fluxsemble-runtime-catalog";
@@ -838,10 +843,11 @@ fn github_sequence_observation(
     local: Option<u64>,
     broker_config: &Path,
 ) -> Result<GithubSequenceObservation, WizardError> {
-    let tags_value = fetch_fixed_github_json(GITHUB_TAGS_URL)?;
-    let releases_value = fetch_fixed_github_json(GITHUB_RELEASES_URL)?;
-    let tags = parse_catalog_tag_sequences(&tags_value)?;
-    let published = parse_published_sequence(&releases_value)?;
+    let tags_page = fetch_fixed_github_json(GITHUB_TAGS_URL)?;
+    let releases_page = fetch_fixed_github_json(GITHUB_RELEASES_URL)?;
+    let tags = parse_catalog_tag_sequences(&tags_page.value, tags_page.pagination_link_present)?;
+    let published =
+        parse_published_sequence(&releases_page.value, releases_page.pagination_link_present)?;
     let next = compare_sequences(local, published).map_err(|_| WizardError::Discovery)?;
     let next_draft_exists = catalog_publish::catalog_draft_exists(broker_config, next)
         .map_err(|_| WizardError::Discovery)?;
@@ -852,7 +858,12 @@ fn github_sequence_observation(
     })
 }
 
-fn fetch_fixed_github_json(url: &'static str) -> Result<serde_json::Value, WizardError> {
+struct GithubJsonPage {
+    value: serde_json::Value,
+    pagination_link_present: bool,
+}
+
+fn fetch_fixed_github_json(url: &'static str) -> Result<GithubJsonPage, WizardError> {
     let client = Client::builder()
         .https_only(true)
         .use_rustls_tls()
@@ -870,6 +881,7 @@ fn fetch_fixed_github_json(url: &'static str) -> Result<serde_json::Value, Wizar
     if response.status() != StatusCode::OK {
         return Err(WizardError::Discovery);
     }
+    let pagination_link_present = response.headers().contains_key(LINK);
     let mut bytes = Vec::new();
     response
         .take(MAX_GITHUB_RESPONSE_BYTES + 1)
@@ -878,12 +890,19 @@ fn fetch_fixed_github_json(url: &'static str) -> Result<serde_json::Value, Wizar
     if bytes.len() as u64 > MAX_GITHUB_RESPONSE_BYTES {
         return Err(WizardError::Discovery);
     }
-    serde_json::from_slice(&bytes).map_err(|_| WizardError::Discovery)
+    let value = serde_json::from_slice(&bytes).map_err(|_| WizardError::Discovery)?;
+    Ok(GithubJsonPage {
+        value,
+        pagination_link_present,
+    })
 }
 
-fn parse_catalog_tag_sequences(value: &serde_json::Value) -> Result<BTreeSet<u64>, WizardError> {
+fn parse_catalog_tag_sequences(
+    value: &serde_json::Value,
+    pagination_link_present: bool,
+) -> Result<BTreeSet<u64>, WizardError> {
     let values = value.as_array().ok_or(WizardError::Discovery)?;
-    if values.len() >= 100 {
+    if pagination_link_present || values.len() >= 100 {
         return Err(WizardError::Discovery);
     }
     values
@@ -900,9 +919,12 @@ fn parse_catalog_tag_sequences(value: &serde_json::Value) -> Result<BTreeSet<u64
         .collect()
 }
 
-fn parse_published_sequence(value: &serde_json::Value) -> Result<Option<u64>, WizardError> {
+fn parse_published_sequence(
+    value: &serde_json::Value,
+    pagination_link_present: bool,
+) -> Result<Option<u64>, WizardError> {
     let values = value.as_array().ok_or(WizardError::Discovery)?;
-    if values.len() >= 100 {
+    if pagination_link_present || values.len() >= 100 {
         return Err(WizardError::Discovery);
     }
     let mut published = None;
@@ -1022,6 +1044,23 @@ mod tests {
 
     fn run_release_with_harness(harness: &mut ReleaseHarness) -> Result<(), WizardError> {
         drive_release(harness)
+    }
+
+    #[test]
+    fn github_tag_observation_requests_maximum_page_and_rejects_pagination() {
+        assert!(GITHUB_TAGS_URL.ends_with("?per_page=100"));
+        let partial = json!([{"ref": "refs/tags/catalog-v1-sequence-4"}]);
+        assert!(parse_catalog_tag_sequences(&partial, true).is_err());
+        assert_eq!(
+            parse_catalog_tag_sequences(&partial, false).unwrap(),
+            BTreeSet::from([4])
+        );
+        let maximum_page = serde_json::Value::Array(
+            (1..=100)
+                .map(|sequence| json!({"ref": format!("refs/tags/catalog-v1-sequence-{sequence}")}))
+                .collect(),
+        );
+        assert!(parse_catalog_tag_sequences(&maximum_page, false).is_err());
     }
 
     #[test]
