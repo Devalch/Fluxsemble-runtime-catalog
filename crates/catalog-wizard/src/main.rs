@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use catalog_wizard::{
     cli::{self, Command, HelpTopic},
     prompt::StdioPrompter,
-    trust,
+    release, trust,
 };
 
 fn main() {
@@ -16,6 +16,16 @@ fn main() {
                 cli::command_help(&command).unwrap_or(cli::root_help())
             )
         }
+        Ok(Command::Release(options)) => {
+            run_guided(|prompter| release::run_release(options, prompter))
+        }
+        Ok(Command::Resume(options)) => run_guided(|prompter| match options.qualification {
+            Some(path) => release::resume_release_with_qualification(
+                Some(std::path::Path::new(&path)),
+                prompter,
+            ),
+            None => release::resume_release(prompter),
+        }),
         Ok(Command::TrustMachine) => run_trust_machine(),
         Ok(command) => {
             eprintln!("Command requires the guided workflow modules: {command:?}");
@@ -25,6 +35,16 @@ fn main() {
             eprintln!("Invalid command. Run `catalog-wizard --help`.");
             std::process::exit(2);
         }
+    }
+}
+
+fn run_guided(run: impl FnOnce(&mut StdioPrompter) -> Result<(), catalog_wizard::WizardError>) {
+    let mut prompter = StdioPrompter::new();
+    if run(&mut prompter).is_err() {
+        eprintln!(
+            "Guided release stopped safely. Run `catalog-wizard resume` or `catalog-wizard check`."
+        );
+        std::process::exit(2);
     }
 }
 
