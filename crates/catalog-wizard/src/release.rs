@@ -19,6 +19,7 @@ use reqwest::{
     header::{LINK, USER_AGENT},
     redirect::Policy,
 };
+use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
@@ -51,6 +52,55 @@ const GITHUB_TAGS_URL: &str = "https://api.github.com/repos/Devalch/Fluxsemble-r
 const GITHUB_RELEASES_URL: &str =
     "https://api.github.com/repos/Devalch/Fluxsemble-runtime-catalog/releases?per_page=100";
 const REPOSITORY: &str = "Devalch/Fluxsemble-runtime-catalog";
+const EVIDENCE_COMPLETION_NAME: &str = "evidence-complete-v1";
+const EVIDENCE_COMPLETION_BYTES: &[u8] = b"catalog-wizard-evidence-complete-v1\n";
+const MAX_PUBLIC_RECEIPT_ASSETS: usize = 64;
+const MAX_PUBLIC_FIELD_BYTES: usize = 512;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublicReceiptAssetV1 {
+    asset_id: String,
+    name: String,
+    size: u64,
+    sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublicPublicationReceiptV1 {
+    schema_version: u16,
+    publication_id: String,
+    phase: String,
+    approval_sha256: String,
+    draft_receipt_sha256: String,
+    repository: String,
+    release_id: String,
+    tag: String,
+    source_commit: String,
+    assets: Vec<PublicReceiptAssetV1>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublicLatestCatalogV1 {
+    name: String,
+    size: u64,
+    sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublicLatestReceiptV1 {
+    schema_version: u16,
+    latest_id: String,
+    phase: String,
+    publication_sha256: String,
+    repository: String,
+    release_id: String,
+    tag: String,
+    catalog: PublicLatestCatalogV1,
+}
 
 pub fn run_release(
     options: ReleaseOptions,
@@ -203,15 +253,21 @@ fn resume_in_repo(
     qualification_path: Option<&Path>,
     prompter: &mut dyn Prompter,
 ) -> Result<(), WizardError> {
-    require_clean_head(repo)?;
     let state = select_resumable_state(repo, prompter)?;
     validate_resumed_state(repo, &state)?;
+    if state.phase == ReleasePhase::Published {
+        require_clean_or_exact_pending_evidence(repo, &state)?;
+    } else {
+        require_clean_head(repo)?;
+    }
     verify_resumed_source_identity(&state, &source_identity(repo)?)?;
     require_trusted_machine(repo, required_roles(state.mode))?;
-    let local = local_latest_sequence(repo)?;
-    let observation = github_sequence_observation(local, &publisher_broker_config()?)?;
-    if reconcile_github_state(local, &observation)? != state.sequence {
-        return Err(WizardError::Discovery);
+    if state.phase != ReleasePhase::Published {
+        let local = local_latest_sequence(repo)?;
+        let observation = github_sequence_observation(local, &publisher_broker_config()?)?;
+        if reconcile_github_state(local, &observation)? != state.sequence {
+            return Err(WizardError::Discovery);
+        }
     }
     let launcher_config = private_config_root()?.join("launcher-config-v1.json");
     let mut release = ProductionRelease::new(
@@ -578,16 +634,16 @@ impl ReleaseMachine for ProductionRelease<'_> {
             .prompter
             .ask("Update docs and evidence files now? [Y/n]")?;
         if matches!(answer.as_str(), "" | "y" | "Y" | "yes" | "YES") {
-            commit_public_evidence(&self.repo, &self.state, &receipt_paths)
+            commit_public_evidence(&self.repo, &self.state, &receipt_paths)?;
         } else if matches!(answer.as_str(), "n" | "N" | "no" | "NO") {
             for path in receipt_paths {
                 self.prompter
                     .say(&format!("Generated receipt: {}", path.display()))?;
             }
-            Ok(())
         } else {
-            Err(WizardError::UserDeclined)
+            return Err(WizardError::UserDeclined);
         }
+        mark_evidence_complete(&self.state)
     }
 
     fn say(&mut self, message: &str) -> Result<(), WizardError> {
@@ -625,15 +681,129 @@ fn generate_public_receipts(
     state: &WizardState,
 ) -> Result<Vec<PathBuf>, WizardError> {
     let source_root = state.work_dir.join("publish-state/latest");
+    let publication = read_bounded_regular(
+        &source_root.join("publication-receipt-v1.json"),
+        8 * 1024 * 1024,
+    )?;
+    let latest =
+        read_bounded_regular(&source_root.join("latest-receipt-v1.json"), 8 * 1024 * 1024)?;
+    validate_public_receipts(state, &publication, &latest)?;
+
     let receipt_root = state.work_dir.join("receipts");
-    let mut generated = Vec::new();
-    for name in ["publication-receipt-v1.json", "latest-receipt-v1.json"] {
-        let bytes = read_bounded_regular(&source_root.join(name), 8 * 1024 * 1024)?;
-        let destination = receipt_root.join(name);
-        write_exact_or_verify(&destination, &bytes)?;
-        generated.push(destination);
-    }
+    let generated = vec![
+        receipt_root.join("publication-receipt-v1.json"),
+        receipt_root.join("latest-receipt-v1.json"),
+    ];
+    require_absent_or_exact(&generated[0], &publication)?;
+    require_absent_or_exact(&generated[1], &latest)?;
+    write_exact_or_verify(&generated[0], &publication)?;
+    write_exact_or_verify(&generated[1], &latest)?;
     Ok(generated)
+}
+
+fn validate_public_receipts(
+    state: &WizardState,
+    publication_bytes: &[u8],
+    latest_bytes: &[u8],
+) -> Result<(), WizardError> {
+    let publication_contract: catalog_publish::PublicationReceiptV1 =
+        serde_json::from_slice(publication_bytes).map_err(|_| WizardError::State)?;
+    let latest_contract: catalog_publish::LatestReceiptV1 =
+        serde_json::from_slice(latest_bytes).map_err(|_| WizardError::State)?;
+    if serde_jcs::to_vec(&publication_contract).map_err(|_| WizardError::State)?
+        != publication_bytes
+        || serde_jcs::to_vec(&latest_contract).map_err(|_| WizardError::State)? != latest_bytes
+    {
+        return Err(WizardError::State);
+    }
+    let publication: PublicPublicationReceiptV1 =
+        serde_json::from_slice(publication_bytes).map_err(|_| WizardError::State)?;
+    let latest: PublicLatestReceiptV1 =
+        serde_json::from_slice(latest_bytes).map_err(|_| WizardError::State)?;
+
+    let expected_tag = format!("catalog-v1-sequence-{}", state.sequence);
+    if state.phase != ReleasePhase::Published
+        || publication.schema_version != 1
+        || publication.phase != "published_latest_pending"
+        || publication.repository != REPOSITORY
+        || publication.tag != expected_tag
+        || publication.source_commit != state.catalog_source_commit
+        || !valid_sha256(&publication.publication_id)
+        || !valid_sha256(&publication.approval_sha256)
+        || !valid_sha256(&publication.draft_receipt_sha256)
+        || !valid_remote_id(&publication.release_id)
+        || publication.assets.is_empty()
+        || publication.assets.len() > MAX_PUBLIC_RECEIPT_ASSETS
+        || latest.schema_version != 1
+        || latest.phase != "latest_verified"
+        || latest.publication_sha256 != format!("{:x}", Sha256::digest(publication_bytes))
+        || latest.repository != publication.repository
+        || latest.release_id != publication.release_id
+        || latest.tag != publication.tag
+        || !valid_sha256(&latest.latest_id)
+        || latest.catalog.name != "catalog-v1.json"
+        || latest.catalog.size == 0
+        || !valid_sha256(&latest.catalog.sha256)
+    {
+        return Err(WizardError::State);
+    }
+
+    let mut asset_ids = BTreeSet::new();
+    let mut asset_names = BTreeSet::new();
+    for asset in &publication.assets {
+        if !valid_remote_id(&asset.asset_id)
+            || !valid_public_asset_name(&asset.name)
+            || asset.size == 0
+            || !valid_sha256(&asset.sha256)
+            || !asset_ids.insert(asset.asset_id.as_str())
+            || !asset_names.insert(asset.name.as_str())
+        {
+            return Err(WizardError::State);
+        }
+    }
+    if !publication.assets.iter().any(|asset| {
+        asset.name == latest.catalog.name
+            && asset.size == latest.catalog.size
+            && asset.sha256 == latest.catalog.sha256
+    }) {
+        return Err(WizardError::State);
+    }
+    Ok(())
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64 && lower_hex(value)
+}
+
+fn valid_remote_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_PUBLIC_FIELD_BYTES
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn valid_public_asset_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 255
+        && !matches!(value, "." | "..")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn evidence_complete(state: &WizardState) -> Result<bool, WizardError> {
+    let path = state.work_dir.join(EVIDENCE_COMPLETION_NAME);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => Ok(read_bounded_regular(&path, 128)? == EVIDENCE_COMPLETION_BYTES),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(WizardError::State),
+    }
+}
+
+fn mark_evidence_complete(state: &WizardState) -> Result<(), WizardError> {
+    write_exact_or_verify(
+        &state.work_dir.join(EVIDENCE_COMPLETION_NAME),
+        EVIDENCE_COMPLETION_BYTES,
+    )
 }
 
 fn commit_public_evidence(
@@ -644,34 +814,112 @@ fn commit_public_evidence(
     if receipt_paths.len() != 2 {
         return Err(WizardError::State);
     }
-    let destinations = [
-        repo.join(format!(
-            "qualifications/publication-receipt-sequence-{}.json",
-            state.sequence
-        )),
-        repo.join(format!(
-            "qualifications/latest-receipt-sequence-{}.json",
-            state.sequence
-        )),
-    ];
     let receipt_bytes = receipt_paths
         .iter()
         .map(|source| read_bounded_regular(source, 8 * 1024 * 1024))
         .collect::<Result<Vec<_>, _>>()?;
+    validate_public_receipts(state, &receipt_bytes[0], &receipt_bytes[1])?;
+    let outputs = public_evidence_outputs(repo, state, &receipt_bytes);
+    for (destination, bytes) in &outputs {
+        require_absent_or_exact(destination, bytes)?;
+    }
+    for (destination, bytes) in &outputs {
+        write_exact_or_verify(destination, bytes)?;
+    }
+    Ok(())
+}
+
+fn public_evidence_outputs(
+    repo: &Path,
+    state: &WizardState,
+    receipt_bytes: &[Vec<u8>],
+) -> Vec<(PathBuf, Vec<u8>)> {
     let document = format!(
         "# Runtime catalog release sequence {}\n\nPublic release evidence:\n\n- `qualifications/publication-receipt-sequence-{}.json`\n- `qualifications/latest-receipt-sequence-{}.json`\n",
         state.sequence, state.sequence, state.sequence
     );
-    let document_path = repo.join(format!("docs/release-sequence-{}.md", state.sequence));
+    vec![
+        (
+            repo.join(format!(
+                "qualifications/publication-receipt-sequence-{}.json",
+                state.sequence
+            )),
+            receipt_bytes[0].clone(),
+        ),
+        (
+            repo.join(format!(
+                "qualifications/latest-receipt-sequence-{}.json",
+                state.sequence
+            )),
+            receipt_bytes[1].clone(),
+        ),
+        (
+            repo.join(format!("docs/release-sequence-{}.md", state.sequence)),
+            document.into_bytes(),
+        ),
+    ]
+}
 
-    for (destination, bytes) in destinations.iter().zip(receipt_bytes.iter()) {
-        require_absent_or_exact(destination, bytes)?;
+fn require_clean_or_exact_pending_evidence(
+    repo: &Path,
+    state: &WizardState,
+) -> Result<(), WizardError> {
+    if require_clean_head(repo).is_ok() {
+        return Ok(());
     }
-    require_absent_or_exact(&document_path, document.as_bytes())?;
-    for (destination, bytes) in destinations.iter().zip(receipt_bytes.iter()) {
-        write_exact_or_verify(destination, bytes)?;
+    let publication = read_bounded_regular(
+        &state
+            .work_dir
+            .join("publish-state/latest/publication-receipt-v1.json"),
+        8 * 1024 * 1024,
+    )?;
+    let latest = read_bounded_regular(
+        &state
+            .work_dir
+            .join("publish-state/latest/latest-receipt-v1.json"),
+        8 * 1024 * 1024,
+    )?;
+    validate_public_receipts(state, &publication, &latest)?;
+    let outputs = public_evidence_outputs(repo, state, &[publication, latest]);
+
+    let staged = Command::new("git")
+        .args(["diff", "--cached", "--quiet"])
+        .current_dir(repo)
+        .status()
+        .map_err(|_| WizardError::Config)?;
+    if !staged.success() {
+        return Err(WizardError::Config);
     }
-    write_exact_or_verify(&document_path, document.as_bytes())
+    let status = Command::new("git")
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .current_dir(repo)
+        .output()
+        .map_err(|_| WizardError::Config)?;
+    if !status.status.success() || !status.stderr.is_empty() || status.stdout.is_empty() {
+        return Err(WizardError::Config);
+    }
+    for record in status
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+    {
+        if record.len() < 4 || !matches!(&record[..3], b"?? " | b" M ") {
+            return Err(WizardError::Config);
+        }
+        let relative = std::str::from_utf8(&record[3..]).map_err(|_| WizardError::Config)?;
+        let Some((path, expected)) = outputs.iter().find(|(path, _)| {
+            path.strip_prefix(repo)
+                .ok()
+                .and_then(Path::to_str)
+                .is_some_and(|candidate| candidate == relative)
+        }) else {
+            return Err(WizardError::Config);
+        };
+        if read_bounded_regular(path, 8 * 1024 * 1024)? != *expected {
+            return Err(WizardError::Config);
+        }
+    }
+    Ok(())
 }
 
 fn require_absent_or_exact(path: &Path, bytes: &[u8]) -> Result<(), WizardError> {
@@ -878,7 +1126,7 @@ fn resumable_states(repo: &Path) -> Result<Vec<WizardState>, WizardError> {
             if state.sequence != sequence {
                 return Err(WizardError::State);
             }
-            if !matches!(state.phase, ReleasePhase::Published) {
+            if !matches!(state.phase, ReleasePhase::Published) || !evidence_complete(&state)? {
                 states.push(state);
             }
         }
@@ -1202,6 +1450,7 @@ fn encode_sha256(bytes: &[u8; 32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     struct ReleaseHarness {
         phase: ReleasePhase,
@@ -1346,6 +1595,58 @@ mod tests {
 
     fn run_release_with_harness(harness: &mut ReleaseHarness) -> Result<(), WizardError> {
         drive_release(harness)
+    }
+
+    fn public_receipt_fixture(state: &WizardState) -> (serde_json::Value, serde_json::Value) {
+        let publication = json!({
+            "schema_version": 1,
+            "publication_id": "33".repeat(32),
+            "phase": "published_latest_pending",
+            "approval_sha256": "44".repeat(32),
+            "draft_receipt_sha256": "55".repeat(32),
+            "repository": REPOSITORY,
+            "release_id": "12345",
+            "tag": format!("catalog-v1-sequence-{}", state.sequence),
+            "source_commit": state.catalog_source_commit,
+            "assets": [{
+                "asset_id": "67890",
+                "name": "catalog-v1.json",
+                "size": 20,
+                "sha256": "66".repeat(32),
+            }],
+        });
+        let publication_bytes = serde_jcs::to_vec(&publication).unwrap();
+        let latest = json!({
+            "schema_version": 1,
+            "latest_id": "77".repeat(32),
+            "phase": "latest_verified",
+            "publication_sha256": format!("{:x}", Sha256::digest(&publication_bytes)),
+            "repository": REPOSITORY,
+            "release_id": "12345",
+            "tag": format!("catalog-v1-sequence-{}", state.sequence),
+            "catalog": {
+                "name": "catalog-v1.json",
+                "size": 20,
+                "sha256": "66".repeat(32),
+            },
+        });
+        (publication, latest)
+    }
+
+    fn write_public_receipt_fixture(
+        latest_root: &Path,
+        publication: &serde_json::Value,
+        latest: &serde_json::Value,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let publication_bytes = serde_jcs::to_vec(publication).unwrap();
+        let latest_bytes = serde_jcs::to_vec(latest).unwrap();
+        fs::write(
+            latest_root.join("publication-receipt-v1.json"),
+            &publication_bytes,
+        )
+        .unwrap();
+        fs::write(latest_root.join("latest-receipt-v1.json"), &latest_bytes).unwrap();
+        (publication_bytes, latest_bytes)
     }
 
     #[test]
@@ -1570,6 +1871,98 @@ mod tests {
     }
 
     #[test]
+    fn published_state_without_evidence_completion_remains_resumable() {
+        let repo = std::env::temp_dir().join(format!(
+            "catalog-wizard-published-resume-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let work_dir = repo.join(".release-work/sequence-2");
+        let state = WizardState {
+            schema_version: 1,
+            sequence: 2,
+            pi_version: "0.84.0".to_owned(),
+            node_version: "22.20.0".to_owned(),
+            target: TARGET.to_owned(),
+            mode: RunMode::PublishCapable,
+            phase: ReleasePhase::Published,
+            signing_key_generation: 1,
+            catalog_source_commit: "11".repeat(20),
+            catalog_source_tree_sha256: "22".repeat(32),
+            work_dir: work_dir.clone(),
+        };
+        state.save(&work_dir.join("wizard-state.json")).unwrap();
+
+        assert_eq!(resumable_states(&repo).unwrap(), vec![state.clone()]);
+        mark_evidence_complete(&state).unwrap();
+        assert!(resumable_states(&repo).unwrap().is_empty());
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn malformed_or_path_bearing_receipts_are_rejected_before_generation() {
+        let repo = std::env::temp_dir().join(format!(
+            "catalog-wizard-unsafe-evidence-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let work_dir = repo.join(".release-work/sequence-2");
+        let latest_root = work_dir.join("publish-state/latest");
+        fs::create_dir_all(&latest_root).unwrap();
+        let state = WizardState {
+            schema_version: 1,
+            sequence: 2,
+            pi_version: "0.84.0".to_owned(),
+            node_version: "22.20.0".to_owned(),
+            target: TARGET.to_owned(),
+            mode: RunMode::PublishCapable,
+            phase: ReleasePhase::Published,
+            signing_key_generation: 1,
+            catalog_source_commit: "11".repeat(20),
+            catalog_source_tree_sha256: "22".repeat(32),
+            work_dir: work_dir.clone(),
+        };
+        let (mut publication, mut latest) = public_receipt_fixture(&state);
+        publication["assets"][0]["name"] = json!("/private/release.key");
+        let path_publication = serde_jcs::to_vec(&publication).unwrap();
+        latest["publication_sha256"] = json!(format!("{:x}", Sha256::digest(&path_publication)));
+        let path_latest = serde_jcs::to_vec(&latest).unwrap();
+
+        let (mut wrong_publication, mut wrong_latest) = public_receipt_fixture(&state);
+        wrong_publication["tag"] = json!("catalog-v1-sequence-3");
+        let wrong_publication = serde_jcs::to_vec(&wrong_publication).unwrap();
+        wrong_latest["tag"] = json!("catalog-v1-sequence-3");
+        wrong_latest["publication_sha256"] =
+            json!(format!("{:x}", Sha256::digest(&wrong_publication)));
+        let wrong_latest = serde_jcs::to_vec(&wrong_latest).unwrap();
+        let cases = [
+            (b"not-json".to_vec(), path_latest.clone()),
+            (
+                br#"{"private_key_path":"/private/release.key"}"#.to_vec(),
+                path_latest.clone(),
+            ),
+            (path_publication, path_latest),
+            (wrong_publication, wrong_latest),
+        ];
+
+        for (publication_bytes, latest_bytes) in cases {
+            fs::write(
+                latest_root.join("publication-receipt-v1.json"),
+                publication_bytes,
+            )
+            .unwrap();
+            fs::write(latest_root.join("latest-receipt-v1.json"), latest_bytes).unwrap();
+            assert!(generate_public_receipts(&repo, &state).is_err());
+            assert!(!work_dir.join("receipts").exists());
+        }
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
     fn generated_receipts_and_committed_evidence_are_deterministic() {
         let repo = std::env::temp_dir().join(format!(
             "catalog-wizard-evidence-{}",
@@ -1581,12 +1974,6 @@ mod tests {
         let work_dir = repo.join(".release-work/sequence-2");
         let latest = work_dir.join("publish-state/latest");
         fs::create_dir_all(&latest).unwrap();
-        fs::write(
-            latest.join("publication-receipt-v1.json"),
-            b"{\"publication\":true}",
-        )
-        .unwrap();
-        fs::write(latest.join("latest-receipt-v1.json"), b"{\"latest\":true}").unwrap();
         let state = WizardState {
             schema_version: 1,
             sequence: 2,
@@ -1600,6 +1987,9 @@ mod tests {
             catalog_source_tree_sha256: "22".repeat(32),
             work_dir,
         };
+        let (publication, latest_receipt) = public_receipt_fixture(&state);
+        let (publication_bytes, latest_bytes) =
+            write_public_receipt_fixture(&latest, &publication, &latest_receipt);
 
         let receipts = generate_public_receipts(&repo, &state).unwrap();
         commit_public_evidence(&repo, &state, &receipts).unwrap();
@@ -1608,16 +1998,129 @@ mod tests {
 
         assert_eq!(
             fs::read(repo.join("qualifications/publication-receipt-sequence-2.json")).unwrap(),
-            b"{\"publication\":true}"
+            publication_bytes
         );
         assert_eq!(
             fs::read(repo.join("qualifications/latest-receipt-sequence-2.json")).unwrap(),
-            b"{\"latest\":true}"
+            latest_bytes
         );
         assert_eq!(
             fs::read_to_string(repo.join("docs/release-sequence-2.md")).unwrap(),
             "# Runtime catalog release sequence 2\n\nPublic release evidence:\n\n- `qualifications/publication-receipt-sequence-2.json`\n- `qualifications/latest-receipt-sequence-2.json`\n"
         );
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn generated_receipt_replacement_is_rejected_before_tracked_writes() {
+        let repo = std::env::temp_dir().join(format!(
+            "catalog-wizard-replaced-evidence-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let work_dir = repo.join(".release-work/sequence-2");
+        let latest = work_dir.join("publish-state/latest");
+        fs::create_dir_all(&latest).unwrap();
+        let state = WizardState {
+            schema_version: 1,
+            sequence: 2,
+            pi_version: "0.84.0".to_owned(),
+            node_version: "22.20.0".to_owned(),
+            target: TARGET.to_owned(),
+            mode: RunMode::PublishCapable,
+            phase: ReleasePhase::Published,
+            signing_key_generation: 1,
+            catalog_source_commit: "11".repeat(20),
+            catalog_source_tree_sha256: "22".repeat(32),
+            work_dir,
+        };
+        let (publication, latest_receipt) = public_receipt_fixture(&state);
+        write_public_receipt_fixture(&latest, &publication, &latest_receipt);
+        let receipts = generate_public_receipts(&repo, &state).unwrap();
+        fs::set_permissions(&receipts[0], fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(
+            &receipts[0],
+            br#"{"private_key_path":"/private/release.key"}"#,
+        )
+        .unwrap();
+
+        assert!(commit_public_evidence(&repo, &state, &receipts).is_err());
+        assert!(!repo.join("qualifications").exists());
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn published_resume_allows_only_exact_partial_evidence_changes() {
+        let repo = std::env::temp_dir().join(format!(
+            "catalog-wizard-partial-evidence-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&repo).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(repo.join(".gitignore"), ".release-work/\n").unwrap();
+        assert!(
+            Command::new("git")
+                .args(["add", ".gitignore"])
+                .current_dir(&repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=Catalog Wizard Test",
+                    "-c",
+                    "user.email=catalog-wizard@example.invalid",
+                    "commit",
+                    "-qm",
+                    "fixture",
+                ])
+                .current_dir(&repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let work_dir = repo.join(".release-work/sequence-2");
+        let latest = work_dir.join("publish-state/latest");
+        fs::create_dir_all(&latest).unwrap();
+        let state = WizardState {
+            schema_version: 1,
+            sequence: 2,
+            pi_version: "0.84.0".to_owned(),
+            node_version: "22.20.0".to_owned(),
+            target: TARGET.to_owned(),
+            mode: RunMode::PublishCapable,
+            phase: ReleasePhase::Published,
+            signing_key_generation: 1,
+            catalog_source_commit: "11".repeat(20),
+            catalog_source_tree_sha256: "22".repeat(32),
+            work_dir,
+        };
+        let (publication, latest_receipt) = public_receipt_fixture(&state);
+        let (publication_bytes, latest_bytes) =
+            write_public_receipt_fixture(&latest, &publication, &latest_receipt);
+        let outputs = public_evidence_outputs(&repo, &state, &[publication_bytes, latest_bytes]);
+        fs::create_dir_all(outputs[0].0.parent().unwrap()).unwrap();
+        fs::write(&outputs[0].0, &outputs[0].1).unwrap();
+
+        require_clean_or_exact_pending_evidence(&repo, &state).unwrap();
+        fs::write(repo.join("unrelated.txt"), "not approved evidence").unwrap();
+        assert!(require_clean_or_exact_pending_evidence(&repo, &state).is_err());
         fs::remove_dir_all(repo).unwrap();
     }
 
