@@ -5,3 +5,13 @@ Standalone Rust workspace for acquiring, signing, and publishing Fluxsemble runt
 Generated release output is never committed. Owner-private release work stays in ignored paths such as `.release-work/`, `catalog-v1.json`, and `signed-release-bundle/`.
 
 The production private key is never accepted by `catalog-acquire` or `catalog-publish`.
+
+## Guided releases
+
+Release owners should use the guided wizard for normal catalog updates:
+
+```bash
+catalog-wizard release
+```
+
+See `docs/guided-release.md`.
