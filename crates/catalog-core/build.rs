@@ -1,5 +1,6 @@
 use std::{collections::BTreeSet, env, fs, path::PathBuf};
 
+use chrono::NaiveDateTime;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -140,16 +141,10 @@ fn valid_key_id(value: &str) -> bool {
 }
 
 fn valid_activation_time(value: &str) -> bool {
+    const FORMAT: &str = "%Y-%m-%dT%H:%M:%SZ";
     value.len() == 20
-        && value.as_bytes().get(4) == Some(&b'-')
-        && value.as_bytes().get(7) == Some(&b'-')
-        && value.as_bytes().get(10) == Some(&b'T')
-        && value.as_bytes().get(13) == Some(&b':')
-        && value.as_bytes().get(16) == Some(&b':')
-        && value.ends_with('Z')
-        && value.bytes().enumerate().all(|(index, byte)| {
-            matches!(index, 4 | 7 | 10 | 13 | 16 | 19) || byte.is_ascii_digit()
-        })
+        && NaiveDateTime::parse_from_str(value, FORMAT)
+            .is_ok_and(|timestamp| timestamp.format(FORMAT).to_string() == value)
 }
 
 fn derive_key_id(public_key: &[u8; 32]) -> String {

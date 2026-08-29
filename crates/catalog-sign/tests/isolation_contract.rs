@@ -95,12 +95,91 @@ fn direct_and_exact_marker_only_sign_fail_before_key_open_or_output() {
 }
 
 #[test]
-fn inspection_mode_has_a_key_mount_but_no_input_or_output_mount() {
-    let source =
-        fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/isolation.rs")).unwrap();
-    assert!(source.contains("IsolationMode::InspectKey"));
-    assert!(source.contains("mode.requires_input()"));
-    assert!(source.contains("mode.requires_output()"));
+fn real_inspect_key_is_key_only_networkless_and_public_identity_only() {
+    let root = TempRoot::new();
+    let source_static = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/x86_64-unknown-linux-musl/release/catalog-sign")
+        .canonicalize()
+        .expect("build the authorized musl release signer before this integration test");
+    let static_signer = root.path.join("catalog-sign-static");
+    fs::copy(source_static, &static_signer).unwrap();
+    fs::set_permissions(&static_signer, fs::Permissions::from_mode(0o500)).unwrap();
+
+    let key = root.path.join("nonproduction-fixture-key.pem");
+    fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/nonproduction-ed25519-pkcs8.pem"),
+        &key,
+    )
+    .unwrap();
+    fs::set_permissions(&key, fs::Permissions::from_mode(0o400)).unwrap();
+
+    let config = root.path.join("launcher-config-v1.json");
+    let config_bytes = serde_jcs::to_vec(&serde_json::json!({
+        "schema_version": 1,
+        "bwrap_path": "/usr/bin/bwrap",
+        "bwrap_sha256": format!("{:x}", Sha256::digest(fs::read("/usr/bin/bwrap").unwrap())),
+        "signer_path": static_signer,
+        "signer_sha256": format!("{:x}", Sha256::digest(fs::read(&static_signer).unwrap())),
+    }))
+    .unwrap();
+    fs::write(&config, config_bytes).unwrap();
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let before = fs::read_dir(&root.path)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<std::collections::BTreeSet<_>>();
+    let witness = InotifyKeyOpenWitness::new(&key);
+    let result = Command::new(env!("CARGO_BIN_EXE_catalog-sign-launcher"))
+        .args([
+            "inspect-key",
+            "--config",
+            config.to_str().unwrap(),
+            "--key",
+            key.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "inspection failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(result.stderr.is_empty());
+    assert!(
+        witness.observed_open(),
+        "isolated inspection did not open the key"
+    );
+
+    let canonical = result.stdout.strip_suffix(b"\n").unwrap();
+    let identity: serde_json::Value = serde_json::from_slice(canonical).unwrap();
+    assert_eq!(serde_jcs::to_vec(&identity).unwrap(), canonical);
+    assert_eq!(identity.as_object().unwrap().len(), 3);
+    assert_eq!(
+        identity["key_id"],
+        "runtime-catalog-ed25519-56475aa75463474c"
+    );
+    assert_eq!(
+        identity["public_key"],
+        "A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg"
+    );
+    assert_eq!(
+        identity["fingerprint"],
+        "56475aa75463474c0285df5dbf2bcab73da651358839e9b77481b2eab107708c"
+    );
+    assert!(identity.get("signature").is_none());
+
+    let after = fs::read_dir(&root.path)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(after, before, "inspection created a host output artifact");
+    assert!(!root.path.join("input").exists());
+    assert!(!root.path.join("output").exists());
+    // Successful inner entry proves the exact inspect mount set, isolated network namespace,
+    // no-route check, inherited socket-denying prefilter, and final syscall filter all passed.
 }
 
 #[test]
