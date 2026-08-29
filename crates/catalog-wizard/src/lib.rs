@@ -7,6 +7,7 @@ pub mod prompt;
 pub mod qualification;
 pub mod sequence;
 pub mod state;
+pub mod trust;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WizardError {
