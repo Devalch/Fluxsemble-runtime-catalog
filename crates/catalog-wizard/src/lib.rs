@@ -1,6 +1,7 @@
 pub mod cli;
 pub mod commands;
 pub mod config;
+pub mod execution;
 pub mod intent;
 pub mod key_rotation;
 pub mod npm;

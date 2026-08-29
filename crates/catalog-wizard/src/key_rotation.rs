@@ -3,7 +3,6 @@ use std::{
     io::Write,
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -14,6 +13,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     WizardError,
+    commands::AuthoritativeProgram,
+    execution,
     prompt::{Prompter, require_phrase},
 };
 
@@ -102,19 +103,20 @@ pub fn inspect_key_with_isolated_signer(
 ) -> Result<ActiveSigningKey, WizardError> {
     require_absolute_path(private_key_path)?;
     require_absolute_path(launcher_config)?;
-    let launcher = isolated_launcher_path()?;
-    let output = Command::new(launcher)
-        .args([
-            "inspect-key",
-            "--config",
-            launcher_config.to_str().ok_or(WizardError::Config)?,
-            "--key",
-            private_key_path.to_str().ok_or(WizardError::Config)?,
-        ])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .map_err(|_| WizardError::ExternalCommand)?;
+    let args = vec![
+        "inspect-key".to_owned(),
+        "--config".to_owned(),
+        launcher_config
+            .to_str()
+            .ok_or(WizardError::Config)?
+            .to_owned(),
+        "--key".to_owned(),
+        private_key_path
+            .to_str()
+            .ok_or(WizardError::Config)?
+            .to_owned(),
+    ];
+    let output = execution::run_output(AuthoritativeProgram::CatalogSignLauncher, &args)?;
     if !output.status.success() || !output.stderr.is_empty() {
         return Err(WizardError::ExternalCommand);
     }
@@ -177,9 +179,8 @@ pub fn rotate_key(
     local_config_path: &Path,
 ) -> Result<ActiveSigningKey, WizardError> {
     let private_key = PathBuf::from(prompter.ask("New private signing key path: ")?);
-    let launcher_config = PathBuf::from(prompter.ask("Isolated signer launcher config path: ")?);
+    let launcher_config = launcher_config_for_signing_config(local_config_path)?;
     require_absolute_path(&private_key)?;
-    require_absolute_path(&launcher_config)?;
 
     let mut inspected = inspect_key_with_isolated_signer(&private_key, &launcher_config)?;
     let current_bytes = fs::read(keyring_path).map_err(|_| WizardError::Config)?;
@@ -320,15 +321,15 @@ fn current_timestamp() -> Result<String, WizardError> {
         .ok_or(WizardError::Config)
 }
 
-fn isolated_launcher_path() -> Result<PathBuf, WizardError> {
-    let current = std::env::current_exe()
-        .and_then(fs::canonicalize)
-        .map_err(|_| WizardError::ExternalCommand)?;
-    let launcher = current
+fn launcher_config_for_signing_config(local_config_path: &Path) -> Result<PathBuf, WizardError> {
+    require_absolute_path(local_config_path)?;
+    if local_config_path.file_name().and_then(|name| name.to_str()) != Some("signing-key.json") {
+        return Err(WizardError::Config);
+    }
+    Ok(local_config_path
         .parent()
-        .ok_or(WizardError::ExternalCommand)?
-        .join("catalog-sign-launcher");
-    fs::canonicalize(launcher).map_err(|_| WizardError::ExternalCommand)
+        .ok_or(WizardError::Config)?
+        .join("launcher-config-v1.json"))
 }
 
 fn require_absolute_path(path: &Path) -> Result<(), WizardError> {
@@ -480,11 +481,38 @@ mod tests {
     }
 
     #[test]
+    fn rotation_derives_the_fixed_launcher_config_without_an_internal_prompt() {
+        let local = Path::new("/home/release/.config/fluxsemble-runtime-catalog/signing-key.json");
+        assert_eq!(
+            launcher_config_for_signing_config(local).unwrap(),
+            PathBuf::from(
+                "/home/release/.config/fluxsemble-runtime-catalog/launcher-config-v1.json"
+            )
+        );
+        #[derive(Default)]
+        struct RecordingPrompter {
+            asked: Vec<String>,
+        }
+        impl Prompter for RecordingPrompter {
+            fn ask(&mut self, message: &str) -> Result<String, WizardError> {
+                self.asked.push(message.to_owned());
+                Ok("/missing/new-signing.key".to_owned())
+            }
+            fn say(&mut self, _: &str) -> Result<(), WizardError> {
+                Ok(())
+            }
+        }
+        let mut prompter = RecordingPrompter::default();
+        assert!(rotate_key(&mut prompter, Path::new("/missing/keyring.json"), local,).is_err());
+        assert_eq!(prompter.asked, ["New private signing key path: "]);
+    }
+
+    #[test]
     fn wizard_source_does_not_open_the_private_key() {
         let source = include_str!("key_rotation.rs");
         assert!(!source.contains(&["fs::read(", "private_key_path"].concat()));
         assert!(!source.contains(&["File::open(", "private_key_path"].concat()));
-        assert!(source.contains("catalog-sign-launcher"));
+        assert!(source.contains("AuthoritativeProgram::CatalogSignLauncher"));
         assert!(source.contains("inspect-key"));
     }
 }

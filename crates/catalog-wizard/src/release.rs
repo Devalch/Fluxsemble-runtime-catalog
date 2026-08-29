@@ -34,6 +34,7 @@ use crate::{
         build_publish_stage_remote, build_sign,
     },
     config::{PrivateSigningConfig, WizardConfig},
+    execution,
     intent::{GenerateReleaseInputsRequest, generate_release_inputs},
     key_rotation::{verify_active_signing_key, verify_signed_bundle_key},
     npm::{
@@ -254,6 +255,7 @@ pub fn run_release(
         catalog_source_tree_sha256: tree_sha256,
         work_dir,
     };
+    state.save(&state.work_dir.join("wizard-state.json"))?;
     let launcher_config = private_config_root()?.join("launcher-config-v1.json");
     let mut release = ProductionRelease::new(state, repo, launcher_config, false, None, prompter);
     drive_release(&mut release)
@@ -351,6 +353,7 @@ trait ReleaseMachine {
     fn verify_signed_bundle(&mut self) -> Result<(), WizardError>;
     fn stage_local(&mut self) -> Result<(), WizardError>;
     fn stage_remote(&mut self) -> Result<(), WizardError>;
+    fn review_draft(&mut self) -> Result<(), WizardError>;
     fn approve_draft(&mut self) -> Result<(), WizardError>;
     fn publish(&mut self) -> Result<(), WizardError>;
     fn update_docs_and_evidence(&mut self) -> Result<(), WizardError>;
@@ -412,6 +415,7 @@ fn drive_release(release: &mut dyn ReleaseMachine) -> Result<(), WizardError> {
                 release.save_phase(ReleasePhase::RemoteDraftStaged)?;
             }
             ReleasePhase::RemoteDraftStaged => {
+                release.review_draft()?;
                 release.approve_draft()?;
                 release.save_phase(ReleasePhase::Approved)?;
             }
@@ -461,11 +465,7 @@ impl<'a> ProductionRelease<'a> {
     }
 
     fn execute(&self, plan: &CommandPlan) -> Result<(), WizardError> {
-        let status = Command::new(&plan.program)
-            .args(&plan.args)
-            .current_dir(&self.repo)
-            .status()
-            .map_err(|_| WizardError::ExternalCommand)?;
+        let status = execution::run_status(plan.program, &plan.args, &self.repo)?;
         if status.success() {
             Ok(())
         } else {
@@ -662,6 +662,27 @@ impl ReleaseMachine for ProductionRelease<'_> {
         ))
     }
 
+    fn review_draft(&mut self) -> Result<(), WizardError> {
+        let receipt = read_bounded_regular(
+            &self
+                .state
+                .work_dir
+                .join("publish-state/latest/draft-receipt-v1.json"),
+            8 * 1024 * 1024,
+        )?;
+        let summary = validated_draft_review_summary(&self.state, &receipt)?;
+        self.prompter.say(&summary)?;
+        if confirm_yes_no(
+            self.prompter,
+            "Approve this reviewed draft and exact asset set? [yes/no]: ",
+            false,
+        )? {
+            Ok(())
+        } else {
+            Err(WizardError::UserDeclined)
+        }
+    }
+
     fn approve_draft(&mut self) -> Result<(), WizardError> {
         let publish_state = self.state.work_dir.join("publish-state");
         let receipt = read_bounded_regular(
@@ -757,6 +778,74 @@ fn generate_public_receipts(
     write_recoverable_evidence(&generated[0], &publication)?;
     write_recoverable_evidence(&generated[1], &latest)?;
     Ok(generated)
+}
+
+fn validated_draft_review_summary(
+    state: &WizardState,
+    draft_bytes: &[u8],
+) -> Result<String, WizardError> {
+    let contract: catalog_publish::DraftReceiptV1 =
+        serde_json::from_slice(draft_bytes).map_err(|_| WizardError::State)?;
+    if serde_jcs::to_vec(&contract).map_err(|_| WizardError::State)? != draft_bytes {
+        return Err(WizardError::State);
+    }
+    let draft: PublicDraftReceiptV1 =
+        serde_json::from_slice(draft_bytes).map_err(|_| WizardError::State)?;
+    let expected_tag = format!("catalog-v1-sequence-{}", state.sequence);
+    if draft.schema_version != 1
+        || draft.receipt_id != receipt_domain_digest(DRAFT_RECEIPT_DOMAIN, &draft.body)?
+        || draft.body.repository != REPOSITORY
+        || !valid_remote_id(&draft.body.release_id)
+        || draft.body.tag != expected_tag
+        || draft.body.tag_commit != state.catalog_source_commit
+        || draft.body.target_commitish != state.catalog_source_commit
+        || draft.body.source_tree_sha256 != state.catalog_source_tree_sha256
+        || draft.body.title.is_empty()
+        || draft.body.title.len() > 256
+        || draft.body.notes.len() > 16 * 1024
+        || !draft.body.draft
+        || draft.body.prerelease
+        || !valid_sha256(&draft.body.local_operation_id)
+        || !valid_sha256(&draft.body.remote_operation_id)
+        || !valid_sha256(&draft.body.signed_transfer_sha256)
+        || !valid_sha256(&draft.body.broker_client_config_sha256)
+        || !valid_sha256(&draft.body.broker_executable_sha256)
+        || !valid_sha256(&draft.body.publisher_broker_config_sha256)
+        || draft.body.phase != "draft_verified"
+        || draft.body.assets.is_empty()
+        || draft.body.assets.len() > MAX_PUBLIC_RECEIPT_ASSETS
+    {
+        return Err(WizardError::State);
+    }
+    let mut asset_ids = BTreeSet::new();
+    let mut asset_names = BTreeSet::new();
+    for asset in &draft.body.assets {
+        if !valid_remote_id(&asset.asset_id)
+            || !valid_public_asset_name(&asset.name)
+            || asset.size == 0
+            || !valid_sha256(&asset.sha256)
+            || !asset_ids.insert(asset.asset_id.as_str())
+            || !asset_names.insert(asset.name.as_str())
+        {
+            return Err(WizardError::State);
+        }
+    }
+
+    let mut summary = format!(
+        "Review the validated GitHub draft before approval:\nRepository: {}\nRelease ID: {}\nTag: {}\nCommit: {}\nAssets ({}):",
+        draft.body.repository,
+        draft.body.release_id,
+        draft.body.tag,
+        draft.body.tag_commit,
+        draft.body.assets.len()
+    );
+    for asset in &draft.body.assets {
+        summary.push_str(&format!(
+            "\n- {} ({} bytes, sha256 {})",
+            asset.name, asset.size, asset.sha256
+        ));
+    }
+    Ok(summary)
 }
 
 fn validate_public_receipts(
@@ -1878,6 +1967,13 @@ mod tests {
                 .push("catalog-publish stage-remote".to_owned());
             Ok(())
         }
+        fn review_draft(&mut self) -> Result<(), WizardError> {
+            self.executed.push("review-draft".to_owned());
+            match self.answers.pop_front().as_deref() {
+                Some("yes" | "YES") => Ok(()),
+                _ => Err(WizardError::UserDeclined),
+            }
+        }
         fn approve_draft(&mut self) -> Result<(), WizardError> {
             self.executed.push("catalog-publish approve".to_owned());
             Ok(())
@@ -2167,6 +2263,36 @@ mod tests {
     }
 
     #[test]
+    fn planned_state_is_resumable_before_release_inputs_are_created() {
+        let repo = std::env::temp_dir().join(format!(
+            "catalog-wizard-planned-visible-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let work_dir = repo.join(".release-work/sequence-2");
+        let state = WizardState {
+            schema_version: 1,
+            sequence: 2,
+            pi_version: "0.84.0".to_owned(),
+            node_version: "22.20.0".to_owned(),
+            target: TARGET.to_owned(),
+            mode: RunMode::DryRun,
+            phase: ReleasePhase::Planned,
+            signing_key_generation: 1,
+            catalog_source_commit: "11".repeat(20),
+            catalog_source_tree_sha256: "22".repeat(32),
+            work_dir: work_dir.clone(),
+        };
+
+        state.save(&work_dir.join("wizard-state.json")).unwrap();
+        assert!(!work_dir.join("intent.json").exists());
+        assert_eq!(resumable_states(&repo).unwrap(), vec![state]);
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
     fn resume_rejects_changed_commit_or_tree_identity() {
         let state = WizardState {
             schema_version: 1,
@@ -2219,12 +2345,36 @@ mod tests {
     }
 
     #[test]
+    fn draft_review_summary_contains_validated_identity_and_exact_assets() {
+        let state = WizardState {
+            schema_version: 1,
+            sequence: 2,
+            pi_version: "0.84.0".to_owned(),
+            node_version: "22.20.0".to_owned(),
+            target: TARGET.to_owned(),
+            mode: RunMode::PublishCapable,
+            phase: ReleasePhase::RemoteDraftStaged,
+            signing_key_generation: 1,
+            catalog_source_commit: "11".repeat(20),
+            catalog_source_tree_sha256: "22".repeat(32),
+            work_dir: PathBuf::from("/repo/.release-work/sequence-2"),
+        };
+        let (draft, _, _, _) = public_receipt_fixture(&state);
+        let summary =
+            validated_draft_review_summary(&state, &serde_jcs::to_vec(&draft).unwrap()).unwrap();
+        assert!(summary.contains("Tag: catalog-v1-sequence-2"));
+        assert!(summary.contains(&format!("Commit: {}", state.catalog_source_commit)));
+        assert!(summary.contains("catalog-v1.json (20 bytes, sha256"));
+    }
+
+    #[test]
     fn publish_capable_run_requires_all_exact_phrases_in_order() {
         let mut harness = ReleaseHarness::publish_fixture_with_answers([
             "SIGN",
             "CREATE TAG",
             "CREATE DRAFT",
             "UPLOAD ASSETS",
+            "yes",
             "PUBLISH",
             "n",
         ]);
@@ -2249,6 +2399,7 @@ mod tests {
                 "verify-signed-bundle-key",
                 "catalog-publish stage-local",
                 "catalog-publish stage-remote",
+                "review-draft",
                 "catalog-publish approve",
                 "catalog-publish publish",
             ]
@@ -2275,6 +2426,35 @@ mod tests {
                 .iter()
                 .any(|command| command == "catalog-publish publish")
         );
+    }
+
+    #[test]
+    fn declining_explicit_draft_review_prevents_approval_and_publication() {
+        let mut harness = ReleaseHarness::publish_fixture_with_answers([
+            "SIGN",
+            "CREATE TAG",
+            "CREATE DRAFT",
+            "UPLOAD ASSETS",
+            "no",
+        ]);
+        assert_eq!(
+            run_release_with_harness(&mut harness),
+            Err(WizardError::UserDeclined)
+        );
+        assert!(harness.executed.iter().any(|step| step == "review-draft"));
+        assert!(
+            !harness
+                .executed
+                .iter()
+                .any(|step| step == "catalog-publish approve")
+        );
+        assert!(
+            !harness
+                .executed
+                .iter()
+                .any(|step| step == "catalog-publish publish")
+        );
+        assert_eq!(harness.phase, ReleasePhase::RemoteDraftStaged);
     }
 
     #[test]

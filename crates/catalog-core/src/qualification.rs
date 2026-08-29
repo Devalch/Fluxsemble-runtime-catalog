@@ -26,6 +26,8 @@ const QUALIFICATION_DOMAIN: &[u8] = b"fluxsemble:runtime-catalog-qualification:v
 pub struct CompatibilityQualificationV1 {
     schema_version: u16,
     compatibility_input_sha256: Sha256Hex,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    candidate_sha256: Option<Sha256Hex>,
     trusted_signing_keyring_sha256: Sha256Hex,
     fluxsemble: FluxsembleBuildBindingV1,
     provider: BoundedId,
@@ -51,6 +53,7 @@ impl CompatibilityQualificationV1 {
         Ok(Self {
             schema_version: wire.schema_version,
             compatibility_input_sha256: Sha256Hex::parse(wire.compatibility_input_sha256)?,
+            candidate_sha256: wire.candidate_sha256.map(Sha256Hex::parse).transpose()?,
             trusted_signing_keyring_sha256: Sha256Hex::parse(wire.trusted_signing_keyring_sha256)?,
             fluxsemble,
             provider,
@@ -76,6 +79,13 @@ impl CompatibilityQualificationV1 {
     #[must_use]
     pub fn compatibility_input_sha256(&self) -> &Sha256Hex {
         &self.compatibility_input_sha256
+    }
+
+    /// Digest of the exact catalog candidate supplied in a guided qualification request.
+    /// Legacy sequence-1 evidence predates the guided handoff and therefore omits it.
+    #[must_use]
+    pub fn candidate_sha256(&self) -> Option<&Sha256Hex> {
+        self.candidate_sha256.as_ref()
     }
 
     #[must_use]
@@ -289,6 +299,8 @@ fn encode_hex(bytes: &[u8; 32]) -> String {
 struct QualificationWire {
     schema_version: u16,
     compatibility_input_sha256: String,
+    #[serde(default)]
+    candidate_sha256: Option<String>,
     trusted_signing_keyring_sha256: String,
     fluxsemble: serde_json::Value,
     provider: String,

@@ -1,14 +1,32 @@
 use std::path::Path;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthoritativeProgram {
+    CatalogAcquire,
+    CatalogSignLauncher,
+    CatalogPublish,
+}
+
+impl AuthoritativeProgram {
+    #[must_use]
+    pub const fn executable_name(self) -> &'static str {
+        match self {
+            Self::CatalogAcquire => "catalog-acquire",
+            Self::CatalogSignLauncher => "catalog-sign-launcher",
+            Self::CatalogPublish => "catalog-publish",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandPlan {
-    pub program: String,
+    pub program: AuthoritativeProgram,
     pub args: Vec<String>,
 }
 
 pub fn build_acquire_intent(intent: &Path, package_inputs: &Path, output: &Path) -> CommandPlan {
     plan(
-        "catalog-acquire",
+        AuthoritativeProgram::CatalogAcquire,
         [
             "acquire-intent".to_owned(),
             "--intent".to_owned(),
@@ -33,7 +51,7 @@ pub fn build_acquire_source(
     output: &Path,
 ) -> CommandPlan {
     plan(
-        "catalog-acquire",
+        AuthoritativeProgram::CatalogAcquire,
         [
             "acquire-source".to_owned(),
             "--source".to_owned(),
@@ -60,7 +78,7 @@ pub fn build_sign(config: &Path, input: &Path, private_key: &Path, output: &Path
 
 pub fn build_publish_stage_local(bundle: &Path, state: &Path) -> CommandPlan {
     plan(
-        "catalog-publish",
+        AuthoritativeProgram::CatalogPublish,
         [
             "stage-local".to_owned(),
             "--bundle".to_owned(),
@@ -73,7 +91,7 @@ pub fn build_publish_stage_local(bundle: &Path, state: &Path) -> CommandPlan {
 
 pub fn build_publish_stage_remote(state: &Path, broker_config: &Path) -> CommandPlan {
     plan(
-        "catalog-publish",
+        AuthoritativeProgram::CatalogPublish,
         [
             "stage-remote".to_owned(),
             "--state".to_owned(),
@@ -86,7 +104,7 @@ pub fn build_publish_stage_remote(state: &Path, broker_config: &Path) -> Command
 
 pub fn build_publish_approve(state: &Path, draft_receipt_sha256: &str) -> CommandPlan {
     plan(
-        "catalog-publish",
+        AuthoritativeProgram::CatalogPublish,
         [
             "approve".to_owned(),
             "--state".to_owned(),
@@ -99,7 +117,7 @@ pub fn build_publish_approve(state: &Path, draft_receipt_sha256: &str) -> Comman
 
 pub fn build_publish(state: &Path, approval: &Path, broker_config: &Path) -> CommandPlan {
     plan(
-        "catalog-publish",
+        AuthoritativeProgram::CatalogPublish,
         [
             "publish".to_owned(),
             "--state".to_owned(),
@@ -130,12 +148,12 @@ fn signer_plan(
         args.extend(["--key".to_owned(), path(private_key)]);
     }
     args.extend(["--output".to_owned(), path(output)]);
-    plan("catalog-sign-launcher", args)
+    plan(AuthoritativeProgram::CatalogSignLauncher, args)
 }
 
-fn plan(program: &str, args: impl IntoIterator<Item = String>) -> CommandPlan {
+fn plan(program: AuthoritativeProgram, args: impl IntoIterator<Item = String>) -> CommandPlan {
     CommandPlan {
-        program: program.to_owned(),
+        program,
         args: args.into_iter().collect(),
     }
 }
@@ -156,7 +174,7 @@ mod tests {
             Path::new("package-inputs.json"),
             Path::new("transfer"),
         );
-        assert_eq!(plan.program, "catalog-acquire");
+        assert_eq!(plan.program, AuthoritativeProgram::CatalogAcquire);
         assert_eq!(
             plan.args,
             vec![

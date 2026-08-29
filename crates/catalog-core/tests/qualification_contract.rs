@@ -44,6 +44,7 @@ fn qualification_value(compatibility_input_sha256: String) -> Value {
     json!({
         "schema_version": 1,
         "compatibility_input_sha256": compatibility_input_sha256,
+        "candidate_sha256": SHA_B,
         "trusted_signing_keyring_sha256": KEYRING_SHA256,
         "fluxsemble": build_value(),
         "provider": "builtin:pi",
@@ -152,6 +153,27 @@ fn every_named_qualification_check_must_have_passed() {
             "accepted failed {check} check"
         );
     }
+}
+
+#[test]
+fn guided_candidate_binding_is_typed_and_legacy_evidence_remains_readable() {
+    let (_, qualification) = bound_fixture();
+    assert_eq!(
+        parse_record(&qualification)
+            .candidate_sha256()
+            .map(|digest| digest.as_str()),
+        Some(SHA_B)
+    );
+
+    let mut malformed = qualification.clone();
+    malformed["candidate_sha256"] = json!("not-a-digest");
+    assert!(
+        CompatibilityQualificationV1::from_json(&serde_json::to_vec(&malformed).unwrap()).is_err()
+    );
+
+    let mut legacy = qualification;
+    legacy.as_object_mut().unwrap().remove("candidate_sha256");
+    assert!(parse_record(&legacy).candidate_sha256().is_none());
 }
 
 #[test]

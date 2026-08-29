@@ -29,7 +29,7 @@ const REQUEST_MANIFEST_NAME: &str = "manifest-v1.json";
 const BUILD_BINDING_NAME: &str = "build-binding-v1.json";
 const QUALIFICATION_NAME: &str = "qualification-v1.json";
 const IMPORT_RECEIPT_NAME: &str = "receipt-v1.json";
-const README: &str = "Fluxsemble qualification request\n\nUpdate Fluxsemble's exact compatibility profile for the Pi, Node, and target tuple in manifest-v1.json.\nCapture the clean Fluxsemble build binding, run the fixed candidate qualification, and return a directory containing exactly build-binding-v1.json and qualification-v1.json.\n\nThis directory contains public, inert qualification inputs only. It grants no signing, publishing, credential, or remote-mutation authority.\n";
+const README: &str = "Fluxsemble qualification request\n\nUpdate Fluxsemble's exact compatibility profile for the Pi, Node, and target tuple in manifest-v1.json.\nCapture the clean Fluxsemble build binding, run the fixed candidate qualification, and bind qualification-v1.json candidate_sha256 to the exact candidate_sha256 in manifest-v1.json.\nReturn a directory containing exactly build-binding-v1.json and qualification-v1.json.\n\nThis directory contains public, inert qualification inputs only. It grants no signing, publishing, credential, or remote-mutation authority.\n";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -272,6 +272,10 @@ pub fn import_handoff(
         || serde_jcs::to_vec(&qualification).map_err(|_| WizardError::Qualification)?
             != qualification_bytes
         || qualification.fluxsemble() != &build
+        || qualification
+            .candidate_sha256()
+            .map(|digest| digest.as_str())
+            != Some(request.candidate_sha256.as_str())
         || qualification.provider().as_str() != "builtin:pi"
         || qualification.target().as_str() != state.target
         || qualification.pi_version().as_str() != state.pi_version
@@ -784,7 +788,12 @@ mod tests {
             write_canonical(handoff.join("build-binding-v1.json"), &build_value());
             write_canonical(
                 handoff.join("qualification-v1.json"),
-                &qualification_value("22.19.0", KEYRING, &qualification_compatibility),
+                &qualification_value(
+                    "22.19.0",
+                    KEYRING,
+                    &qualification_compatibility,
+                    Some(&candidate_sha256),
+                ),
             );
             let state = WizardState {
                 schema_version: 1,
@@ -916,7 +925,7 @@ mod tests {
         let fixture = Fixture::matching();
         write_canonical(
             fixture.handoff.join("qualification-v1.json"),
-            &qualification_value("22.21.0", KEYRING, &"55".repeat(32)),
+            &qualification_value("22.21.0", KEYRING, &"55".repeat(32), Some(&"66".repeat(32))),
         );
         assert!(import_handoff(&fixture.state, &fixture.handoff, KEYRING).is_err());
         assert!(!fixture.root.join("imported-qualification").exists());
@@ -931,6 +940,26 @@ mod tests {
         let fixture = Fixture::matching();
         assert!(import_handoff(&fixture.state, &fixture.handoff, &"55".repeat(32)).is_err());
         assert!(!fixture.root.join("imported-qualification").exists());
+    }
+
+    #[test]
+    fn returned_candidate_binding_must_match_the_exported_request() {
+        let fixture = Fixture::matching();
+        let path = fixture.handoff.join("qualification-v1.json");
+        let mut qualification: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        qualification["candidate_sha256"] = json!("55".repeat(32));
+        write_canonical(path, &qualification);
+
+        assert!(import_handoff(&fixture.state, &fixture.handoff, KEYRING).is_err());
+        assert!(!fixture.root.join("imported-qualification").exists());
+        assert_eq!(
+            WizardState::load(&fixture.root.join("wizard-state.json"))
+                .unwrap()
+                .unwrap()
+                .phase,
+            ReleasePhase::AwaitingQualification
+        );
     }
 
     #[test]
@@ -1017,13 +1046,18 @@ mod tests {
 
     #[test]
     fn consumer_keyring_readiness_requires_exact_digest_and_passed_checks() {
-        let bytes =
-            serde_jcs::to_vec(&qualification_value("22.19.0", KEYRING, COMPATIBILITY)).unwrap();
+        let bytes = serde_jcs::to_vec(&qualification_value(
+            "22.19.0",
+            KEYRING,
+            COMPATIBILITY,
+            None,
+        ))
+        .unwrap();
         let qualification = CompatibilityQualificationV1::from_json(&bytes).unwrap();
         verify_consumer_keyring_readiness(&qualification, KEYRING).unwrap();
         assert!(verify_consumer_keyring_readiness(&qualification, &"55".repeat(32)).is_err());
 
-        let mut failed = qualification_value("22.19.0", KEYRING, COMPATIBILITY);
+        let mut failed = qualification_value("22.19.0", KEYRING, COMPATIBILITY, None);
         failed["checks"]["activation"] = json!("failed");
         let qualification =
             CompatibilityQualificationV1::from_json(&serde_jcs::to_vec(&failed).unwrap()).unwrap();
@@ -1044,8 +1078,9 @@ mod tests {
         node_version: &str,
         keyring: &str,
         compatibility: &str,
+        candidate: Option<&str>,
     ) -> serde_json::Value {
-        json!({
+        let mut value = json!({
             "schema_version": 1,
             "compatibility_input_sha256": compatibility,
             "trusted_signing_keyring_sha256": keyring,
@@ -1068,7 +1103,11 @@ mod tests {
             "reviewer": "release-reviewer",
             "release_owner_approved_at": "2026-08-01T12:00:00Z",
             "residual_risks": ["Fixture-only qualification."]
-        })
+        });
+        if let Some(candidate) = candidate {
+            value["candidate_sha256"] = json!(candidate);
+        }
+        value
     }
 
     fn create_candidate(output: &std::path::Path, root: &std::path::Path) -> (String, String) {

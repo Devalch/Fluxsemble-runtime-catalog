@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     WizardError,
+    config::PrivateSigningConfig,
     key_rotation::inspect_key_with_isolated_signer,
     prompt::{Prompter, confirm_yes_no},
 };
@@ -265,6 +266,15 @@ pub fn trust_machine(
         signing_key_id: inspected.key_id,
     };
     validate_profile(&profile).map_err(|_| WizardError::Config)?;
+    let signing_config_path = local_profiles_dir
+        .parent()
+        .ok_or(WizardError::Config)?
+        .join("signing-key.json");
+    ensure_active_signing_config(
+        &signing_config_path,
+        &profile.signing_private_key_path,
+        active.generation(),
+    )?;
     save_profile(&profile, local_profiles_dir)?;
 
     if confirm_yes_no(
@@ -282,6 +292,69 @@ pub fn trust_machine(
         "A profile match means this matches a previously approved profile; it does not prove this machine is secure.",
     )?;
     Ok(profile)
+}
+
+pub fn validate_local_setup(
+    profiles_directory: &Path,
+    signing_config_path: &Path,
+    facts: &MachineFacts,
+) -> Result<(), WizardError> {
+    let profile = load_matching_profile(
+        profiles_directory,
+        facts,
+        &[
+            MachineRole::Preparer,
+            MachineRole::Signer,
+            MachineRole::Publisher,
+        ],
+    )?;
+    let signing = PrivateSigningConfig::load(signing_config_path)?;
+    validate_profile_signing_binding(&profile, &signing)
+}
+
+pub fn validate_profile_signing_binding(
+    profile: &TrustedMachineProfile,
+    signing: &PrivateSigningConfig,
+) -> Result<(), WizardError> {
+    let active = active_production_key_identity();
+    if profile.signing_key_id != active.key_id()
+        || profile.signing_private_key_path != signing.private_key_path
+        || signing.signing_key_generation != active.generation()
+    {
+        return Err(WizardError::Config);
+    }
+    Ok(())
+}
+
+fn ensure_active_signing_config(
+    path: &Path,
+    private_key_path: &Path,
+    generation: u32,
+) -> Result<(), WizardError> {
+    if path.exists() {
+        let existing = PrivateSigningConfig::load(path)?;
+        if existing.private_key_path == private_key_path
+            && existing.signing_key_generation == generation
+        {
+            return Ok(());
+        }
+        return Err(WizardError::Config);
+    }
+    let private_key_path = private_key_path.to_str().ok_or(WizardError::Config)?;
+    let bytes = serde_jcs::to_vec(&serde_json::json!({
+        "schema_version": 1,
+        "signing_key_generation": generation,
+        "private_key_path": private_key_path,
+    }))
+    .map_err(|_| WizardError::Config)?;
+    atomic_write(path, &bytes, 0o600, "signing-key")?;
+    let loaded = PrivateSigningConfig::load(path)?;
+    if loaded.private_key_path != Path::new(private_key_path)
+        || loaded.signing_key_generation != generation
+    {
+        return Err(WizardError::Config);
+    }
+    Ok(())
 }
 
 fn validate_profile(profile: &TrustedMachineProfile) -> Result<(), TrustError> {
@@ -591,6 +664,45 @@ mod tests {
             profile_matches(&profile, &facts, &[MachineRole::Preparer]),
             Err(TrustError::FactsDoNotMatch)
         );
+    }
+
+    #[test]
+    fn first_time_binding_creates_the_signing_config_consumed_by_setup_check() {
+        let root = std::env::temp_dir().join(format!(
+            "catalog-wizard-trust-binding-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let config_path = root.join("signing-key.json");
+        let profiles = root.join("trusted-machines");
+        let active = active_production_key_identity();
+        let profile = TrustedMachineProfile {
+            signing_private_key_path: PathBuf::from("/private/active-signing.key"),
+            signing_key_id: active.key_id().to_owned(),
+            ..TrustedMachineProfile::fixture_with_roles(vec![
+                MachineRole::Preparer,
+                MachineRole::Signer,
+                MachineRole::Publisher,
+            ])
+        };
+
+        ensure_active_signing_config(
+            &config_path,
+            &profile.signing_private_key_path,
+            active.generation(),
+        )
+        .unwrap();
+        save_profile(&profile, &profiles).unwrap();
+        validate_local_setup(&profiles, &config_path, &profile.facts).unwrap();
+        assert_eq!(
+            fs::metadata(&config_path).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

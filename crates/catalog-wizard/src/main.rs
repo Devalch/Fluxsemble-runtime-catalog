@@ -2,11 +2,10 @@ use std::path::PathBuf;
 
 use catalog_wizard::{
     cli::{self, Command, HelpTopic},
-    config::{PrivateSigningConfig, WizardConfig},
+    config::WizardConfig,
     key_rotation,
     prompt::StdioPrompter,
-    release,
-    trust::{self, MachineRole},
+    release, trust,
 };
 
 fn main() {
@@ -68,22 +67,12 @@ fn run_check() {
         let repo = std::env::current_dir().map_err(|_| catalog_wizard::WizardError::Config)?;
         let _config = WizardConfig::load(&repo.join("catalog-wizard.toml"))?;
         let facts = trust::current_machine_facts(&repo)?;
-        trust::load_matching_profile(
-            &private_config_root()?.join("trusted-machines"),
+        let private_root = private_config_root()?;
+        trust::validate_local_setup(
+            &private_root.join("trusted-machines"),
+            &private_root.join("signing-key.json"),
             &facts,
-            &[
-                MachineRole::Preparer,
-                MachineRole::Signer,
-                MachineRole::Publisher,
-            ],
-        )?;
-        let signing = PrivateSigningConfig::load(&private_config_root()?.join("signing-key.json"))?;
-        if signing.signing_key_generation
-            != catalog_core::active_production_key_identity().generation()
-        {
-            return Err(catalog_wizard::WizardError::Config);
-        }
-        Ok(())
+        )
     })();
     if result.is_err() {
         eprintln!("Local setup check failed.");

@@ -95,7 +95,7 @@ fn generate_release_inputs_with(
 
     let work_root = request.repository_root.join(".release-work");
     let work = WorkRoot::open(&request.repository_root)?;
-    let release = work.create_release_directory(request.sequence)?;
+    let release = work.open_or_create_release_directory(request.sequence)?;
     let release_root = work_root.join(format!("sequence-{}", request.sequence));
     let intent_path = release_root.join("intent.json");
     let package_inputs_path = release_root.join("package-inputs.json");
@@ -205,12 +205,18 @@ impl WorkRoot {
         }
     }
 
-    fn create_release_directory(self, sequence: u64) -> Result<ReleaseDirectory, WizardError> {
+    fn open_or_create_release_directory(
+        self,
+        sequence: u64,
+    ) -> Result<ReleaseDirectory, WizardError> {
         self.revalidate()?;
         let name = CString::new(format!("sequence-{sequence}")).map_err(|_| WizardError::Io)?;
         // SAFETY: the retained work root, validated component, and private mode are valid.
         if unsafe { libc::mkdirat(self.directory.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
-            return Err(WizardError::Io);
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EEXIST) {
+                return Err(WizardError::Io);
+            }
         }
         let directory = openat_directory(self.directory.as_raw_fd(), &name)?;
         let metadata = directory.metadata().map_err(|_| WizardError::Io)?;
@@ -469,7 +475,7 @@ mod tests {
         fs::create_dir(&outside).unwrap();
         symlink(&outside, root.join(".release-work")).unwrap();
 
-        assert!(work.create_release_directory(1).is_err());
+        assert!(work.open_or_create_release_directory(1).is_err());
         assert!(fs::read_dir(&outside).unwrap().next().is_none());
         fs::remove_file(root.join(".release-work")).unwrap();
         fs::remove_dir_all(root).unwrap();
