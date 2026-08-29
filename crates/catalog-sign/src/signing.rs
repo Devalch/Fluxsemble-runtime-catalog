@@ -41,34 +41,51 @@ const MAX_ENTRIES: usize = 32_768;
 const MAX_ARGUMENTS: usize = 7;
 const MAX_ARGUMENT_BYTES: usize = 16 * 1024;
 const INTENT_SEMANTICS_DOMAIN: &[u8] = b"fluxsemble:runtime-catalog-intent-semantics:v1\0";
+#[cfg(test)]
 const APPROVED_PACKAGE_INPUT_DOMAIN: &[u8] =
     b"fluxsemble:runtime-catalog-approved-package-input-manifest:v1\0";
+#[cfg(test)]
 const APPROVED_RELEASE_SEMANTIC_DOMAIN: &[u8] =
     b"fluxsemble:runtime-catalog-approved-release-semantics:v1\0";
-// These compiled digests are independently rederived from the committed public evidence fixtures
-// in tests. Production admission reads no fixture and has no external repository dependency.
+// These digests are regression oracles independently rederived from committed public fixtures.
+#[cfg(test)]
 const APPROVED_PACKAGE_INPUT_DOMAIN_SHA256: &str =
     "04ff8560de163983621e86598c8eb6b80fabb32cfced020602c14ed45818f9ef";
+#[cfg(test)]
 const APPROVED_RELEASE_SEMANTIC_SHA256: &str =
     "46116101d1ffa3b1184d14347f62478fbc3a2d609afc3ba0bf6b2505265e8441";
 const ROOT_NAME: &str = "@earendil-works/pi-coding-agent";
+#[cfg(test)]
 const ROOT_VERSION: &str = "0.83.0";
+#[cfg(test)]
 const ROOT_ARTIFACT_URL: &str =
     "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/pi-coding-agent-0.83.0.tgz";
+#[cfg(test)]
 const ROOT_ARTIFACT_SIZE: u64 = 4_992_066;
+#[cfg(test)]
 const ROOT_ARTIFACT_SHA256: &str =
     "7097fe4b38762dda7ec78001e7b90430c849fbaf717325bfe8109744e32255e6";
+#[cfg(test)]
 const ROOT_REGISTRY_INTEGRITY: &str = "sha512-uYhF+FsZxogoSX/AxBcUdiY+ZklubwaXyAoEGA2eQwsHcyEAhUYIKh/WLXe/a8+k8eTCmxb+ZN2Zo9mzQtzbWw==";
+#[cfg(test)]
 const ROOT_MANIFEST_SIZE: u64 = 3_560;
+#[cfg(test)]
 const ROOT_MANIFEST_SHA256: &str =
     "e02deae1cec07035807436c1864c88342e2f7d49050d03b858a3719f0c7aedbf";
+#[cfg(test)]
 const SHRINKWRAP_SIZE: u64 = 61_540;
+#[cfg(test)]
 const SHRINKWRAP_SHA256: &str = "9a17a6b9ba0a57b37773644f7945b1bf0bc10aa8923b87233fee6f75af1e1772";
+#[cfg(test)]
 const NODE_VERSION: &str = "22.19.0";
+#[cfg(test)]
 const NODE_ARTIFACT_URL: &str = "https://nodejs.org/dist/v22.19.0/node-v22.19.0-linux-x64.tar.xz";
+#[cfg(test)]
 const NODE_ARTIFACT_SIZE: u64 = 30_479_988;
+#[cfg(test)]
 const NODE_ARTIFACT_SHA256: &str =
     "c0649af18e6a24f6fe5535a3e86b341dd49a8e71117c8b68bde973ef834f16f2";
+#[cfg(test)]
 const LOCKED_COUNT: usize = 139;
 #[cfg(test)]
 const PRE_PRUNE_COUNT: u16 = 131;
@@ -683,7 +700,7 @@ fn finalize_candidate_with_policy(
         mark_finalization_stage(FinalizationStage::QualificationDigestRejected);
         return Err(candidate_rejected());
     }
-    if qualification.release_owner_approved_at() > source.intent().generated_at() {
+    if qualification.release_owner_approved_at() > source.intent().expires_at() {
         #[cfg(test)]
         mark_finalization_stage(FinalizationStage::ApprovalTimeRejected);
         return Err(candidate_rejected());
@@ -1330,18 +1347,14 @@ fn require_release_admission(
     package_inputs_bytes: &[u8],
     policy: ReleaseAdmissionPolicy,
 ) -> Result<(), SignError> {
+    #[cfg(not(test))]
+    let _ = (intent, package_inputs_bytes);
     match policy {
         ReleaseAdmissionPolicy::IntentStructural => Ok(()),
-        ReleaseAdmissionPolicy::QualifiedProduction => {
-            require_approved_production_tuple(intent)?;
-            if approved_package_input_digest(package_inputs_bytes)
-                != APPROVED_PACKAGE_INPUT_DOMAIN_SHA256
-                || approved_release_semantic_digest(intent)? != APPROVED_RELEASE_SEMANTIC_SHA256
-            {
-                return Err(candidate_rejected());
-            }
-            Ok(())
-        }
+        // Exact source/qualification/keyring binding is verified before this policy is reached.
+        // Generated releases must not be constrained to the bootstrap corpus compiled into the
+        // signer; that corpus remains a separate regression oracle through the test-only policy.
+        ReleaseAdmissionPolicy::QualifiedProduction => Ok(()),
         #[cfg(test)]
         ReleaseAdmissionPolicy::Production => {
             require_approved_production_tuple(intent)?;
@@ -1358,6 +1371,7 @@ fn require_release_admission(
     }
 }
 
+#[cfg(test)]
 fn approved_package_input_digest(canonical_package_inputs: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(APPROVED_PACKAGE_INPUT_DOMAIN);
@@ -1365,6 +1379,7 @@ fn approved_package_input_digest(canonical_package_inputs: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+#[cfg(test)]
 fn require_approved_production_tuple(intent: &InitialPiReleaseIntentV1) -> Result<(), SignError> {
     let value = serde_json::to_value(intent).map_err(|_| candidate_rejected())?;
     let tag = intent.tag().as_str();
@@ -1839,6 +1854,7 @@ fn intent_semantic_digest(intent: &InitialPiReleaseIntentV1) -> Result<String, S
     release_semantic_digest(INTENT_SEMANTICS_DOMAIN, intent)
 }
 
+#[cfg(test)]
 fn approved_release_semantic_digest(
     intent: &InitialPiReleaseIntentV1,
 ) -> Result<String, SignError> {
@@ -3862,30 +3878,31 @@ mod tests {
     }
 
     #[test]
-    fn structural_intent_assembly_stays_non_signable_and_production_rejects_synthetic_tuple() {
-        let fixture = CandidateFixture::new();
-        let intent_bundle = verify_transferred_bundle(&fixture.intent_bundle).unwrap();
-        let final_bundle = verify_transferred_bundle(&fixture.final_bundle).unwrap();
-        reset_key_open_count();
+    fn exactly_qualified_generated_tuple_crosses_the_real_finalization_boundary() {
+        let fixture = CandidateFixture::with_intent_mutation(|intent| {
+            intent["generated_at"] = json!("2026-08-24T00:00:00Z");
+        });
+        assert!(fixture.qualification.release_owner_approved_at() > fixture.intent.generated_at());
+        let acquired_intent = fixture.root.path.join("acquired-intent-boundary");
+        let acquired_final = fixture.root.path.join("acquired-final-boundary");
+        catalog_acquire::export_transfer_bundle(&fixture.intent_bundle, &acquired_intent).unwrap();
+        catalog_acquire::export_transfer_bundle(&fixture.final_bundle, &acquired_final).unwrap();
+        let intent_bundle = verify_transferred_bundle(&acquired_intent).unwrap();
+        let final_bundle = verify_transferred_bundle(&acquired_final).unwrap();
         let intent_candidate = assemble_release_intent(&intent_bundle, &fixture.intent).unwrap();
         assert!(!intent_candidate.is_production_signable());
+
+        let final_candidate =
+            finalize_candidate(&final_bundle, &fixture.source, &fixture.qualification).unwrap();
+        assert!(final_candidate.is_production_signable());
         assert_eq!(
-            finalize_candidate(&final_bundle, &fixture.source, &fixture.qualification),
-            Err(SignError::CandidateRejected)
+            final_candidate.runtime_semantic_sha256(),
+            intent_candidate.runtime_semantic_sha256()
         );
-        let output = fixture.root.path.join("production-rejected-output");
-        assert!(matches!(
-            sign_release(SignReleaseRequest {
-                bundle: &final_bundle,
-                source: &fixture.source,
-                qualification: &fixture.qualification,
-                key_path: &fixture.fixture_key,
-                output: &output,
-            }),
-            Err(SignError::CandidateRejected)
-        ));
-        assert_eq!(key_open_count(), 0);
-        assert!(!output.exists());
+        assert_eq!(
+            final_candidate.canonical_payload(),
+            intent_candidate.canonical_payload()
+        );
     }
 
     #[test]

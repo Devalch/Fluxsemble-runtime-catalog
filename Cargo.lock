@@ -119,6 +119,7 @@ dependencies = [
 name = "catalog-sign"
 version = "0.1.0"
 dependencies = [
+ "catalog-acquire",
  "catalog-core",
  "ed25519-dalek",
  "libc",
@@ -136,6 +137,7 @@ version = "0.1.0"
 dependencies = [
  "catalog-acquire",
  "catalog-core",
+ "catalog-publish",
  "chrono",
  "libc",
  "reqwest",

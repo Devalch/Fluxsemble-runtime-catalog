@@ -150,8 +150,23 @@ pub fn export_request(
     let manifest = serde_jcs::to_vec(&request).map_err(|_| WizardError::Qualification)?;
     let stage = create_stage(output, "qualification-request")?;
     let result = (|| {
-        catalog_acquire::export_transfer_bundle(candidate_dir, &stage.join("candidate"))
+        let export_root = stage.join("candidate-export");
+        let mut builder = DirBuilder::new();
+        builder.mode(0o700);
+        builder.create(&export_root).map_err(|_| WizardError::Io)?;
+        catalog_acquire::export_transfer_bundle(candidate_dir, &export_root.join("candidate"))
             .map_err(|_| WizardError::Qualification)?;
+        fs::rename(export_root.join("candidate"), stage.join("candidate"))
+            .map_err(|_| WizardError::Io)?;
+        let evidence = stage.parent().ok_or(WizardError::Io)?.join(format!(
+            ".qualification-acquire-evidence.{}.{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| WizardError::Io)?
+                .as_nanos()
+        ));
+        rename_no_replace(&export_root, &evidence)?;
         write_immutable(&stage.join(REQUEST_MANIFEST_NAME), &manifest)?;
         write_immutable(&stage.join("README.txt"), README.as_bytes())?;
         fs::set_permissions(&stage, fs::Permissions::from_mode(0o500))
@@ -164,6 +179,51 @@ pub fn export_request(
     }
     result?;
     Ok(request)
+}
+
+pub fn verify_existing_request(
+    state: &WizardState,
+    candidate_dir: &Path,
+    output: &Path,
+) -> Result<(), WizardError> {
+    validate_state_identity(state)?;
+    let metadata = fs::symlink_metadata(output).map_err(|_| WizardError::Qualification)?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != current_euid()
+        || metadata.permissions().mode() & 0o7777 != 0o500
+        || exact_directory_names(output, 3)?
+            != BTreeSet::from([
+                REQUEST_MANIFEST_NAME.to_owned(),
+                "README.txt".to_owned(),
+                "candidate".to_owned(),
+            ])
+        || read_immutable_regular(&output.join("README.txt"))? != README.as_bytes()
+    {
+        return Err(WizardError::Qualification);
+    }
+    let request_bytes = read_immutable_regular(&output.join(REQUEST_MANIFEST_NAME))?;
+    let request: QualificationRequest = parse_canonical(&request_bytes)?;
+    let keyring_sha256 = production_keyring().sha256();
+    validate_request(state, &request, keyring_sha256)?;
+    let source_candidate = catalog_acquire::verify_transferred_bundle(candidate_dir)
+        .map_err(|_| WizardError::Qualification)?;
+    let exported_candidate = catalog_acquire::verify_transferred_bundle(&output.join("candidate"))
+        .map_err(|_| WizardError::Qualification)?;
+    candidate_intent_for_state(state, candidate_dir)?;
+    candidate_intent_for_state(state, &output.join("candidate"))?;
+    if source_candidate.bundle_sha256() != request.candidate_sha256
+        || exported_candidate.bundle_sha256() != request.candidate_sha256
+        || source_candidate
+            .verified_input()
+            .compatibility_input_sha256()
+            != exported_candidate
+                .verified_input()
+                .compatibility_input_sha256()
+    {
+        return Err(WizardError::Qualification);
+    }
+    Ok(())
 }
 
 pub fn import_handoff(
@@ -775,6 +835,12 @@ mod tests {
                 )
         );
         assert_eq!(request.candidate_sha256().len(), 64);
+        verify_existing_request(
+            &fixture.state,
+            &fixture.root.join("qualification-request/candidate"),
+            &output,
+        )
+        .unwrap();
         assert!(
             export_request(
                 &fixture.state,
@@ -783,6 +849,27 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn completed_export_is_reusable_when_state_save_was_interrupted() {
+        let mut fixture = Fixture::matching();
+        fixture.state.phase = ReleasePhase::CandidateAssembled;
+        let output = fixture.root.join("interrupted-export");
+        export_request(
+            &fixture.state,
+            &fixture.root.join("qualification-request/candidate"),
+            &output,
+        )
+        .unwrap();
+
+        assert_eq!(fixture.state.phase, ReleasePhase::CandidateAssembled);
+        verify_existing_request(
+            &fixture.state,
+            &fixture.root.join("qualification-request/candidate"),
+            &output,
+        )
+        .unwrap();
     }
 
     #[test]

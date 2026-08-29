@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs::{self, OpenOptions},
     io::{Read, Write},
     os::unix::fs::{MetadataExt, OpenOptionsExt},
@@ -18,7 +19,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     WizardError,
-    cli::{ReleaseOptions, RunMode},
+    cli::{ReleaseOptions, ResumeOptions, RunMode},
     commands::{
         CommandPlan, build_acquire_intent, build_acquire_source, build_assemble_intent,
         build_finalize_candidate,
@@ -33,31 +34,50 @@ use crate::{
     qualification,
     sequence::{compare_sequences, local_latest_sequence},
     state::{ReleasePhase, WizardState},
+    trust::{self, MachineRole},
 };
 
 const TARGET: &str = "linux_x86_64";
 const STATE_ROOT: &str = ".release-work";
 const MAX_GITHUB_RESPONSE_BYTES: u64 = 1024 * 1024;
-const GITHUB_LATEST_RELEASE_URL: &str =
-    "https://api.github.com/repos/Devalch/Fluxsemble-runtime-catalog/releases/latest";
+const GITHUB_TAGS_URL: &str = "https://api.github.com/repos/Devalch/Fluxsemble-runtime-catalog/git/matching-refs/tags/catalog-v1-sequence-";
+const GITHUB_RELEASES_URL: &str =
+    "https://api.github.com/repos/Devalch/Fluxsemble-runtime-catalog/releases?per_page=100";
+const REPOSITORY: &str = "Devalch/Fluxsemble-runtime-catalog";
 
 pub fn run_release(
     options: ReleaseOptions,
     prompter: &mut dyn Prompter,
 ) -> Result<(), WizardError> {
     let repo = std::env::current_dir().map_err(|_| WizardError::Config)?;
-    let config = load_config(&repo, options.config.as_deref())?;
-    if config.repository != "Devalch/Fluxsemble-runtime-catalog"
-        || config.target != TARGET
-        || config.state_root != STATE_ROOT
-    {
-        return Err(WizardError::Config);
-    }
+    let config_path = resume_config_path(&repo, options.config.as_deref());
+    let config = WizardConfig::load(&config_path)?;
+    validate_release_config(&config)?;
     require_clean_head(&repo)?;
+    require_trusted_machine(&repo, &[MachineRole::Preparer])?;
+
+    loop {
+        let unfinished = resumable_states(&repo)?;
+        if unfinished.is_empty() {
+            break;
+        }
+        match UnfinishedChoice::parse(
+            &prompter.ask("An unfinished release exists. Enter resume, start new, or exit: ")?,
+        )? {
+            UnfinishedChoice::Resume => {
+                return resume_in_repo(&repo, &config, None, prompter);
+            }
+            UnfinishedChoice::StartNew => {
+                let state = choose_resumable_state(unfinished, prompter)?;
+                archive_unfinished_state(&repo, &state)?;
+            }
+            UnfinishedChoice::Exit => return Err(WizardError::UserDeclined),
+        }
+    }
 
     let local = local_latest_sequence(&repo)?;
-    let github = github_latest_sequence()?;
-    let sequence = compare_sequences(local, github).map_err(|_| WizardError::Discovery)?;
+    let observation = github_sequence_observation(local, &publisher_broker_config()?)?;
+    let sequence = reconcile_github_state(local, &observation)?;
     let pi_versions = NpmPiVersionSource.available_pi_versions()?;
     let entered_pi;
     let requested_pi = match options.pi.as_deref() {
@@ -93,6 +113,7 @@ pub fn run_release(
             _ => return Err(WizardError::UserDeclined),
         },
     };
+    require_trusted_machine(&repo, required_roles(mode))?;
     if !confirm_yes_no(
         prompter,
         &format!(
@@ -129,20 +150,66 @@ pub fn run_release(
 }
 
 pub fn resume_release(prompter: &mut dyn Prompter) -> Result<(), WizardError> {
-    resume_release_with_qualification(None, prompter)
+    resume_release_with_options(
+        ResumeOptions {
+            qualification: None,
+            config: None,
+        },
+        prompter,
+    )
 }
 
 pub fn resume_release_with_qualification(
     qualification_path: Option<&Path>,
     prompter: &mut dyn Prompter,
 ) -> Result<(), WizardError> {
+    let qualification = qualification_path
+        .map(|path| path.to_str().map(str::to_owned).ok_or(WizardError::Config))
+        .transpose()?;
+    resume_release_with_options(
+        ResumeOptions {
+            qualification,
+            config: None,
+        },
+        prompter,
+    )
+}
+
+pub fn resume_release_with_options(
+    options: ResumeOptions,
+    prompter: &mut dyn Prompter,
+) -> Result<(), WizardError> {
     let repo = std::env::current_dir().map_err(|_| WizardError::Config)?;
-    let state = select_resumable_state(&repo, prompter)?;
-    validate_resumed_state(&repo, &state)?;
+    let config = WizardConfig::load(&resume_config_path(&repo, options.config.as_deref()))?;
+    validate_release_config(&config)?;
+    resume_in_repo(
+        &repo,
+        &config,
+        options.qualification.as_deref().map(Path::new),
+        prompter,
+    )
+}
+
+fn resume_in_repo(
+    repo: &Path,
+    _config: &WizardConfig,
+    qualification_path: Option<&Path>,
+    prompter: &mut dyn Prompter,
+) -> Result<(), WizardError> {
+    require_clean_head(repo)?;
+    let state = select_resumable_state(repo, prompter)?;
+    validate_resumed_state(repo, &state)?;
+    verify_resumed_source_identity(&state, &source_identity(repo)?)?;
+    require_trusted_machine(repo, required_roles(state.mode))?;
+    let local = local_latest_sequence(repo)?;
+    let observation = github_sequence_observation(local, &publisher_broker_config()?)?;
+    if reconcile_github_state(local, &observation)? != state.sequence {
+        return Err(WizardError::Discovery);
+    }
     let launcher_config = private_config_root()?.join("launcher-config-v1.json");
     let mut release = ProductionRelease::new(
         state,
-        repo,
+        repo.to_owned(),
         launcher_config,
         true,
         qualification_path.map(Path::to_owned),
@@ -316,12 +383,13 @@ impl ReleaseMachine for ProductionRelease<'_> {
     }
 
     fn export_qualification(&mut self) -> Result<(), WizardError> {
-        qualification::export_request(
-            &self.state,
-            &self.state.work_dir.join("acquired-transfer"),
-            &self.state.work_dir.join("qualification-request"),
-        )?;
-        Ok(())
+        let candidate = self.state.work_dir.join("acquired-transfer");
+        let output = self.state.work_dir.join("qualification-request");
+        if output.exists() {
+            qualification::verify_existing_request(&self.state, &candidate, &output)
+        } else {
+            qualification::export_request(&self.state, &candidate, &output).map(|_| ())
+        }
     }
 
     fn qualification_available(&self) -> bool {
@@ -496,37 +564,13 @@ fn select_resumable_state(
     repo: &Path,
     prompter: &mut dyn Prompter,
 ) -> Result<WizardState, WizardError> {
-    let root = repo.join(STATE_ROOT);
-    let root_metadata = fs::symlink_metadata(&root).map_err(|_| WizardError::State)?;
-    if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
-        return Err(WizardError::State);
-    }
-    let mut states = Vec::new();
-    for entry in fs::read_dir(&root).map_err(|_| WizardError::State)? {
-        let entry = entry.map_err(|_| WizardError::State)?;
-        if states.len() >= 64 {
-            return Err(WizardError::State);
-        }
-        let metadata = entry.file_type().map_err(|_| WizardError::State)?;
-        if !metadata.is_dir() || metadata.is_symlink() {
-            continue;
-        }
-        let state_path = entry.path().join("wizard-state.json");
-        let state_metadata = match fs::symlink_metadata(&state_path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => return Err(WizardError::State),
-        };
-        if !state_metadata.is_file() || state_metadata.file_type().is_symlink() {
-            return Err(WizardError::State);
-        }
-        if let Some(state) = WizardState::load(&state_path)? {
-            if !matches!(state.phase, ReleasePhase::Published) {
-                states.push(state);
-            }
-        }
-    }
-    states.sort_by_key(|state| state.sequence);
+    choose_resumable_state(resumable_states(repo)?, prompter)
+}
+
+fn choose_resumable_state(
+    mut states: Vec<WizardState>,
+    prompter: &mut dyn Prompter,
+) -> Result<WizardState, WizardError> {
     match states.len() {
         0 => Err(WizardError::State),
         1 => Ok(states.remove(0)),
@@ -540,6 +584,124 @@ fn select_resumable_state(
                 .find(|state| state.sequence == sequence)
                 .ok_or(WizardError::State)
         }
+    }
+}
+
+fn resumable_states(repo: &Path) -> Result<Vec<WizardState>, WizardError> {
+    let root = repo.join(STATE_ROOT);
+    let root_metadata = match fs::symlink_metadata(&root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(_) => return Err(WizardError::State),
+    };
+    if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
+        return Err(WizardError::State);
+    }
+    let mut states = Vec::new();
+    for (index, entry) in fs::read_dir(&root)
+        .map_err(|_| WizardError::State)?
+        .enumerate()
+    {
+        if index >= 256 {
+            return Err(WizardError::State);
+        }
+        let entry = entry.map_err(|_| WizardError::State)?;
+        if states.len() >= 64 {
+            return Err(WizardError::State);
+        }
+        let metadata = entry.file_type().map_err(|_| WizardError::State)?;
+        if !metadata.is_dir() || metadata.is_symlink() {
+            continue;
+        }
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| WizardError::State)?;
+        let Some(sequence) = name
+            .strip_prefix("sequence-")
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|sequence| *sequence > 0)
+        else {
+            continue;
+        };
+        let state_path = entry.path().join("wizard-state.json");
+        let state_metadata = match fs::symlink_metadata(&state_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err(WizardError::State),
+        };
+        if !state_metadata.is_file() || state_metadata.file_type().is_symlink() {
+            return Err(WizardError::State);
+        }
+        if let Some(state) = WizardState::load(&state_path)? {
+            if state.sequence != sequence {
+                return Err(WizardError::State);
+            }
+            if !matches!(state.phase, ReleasePhase::Published) {
+                states.push(state);
+            }
+        }
+    }
+    states.sort_by_key(|state| state.sequence);
+    Ok(states)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnfinishedChoice {
+    Resume,
+    StartNew,
+    Exit,
+}
+
+impl UnfinishedChoice {
+    fn parse(value: &str) -> Result<Self, WizardError> {
+        match value {
+            "resume" => Ok(Self::Resume),
+            "start new" => Ok(Self::StartNew),
+            "exit" => Ok(Self::Exit),
+            _ => Err(WizardError::UserDeclined),
+        }
+    }
+}
+
+fn archive_unfinished_state(repo: &Path, state: &WizardState) -> Result<(), WizardError> {
+    if !matches!(
+        state.phase,
+        ReleasePhase::Planned
+            | ReleasePhase::InputsDiscovered
+            | ReleasePhase::Acquired
+            | ReleasePhase::CandidateAssembled
+            | ReleasePhase::AwaitingQualification
+            | ReleasePhase::QualificationImported
+            | ReleasePhase::Qualified
+    ) {
+        return Err(WizardError::State);
+    }
+    validate_resumed_state(repo, state)?;
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|_| WizardError::State)?
+        .as_nanos();
+    let destination = repo
+        .join(STATE_ROOT)
+        .join(format!("abandoned-sequence-{}-{nonce}", state.sequence));
+    if destination.exists() {
+        return Err(WizardError::State);
+    }
+    fs::rename(&state.work_dir, &destination).map_err(|_| WizardError::State)?;
+    fs::File::open(repo.join(STATE_ROOT))
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| WizardError::State)
+}
+
+fn verify_resumed_source_identity(
+    state: &WizardState,
+    current: &(String, String),
+) -> Result<(), WizardError> {
+    if current.0 == state.catalog_source_commit && current.1 == state.catalog_source_tree_sha256 {
+        Ok(())
+    } else {
+        Err(WizardError::State)
     }
 }
 
@@ -562,9 +724,17 @@ fn validate_resumed_state(repo: &Path, state: &WizardState) -> Result<(), Wizard
     Ok(())
 }
 
-fn load_config(repo: &Path, configured: Option<&str>) -> Result<WizardConfig, WizardError> {
-    let path = configured.map_or_else(|| repo.join("catalog-wizard.toml"), PathBuf::from);
-    WizardConfig::load(&path)
+fn resume_config_path(repo: &Path, configured: Option<&str>) -> PathBuf {
+    configured.map_or_else(|| repo.join("catalog-wizard.toml"), PathBuf::from)
+}
+
+fn validate_release_config(config: &WizardConfig) -> Result<(), WizardError> {
+    if config.repository != REPOSITORY || config.target != TARGET || config.state_root != STATE_ROOT
+    {
+        Err(WizardError::Config)
+    } else {
+        Ok(())
+    }
 }
 
 fn private_config_root() -> Result<PathBuf, WizardError> {
@@ -573,6 +743,31 @@ fn private_config_root() -> Result<PathBuf, WizardError> {
         return Err(WizardError::Config);
     }
     Ok(home.join(".config/fluxsemble-runtime-catalog"))
+}
+
+fn publisher_broker_config() -> Result<PathBuf, WizardError> {
+    Ok(private_config_root()?.join("publisher-broker-client-v1.json"))
+}
+
+fn required_roles(mode: RunMode) -> &'static [MachineRole] {
+    match mode {
+        RunMode::DryRun => &[MachineRole::Preparer],
+        RunMode::PublishCapable => &[
+            MachineRole::Preparer,
+            MachineRole::Signer,
+            MachineRole::Publisher,
+        ],
+    }
+}
+
+fn require_trusted_machine(repo: &Path, roles: &[MachineRole]) -> Result<(), WizardError> {
+    let facts = trust::current_machine_facts(repo)?;
+    trust::load_matching_profile(
+        &private_config_root()?.join("trusted-machines"),
+        &facts,
+        roles,
+    )?;
+    Ok(())
 }
 
 fn require_clean_head(repo: &Path) -> Result<(), WizardError> {
@@ -612,7 +807,52 @@ fn source_identity(repo: &Path) -> Result<(String, String), WizardError> {
     Ok((commit, format!("{:x}", Sha256::digest(&tree.stdout))))
 }
 
-fn github_latest_sequence() -> Result<Option<u64>, WizardError> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GithubSequenceObservation {
+    published: Option<u64>,
+    tags: BTreeSet<u64>,
+    next_draft_exists: bool,
+}
+
+fn reconcile_github_state(
+    local: Option<u64>,
+    observation: &GithubSequenceObservation,
+) -> Result<u64, WizardError> {
+    let next =
+        compare_sequences(local, observation.published).map_err(|_| WizardError::Discovery)?;
+    if observation
+        .published
+        .is_some_and(|published| !observation.tags.contains(&published))
+        || observation
+            .tags
+            .iter()
+            .any(|sequence| Some(*sequence) > local)
+        || observation.next_draft_exists
+    {
+        return Err(WizardError::Discovery);
+    }
+    Ok(next)
+}
+
+fn github_sequence_observation(
+    local: Option<u64>,
+    broker_config: &Path,
+) -> Result<GithubSequenceObservation, WizardError> {
+    let tags_value = fetch_fixed_github_json(GITHUB_TAGS_URL)?;
+    let releases_value = fetch_fixed_github_json(GITHUB_RELEASES_URL)?;
+    let tags = parse_catalog_tag_sequences(&tags_value)?;
+    let published = parse_published_sequence(&releases_value)?;
+    let next = compare_sequences(local, published).map_err(|_| WizardError::Discovery)?;
+    let next_draft_exists = catalog_publish::catalog_draft_exists(broker_config, next)
+        .map_err(|_| WizardError::Discovery)?;
+    Ok(GithubSequenceObservation {
+        published,
+        tags,
+        next_draft_exists,
+    })
+}
+
+fn fetch_fixed_github_json(url: &'static str) -> Result<serde_json::Value, WizardError> {
     let client = Client::builder()
         .https_only(true)
         .use_rustls_tls()
@@ -623,13 +863,10 @@ fn github_latest_sequence() -> Result<Option<u64>, WizardError> {
         .build()
         .map_err(|_| WizardError::Discovery)?;
     let response = client
-        .get(GITHUB_LATEST_RELEASE_URL)
+        .get(url)
         .header(USER_AGENT, "catalog-wizard/0.1.0")
         .send()
         .map_err(|_| WizardError::Discovery)?;
-    if response.status() == StatusCode::NOT_FOUND {
-        return Ok(None);
-    }
     if response.status() != StatusCode::OK {
         return Err(WizardError::Discovery);
     }
@@ -641,18 +878,57 @@ fn github_latest_sequence() -> Result<Option<u64>, WizardError> {
     if bytes.len() as u64 > MAX_GITHUB_RESPONSE_BYTES {
         return Err(WizardError::Discovery);
     }
-    let value: serde_json::Value =
-        serde_json::from_slice(&bytes).map_err(|_| WizardError::Discovery)?;
-    let tag = value
-        .get("tag_name")
-        .and_then(serde_json::Value::as_str)
-        .ok_or(WizardError::Discovery)?;
-    let sequence = tag
-        .strip_prefix("catalog-v1-sequence-")
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .ok_or(WizardError::Discovery)?;
-    Ok(Some(sequence))
+    serde_json::from_slice(&bytes).map_err(|_| WizardError::Discovery)
+}
+
+fn parse_catalog_tag_sequences(value: &serde_json::Value) -> Result<BTreeSet<u64>, WizardError> {
+    let values = value.as_array().ok_or(WizardError::Discovery)?;
+    if values.len() >= 100 {
+        return Err(WizardError::Discovery);
+    }
+    values
+        .iter()
+        .map(|value| {
+            value
+                .get("ref")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|reference| reference.strip_prefix("refs/tags/catalog-v1-sequence-"))
+                .and_then(|sequence| sequence.parse::<u64>().ok())
+                .filter(|sequence| *sequence > 0)
+                .ok_or(WizardError::Discovery)
+        })
+        .collect()
+}
+
+fn parse_published_sequence(value: &serde_json::Value) -> Result<Option<u64>, WizardError> {
+    let values = value.as_array().ok_or(WizardError::Discovery)?;
+    if values.len() >= 100 {
+        return Err(WizardError::Discovery);
+    }
+    let mut published = None;
+    for value in values {
+        if value
+            .get("draft")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or(WizardError::Discovery)?
+        {
+            continue;
+        }
+        let Some(tag) = value.get("tag_name").and_then(serde_json::Value::as_str) else {
+            return Err(WizardError::Discovery);
+        };
+        let Some(sequence) = tag
+            .strip_prefix("catalog-v1-sequence-")
+            .map(|value| value.parse::<u64>())
+            .transpose()
+            .map_err(|_| WizardError::Discovery)?
+            .filter(|sequence| *sequence > 0)
+        else {
+            continue;
+        };
+        published = Some(published.map_or(sequence, |current: u64| current.max(sequence)));
+    }
+    Ok(published)
 }
 
 fn lower_hex(value: &str) -> bool {
@@ -746,6 +1022,151 @@ mod tests {
 
     fn run_release_with_harness(harness: &mut ReleaseHarness) -> Result<(), WizardError> {
         drive_release(harness)
+    }
+
+    #[test]
+    fn tag_only_and_draft_only_remote_state_stop_sequence_allocation() {
+        let local = Some(4);
+        assert!(
+            reconcile_github_state(
+                local,
+                &GithubSequenceObservation {
+                    published: Some(4),
+                    tags: std::collections::BTreeSet::from([4, 5]),
+                    next_draft_exists: false,
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            reconcile_github_state(
+                local,
+                &GithubSequenceObservation {
+                    published: Some(4),
+                    tags: std::collections::BTreeSet::from([4]),
+                    next_draft_exists: true,
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(
+            reconcile_github_state(
+                local,
+                &GithubSequenceObservation {
+                    published: Some(4),
+                    tags: std::collections::BTreeSet::from([4]),
+                    next_draft_exists: false,
+                }
+            )
+            .unwrap(),
+            5
+        );
+    }
+
+    #[test]
+    fn unfinished_release_choice_supports_resume_start_new_and_exit_exactly() {
+        assert_eq!(
+            UnfinishedChoice::parse("resume"),
+            Ok(UnfinishedChoice::Resume)
+        );
+        assert_eq!(
+            UnfinishedChoice::parse("start new"),
+            Ok(UnfinishedChoice::StartNew)
+        );
+        assert_eq!(UnfinishedChoice::parse("exit"), Ok(UnfinishedChoice::Exit));
+        assert!(UnfinishedChoice::parse("delete it").is_err());
+    }
+
+    #[test]
+    fn start_new_archives_only_the_selected_safe_unfinished_state() {
+        let repo = std::env::temp_dir().join(format!(
+            "catalog-wizard-unfinished-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let work_dir = repo.join(".release-work/sequence-2");
+        let state = WizardState {
+            schema_version: 1,
+            sequence: 2,
+            pi_version: "0.84.0".to_owned(),
+            node_version: "22.20.0".to_owned(),
+            target: TARGET.to_owned(),
+            mode: RunMode::DryRun,
+            phase: ReleasePhase::AwaitingQualification,
+            signing_key_generation: 1,
+            catalog_source_commit: "11".repeat(20),
+            catalog_source_tree_sha256: "22".repeat(32),
+            work_dir: work_dir.clone(),
+        };
+        state.save(&work_dir.join("wizard-state.json")).unwrap();
+
+        archive_unfinished_state(&repo, &state).unwrap();
+        assert!(!work_dir.exists());
+        assert!(resumable_states(&repo).unwrap().is_empty());
+        assert!(
+            fs::read_dir(repo.join(STATE_ROOT))
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("abandoned-sequence-2-"))
+        );
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn resume_rejects_changed_commit_or_tree_identity() {
+        let state = WizardState {
+            schema_version: 1,
+            sequence: 2,
+            pi_version: "0.84.0".to_owned(),
+            node_version: "22.20.0".to_owned(),
+            target: TARGET.to_owned(),
+            mode: RunMode::DryRun,
+            phase: ReleasePhase::AwaitingQualification,
+            signing_key_generation: 1,
+            catalog_source_commit: "11".repeat(20),
+            catalog_source_tree_sha256: "22".repeat(32),
+            work_dir: PathBuf::from("/repo/.release-work/sequence-2"),
+        };
+        assert!(
+            verify_resumed_source_identity(
+                &state,
+                &("33".repeat(20), state.catalog_source_tree_sha256.clone())
+            )
+            .is_err()
+        );
+        assert!(
+            verify_resumed_source_identity(
+                &state,
+                &(state.catalog_source_commit.clone(), "44".repeat(32))
+            )
+            .is_err()
+        );
+        verify_resumed_source_identity(
+            &state,
+            &(
+                state.catalog_source_commit.clone(),
+                state.catalog_source_tree_sha256.clone(),
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn resume_config_option_is_not_discarded() {
+        let repo = Path::new("/repo");
+        assert_eq!(
+            resume_config_path(repo, Some("/private/custom.toml")),
+            PathBuf::from("/private/custom.toml")
+        );
+        assert_eq!(
+            resume_config_path(repo, None),
+            PathBuf::from("/repo/catalog-wizard.toml")
+        );
     }
 
     #[test]

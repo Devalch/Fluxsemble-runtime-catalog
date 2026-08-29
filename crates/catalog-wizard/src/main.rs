@@ -19,13 +19,9 @@ fn main() {
         Ok(Command::Release(options)) => {
             run_guided(|prompter| release::run_release(options, prompter))
         }
-        Ok(Command::Resume(options)) => run_guided(|prompter| match options.qualification {
-            Some(path) => release::resume_release_with_qualification(
-                Some(std::path::Path::new(&path)),
-                prompter,
-            ),
-            None => release::resume_release(prompter),
-        }),
+        Ok(Command::Resume(options)) => {
+            run_guided(|prompter| release::resume_release_with_options(options, prompter))
+        }
         Ok(Command::TrustMachine) => run_trust_machine(),
         Ok(command) => {
             eprintln!("Command requires the guided workflow modules: {command:?}");

@@ -32,6 +32,9 @@ name = "catalog-sign-fixture"
 path = "src/bin/catalog-sign-fixture.rs"
 required-features = ["fixture-tools"]
 
+[dev-dependencies]
+catalog-acquire = { path = "../catalog-acquire" }
+
 [[example]]
 name = "sign-fixture"
 path = "examples/sign-fixture.rs"

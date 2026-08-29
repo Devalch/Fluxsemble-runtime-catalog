@@ -1778,6 +1778,25 @@ fn broker_expected_task9_digest_is_checked_before_gh_or_config_directory_authori
 }
 
 #[test]
+fn fixed_catalog_draft_inspection_uses_the_authenticated_broker_without_mutation() {
+    let fixture = Fixture::new(
+        "catalog-draft-inspection-present",
+        FakeBehavior::Success,
+        &draft_list_json(),
+    );
+    let (client_config, _) = broker_client_fixture(&fixture);
+    assert!(catalog_publish::catalog_draft_exists(&client_config, 1).unwrap());
+
+    let fixture = Fixture::new(
+        "catalog-draft-inspection-missing",
+        FakeBehavior::Success,
+        b"[]",
+    );
+    let (client_config, _) = broker_client_fixture(&fixture);
+    assert!(!catalog_publish::catalog_draft_exists(&client_config, 1).unwrap());
+}
+
+#[test]
 fn real_broker_client_process_returns_only_canonical_typed_public_response() {
     let fixture = Fixture::new(
         "broker-client-real-process",

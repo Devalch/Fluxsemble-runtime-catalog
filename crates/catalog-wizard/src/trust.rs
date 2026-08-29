@@ -1,8 +1,8 @@
 use std::{
     collections::BTreeSet,
     fs::{self, OpenOptions},
-    io::Write,
-    os::unix::fs::OpenOptionsExt,
+    io::{Read, Write},
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -20,6 +20,8 @@ use crate::{
 
 const PROFILE_SCHEMA_VERSION: u32 = 1;
 const MAX_FIELD_BYTES: usize = 4_096;
+const MAX_PROFILE_BYTES: u64 = 64 * 1024;
+const MAX_PROFILE_FILES: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -116,6 +118,87 @@ pub fn profile_matches(
         }
     }
     Ok(())
+}
+
+pub fn load_matching_profile(
+    directory: &Path,
+    facts: &MachineFacts,
+    required: &[MachineRole],
+) -> Result<TrustedMachineProfile, WizardError> {
+    let directory_metadata = fs::symlink_metadata(directory).map_err(|_| WizardError::Config)?;
+    if !directory_metadata.is_dir()
+        || directory_metadata.file_type().is_symlink()
+        || directory_metadata.uid() != current_euid()
+        || directory_metadata.permissions().mode() & 0o7777 != 0o700
+    {
+        return Err(WizardError::Config);
+    }
+
+    let mut matching = Vec::new();
+    for (index, entry) in fs::read_dir(directory)
+        .map_err(|_| WizardError::Config)?
+        .enumerate()
+    {
+        if index >= MAX_PROFILE_FILES {
+            return Err(WizardError::Config);
+        }
+        let entry = entry.map_err(|_| WizardError::Config)?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| WizardError::Config)?;
+        let label = name.strip_suffix(".json").ok_or(WizardError::Config)?;
+        validate_label(label).map_err(|_| WizardError::Config)?;
+        let metadata = fs::symlink_metadata(entry.path()).map_err(|_| WizardError::Config)?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != current_euid()
+            || metadata.permissions().mode() & 0o7777 != 0o600
+            || metadata.nlink() != 1
+            || metadata.len() == 0
+            || metadata.len() > MAX_PROFILE_BYTES
+        {
+            return Err(WizardError::Config);
+        }
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let mut file = options
+            .open(entry.path())
+            .map_err(|_| WizardError::Config)?;
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        (&mut file)
+            .take(MAX_PROFILE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| WizardError::Config)?;
+        let after = file.metadata().map_err(|_| WizardError::Config)?;
+        if bytes.len() as u64 != metadata.len()
+            || metadata.dev() != after.dev()
+            || metadata.ino() != after.ino()
+            || metadata.len() != after.len()
+            || after.nlink() != 1
+        {
+            return Err(WizardError::Config);
+        }
+        let profile: TrustedMachineProfile =
+            serde_json::from_slice(&bytes).map_err(|_| WizardError::Config)?;
+        if profile.label != label
+            || serde_jcs::to_vec(&profile).map_err(|_| WizardError::Config)? != bytes
+        {
+            return Err(WizardError::Config);
+        }
+        match profile_matches(&profile, facts, required) {
+            Ok(()) => matching.push(profile),
+            Err(TrustError::FactsDoNotMatch | TrustError::MissingRole(_) | TrustError::Expired) => {
+            }
+            Err(TrustError::InvalidProfile) => return Err(WizardError::Config),
+        }
+    }
+    match matching.as_slice() {
+        [profile] => Ok(profile.clone()),
+        _ => Err(WizardError::Config),
+    }
 }
 
 impl PublicMachineApprovalReceipt {
@@ -272,6 +355,11 @@ fn read_fact(path: &str) -> Result<String, WizardError> {
 
 fn current_timestamp() -> Result<String, WizardError> {
     Ok(current_time()?.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+}
+
+fn current_euid() -> u32 {
+    // SAFETY: geteuid has no preconditions or side effects.
+    unsafe { libc::geteuid() }
 }
 
 fn current_time() -> Result<DateTime<Utc>, WizardError> {
@@ -434,6 +522,7 @@ impl TrustedMachineProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn profile_requires_requested_roles() {
@@ -441,6 +530,42 @@ mod tests {
         let facts = MachineFacts::fixture_matching();
         assert!(profile_matches(&profile, &facts, &[MachineRole::Preparer]).is_ok());
         assert!(profile_matches(&profile, &facts, &[MachineRole::Signer]).is_err());
+    }
+
+    #[test]
+    fn matching_profile_loader_rejects_missing_roles_and_returns_exact_match() {
+        let directory = std::env::temp_dir().join(format!(
+            "catalog-wizard-trust-load-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let profile = TrustedMachineProfile::fixture_with_roles(vec![MachineRole::Preparer]);
+        let path = directory.join("trusted-release-machine.json");
+        fs::write(&path, serde_jcs::to_vec(&profile).unwrap()).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert_eq!(
+            load_matching_profile(
+                &directory,
+                &MachineFacts::fixture_matching(),
+                &[MachineRole::Signer]
+            ),
+            Err(WizardError::Config)
+        );
+        assert_eq!(
+            load_matching_profile(
+                &directory,
+                &MachineFacts::fixture_matching(),
+                &[MachineRole::Preparer]
+            )
+            .unwrap(),
+            profile
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

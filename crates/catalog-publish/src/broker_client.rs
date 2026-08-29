@@ -56,6 +56,32 @@ pub(crate) struct BrokerIdentityDigests {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BrokerClientError;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoteInspectionError;
+
+pub fn catalog_draft_exists(
+    config_path: &Path,
+    sequence: u64,
+) -> Result<bool, RemoteInspectionError> {
+    if sequence == 0 {
+        return Err(RemoteInspectionError);
+    }
+    let tag = format!("catalog-v1-sequence-{sequence}");
+    let client = BrokerClient::open(config_path).map_err(|_| RemoteInspectionError)?;
+    match client
+        .execute(&BrokerRequestV1::ReadDraft {
+            schema_version: 1,
+            repository: "Devalch/Fluxsemble-runtime-catalog".to_owned(),
+            tag: tag.clone(),
+        })
+        .map_err(|_| RemoteInspectionError)?
+    {
+        BrokerResponseV1::DraftMissing { tag: actual, .. } if actual == tag => Ok(false),
+        BrokerResponseV1::Draft { tag: actual, .. } if actual == tag => Ok(true),
+        _ => Err(RemoteInspectionError),
+    }
+}
+
 struct RetainedFile {
     path: PathBuf,
     file: fs::File,
