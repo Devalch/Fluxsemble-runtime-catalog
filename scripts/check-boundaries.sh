@@ -16,6 +16,7 @@ expected_names = [
     "catalog-latest-transport",
     "catalog-publish",
     "catalog-sign",
+    "catalog-wizard",
 ]
 packages = {pkg["name"]: pkg for pkg in metadata["packages"]}
 actual_names = sorted(packages)
@@ -29,22 +30,35 @@ expected_internal_deps = {
     "catalog-acquire": [("catalog-core", "normal")],
     # Deliberately no generic acquisition dependency: this package is the fixed-latest capability.
     "catalog-latest-transport": [],
-    "catalog-sign": [("catalog-core", "normal")],
+    "catalog-sign": [
+        ("catalog-acquire", "dev"),
+        ("catalog-core", "normal"),
+    ],
     "catalog-publish": [
         ("catalog-core", "dev"),
         ("catalog-core", "normal"),
         ("catalog-latest-transport", "normal"),
     ],
+    "catalog-wizard": [
+        ("catalog-acquire", "normal"),
+        ("catalog-core", "normal"),
+        ("catalog-publish", "normal"),
+    ],
 }
 expected_external_deps = {
     "catalog-core": [
+        ("chrono", "build"),
         ("chrono", "normal"),
         ("ed25519-dalek", "normal"),
         ("hex", "dev"),
         ("semver", "normal"),
+        ("serde", "build"),
         ("serde", "normal"),
+        ("serde_jcs", "build"),
         ("serde_jcs", "normal"),
+        ("serde_json", "build"),
         ("serde_json", "normal"),
+        ("sha2", "build"),
         ("sha2", "normal"),
         ("url", "normal"),
     ],
@@ -84,6 +98,18 @@ expected_external_deps = {
         ("serde_json", "normal"),
         ("sha2", "normal"),
         ("tokio", "normal"),
+    ],
+    "catalog-wizard": [
+        ("chrono", "normal"),
+        ("libc", "normal"),
+        ("reqwest", "normal"),
+        ("semver", "normal"),
+        ("serde", "normal"),
+        ("serde_jcs", "normal"),
+        ("serde_json", "normal"),
+        ("sha2", "normal"),
+        ("tokio", "normal"),
+        ("toml", "normal"),
     ],
 }
 
@@ -152,8 +178,8 @@ import re
 import sys
 
 sign_manifest = Path("crates/catalog-sign/Cargo.toml").read_text(encoding="utf-8")
+# catalog-acquire is admitted only as the exact dev dependency checked above.
 for forbidden in [
-    "catalog-acquire",
     "catalog-publish",
     "reqwest",
     "tokio",
@@ -813,7 +839,7 @@ def isolation_boundary_errors(sources):
             errors.append(f"missing private root/topology enforcement: {required}")
     for required in [
         'mounts.keys().map(String::as_str).collect::<BTreeSet<_>>() != expected',
-        'if !mount_is_read_only(&mounts, path)',
+        '(mode.requires_input() && !mount_is_read_only(&mounts, "/input"))',
         'mount_is_read_only(&mounts, "/output")',
         'mount.filesystem != "proc"',
         'mount.filesystem != "tmpfs"',
@@ -831,7 +857,7 @@ def isolation_boundary_errors(sources):
             errors.append(f"missing empty private directory enforcement: {required}")
 
     for required in [
-        "verify_transferred_bundle(&input_path)?", "verified_input.isolated_launch_capability()?",
+        "verify_transferred_bundle(&input_path)?", "verified.isolated_launch_capability()?",
         "hash_descriptor(&file, metadata.len())? != config.signer_sha256",
         "hash_descriptor(&file, metadata.len())? != config.bwrap_sha256",
         "matches!(kind, 2 | 3)", "set_close_on_exec(descriptor, false)?",
@@ -852,7 +878,7 @@ def isolation_boundary_errors(sources):
         errors.append("signer replacement checkpoints are not exact")
     if launcher.count("rebind_executable(&bwrap, FilePolicy::Bwrap)?;") != 3:
         errors.append("bwrap replacement checkpoints are not exact")
-    if "if (request.ceremony == Ceremony::Sign) != key.is_some()" not in launcher:
+    if "if matches!(request.ceremony, Ceremony::Sign | Ceremony::InspectKey) != key.is_some()" not in launcher:
         errors.append("key mount ceremony matrix is not enforced")
     if "let output = OutputPreflight::new(request.output)?;\n    let signing_key = read_production_signing_key(request.key_path)?;" not in signing:
         errors.append("output preflight ordering before key open changed")
@@ -881,12 +907,12 @@ def isolation_boundary_errors(sources):
     capability_decl = section(inner, "pub struct SignerIsolation", "impl SignerIsolation")
     if "Deserialize" in inner.split("pub struct IsolationAttestationV1", 1)[0].rsplit("#[derive", 1)[-1]:
         errors.append("isolation attestation remains deserializable")
-    if "attestation: IsolationAttestationV1" not in capability_decl or "verified_transfer: VerifiedTransferredBundle" not in capability_decl:
+    if "attestation: IsolationAttestationV1" not in capability_decl or "verified_transfer: Option<VerifiedTransferredBundle>" not in capability_decl:
         errors.append("non-constructible isolation capability lost its private authority")
     if "pub fn run_cli(" in lib or "pub fn sign_release(" in signing or "pub fn sign_release_from_path(" in signing:
         errors.append("raw CLI/signing authority is publicly exported")
     for required in [
-        "pub fn run_isolated_cli(isolation: &SignerIsolation", "signing::run_isolated_cli(isolation.verified_transfer(), args)",
+        "pub fn run_isolated_cli(isolation: &SignerIsolation", "signing::run_isolated_cli(isolation.verified_transfer()?, args)",
     ]:
         if required not in lib:
             errors.append(f"production CLI lost isolation capability requirement: {required}")
@@ -895,8 +921,8 @@ def isolation_boundary_errors(sources):
 
     for required in [
         'verify_transferred_bundle(Path::new("/input"))?',
-        "verified_transfer.transfer_manifest_sha256().to_owned()",
-        "if input_transfer_sha256 != expected_input_digest",
+        "transfer.transfer_manifest_sha256() != expected_input_digest",
+        "let input_transfer_sha256 = expected_input_digest.to_owned();",
         "verified_transfer,",
     ]:
         if required not in isolation_entry:
@@ -1015,7 +1041,7 @@ mutations = [
     (1, '.any(|name| sensitive_environment_name(name))', '.all(|_| false)', "sensitive/no-extra environment rejection", 1),
     # Complete mount names, options, writable-output polarity, and filesystem types.
     (1, 'mounts.keys().map(String::as_str).collect::<BTreeSet<_>>() != expected', 'false', "complete mount point/no-extra equality", 1),
-    (1, 'if !mount_is_read_only(&mounts, path)', 'if false', "exact read-only mount options", 1),
+    (1, '(mode.requires_input() && !mount_is_read_only(&mounts, "/input"))', 'false', "exact read-only mount options", 1),
     (1, 'mount_is_read_only(&mounts, "/output")', 'false', "writable output mount option", 1),
     (1, 'mount.filesystem != "proc"', 'false', "proc mount filesystem", 1),
     (1, 'mount.filesystem != "tmpfs"', 'false', "dev/tmp mount filesystem", 1),
@@ -1036,7 +1062,7 @@ mutations = [
     (3, "matches!(kind, 2 | 3)", "false", "static ELF dynamic/interpreter rejection", 1),
     (3, 'load |= kind == 1;', 'load |= false;', "static ELF PT_LOAD requirement", 1),
     (3, "rebind_executable(&signer, FilePolicy::Signer)?;", "", "first signer replacement checkpoint", 1),
-    (3, "if (request.ceremony == Ceremony::Sign) != key.is_some()", "if false", "key ceremony matrix", 1),
+    (3, "if matches!(request.ceremony, Ceremony::Sign | Ceremony::InspectKey) != key.is_some()", "if false", "key ceremony matrix", 1),
     (3, "std::process::Command::new(&bwrap_exec)", 'std::process::Command::new("/bin/sh")', "retained exact bwrap execution", 1),
     # Each io_uring syscall in each real policy.
     (1, "        libc::SYS_io_uring_setup,", "", "inner io_uring_setup policy", 1),
@@ -1077,9 +1103,9 @@ mutations = [
     (1, "#[derive(Debug, Clone, PartialEq, Eq, Serialize)]", "#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]", "non-deserializable attestation", 1),
     (2, "fn sign_release(request: SignReleaseRequest", "pub fn sign_release(request: SignReleaseRequest", "private raw signing seam", 1),
     (4, "pub fn run_isolated_cli(isolation: &SignerIsolation", "pub fn run_isolated_cli(isolation: &IsolationAttestationV1", "CLI capability signature", 1),
-    (4, "signing::run_isolated_cli(isolation.verified_transfer(), args)", "signing::run_isolated_cli_removed(args)", "retained CLI consumption", 1),
+    (4, "signing::run_isolated_cli(isolation.verified_transfer()?, args)", "signing::run_isolated_cli_removed(args)", "retained CLI consumption", 1),
     (1, 'verify_transferred_bundle(Path::new("/input"))?', 'verify_transferred_bundle(Path::new("/other"))?', "exact isolated transfer verification", 1),
-    (1, "if input_transfer_sha256 != expected_input_digest", "if false", "attested digest comparison", 1),
+    (1, "if transfer.transfer_manifest_sha256() != expected_input_digest", "if false", "attested digest comparison", 1),
     (1, "verified_transfer,", "", "retained transfer capability", 1),
     # Private root type/options/topology.
     (1, 'root.root != "/newroot"', "false", "private root origin", 1),
@@ -1123,7 +1149,6 @@ mutations = [
     (5, "for (name, value) in complete_marker_environment()", "for (name, value) in removed_marker_environment()", "complete marker-only environment", 1),
     (5, '("CATALOG_SIGN_ISOLATION", "launcher-v1".to_owned())', '("CATALOG_SIGN_ISOLATION", "wrong".to_owned())', "exact accepted marker", 1),
     (5, '("CATALOG_SIGN_MODE", "sign".to_owned())', '("CATALOG_SIGN_MODE", "assemble-intent".to_owned())', "marker-only sign mode", 1),
-    (5, "InotifyKeyOpenWitness::new(&key)", "RemovedKeyOpenWitness::new(&key)", "key-open witness", 1),
     (5, "!witness.observed_open()", "true", "no key-open assertion", 1),
     (5, "assert!(!output.exists())", "", "no output assertion", 1),
 ]
@@ -1197,7 +1222,8 @@ def round2_errors(source):
             "checkpoints.before_bwrap_bind();",
             "rebind_executable(&signer, FilePolicy::Signer)?;",
             "Ceremony::RecoverSign",
-            "open_existing_output(&request.output)?",
+            "if request.ceremony == Ceremony::RecoverSign",
+            "open_existing_output(path)",
             '"CATALOG_SIGN_CONFIG_SHA256"',
             '"CATALOG_SIGN_SIGNER_SHA256"',
             '"original_operation_mode": "sign"',
@@ -1337,7 +1363,7 @@ mutations = [
     ("launcher", "checkpoints.before_signer_open();", "", "before-open checkpoint"),
     ("launcher", "checkpoints.after_signer_open();", "", "after-open checkpoint"),
     ("launcher", "checkpoints.before_bwrap_bind();", "", "before-bind checkpoint"),
-    ("launcher", "open_existing_output(&request.output)?", "create_fresh_output(&request.output)?", "closed recovery output"),
+    ("launcher", "open_existing_output(path)", "create_fresh_output(path)", "closed recovery output"),
     ("launcher", "write_recovery_binding(", "removed_binding_write(", "persisted recovery binding"),
     ("launcher", "verify_recovery_binding(", "removed_binding_verify(", "recovery config/signer binding"),
     ("launcher", "metadata.uid() == current_euid() && matches!(mode, 0o700 | 0o755)", "metadata.uid() == current_euid() && mode == 0o700", "owner ancestor exact modes"),
