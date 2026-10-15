@@ -122,6 +122,14 @@ fn acquire_with_control(
             source.sha256(),
         )?;
     }
+    for source in request.package_inputs.auxiliary_inputs() {
+        insert_expected(
+            &mut expected,
+            source.url(),
+            source.size_bytes(),
+            source.sha256(),
+        )?;
+    }
     for component in intent.profile().components() {
         for artifact in component.artifacts() {
             insert_expected(

@@ -290,6 +290,10 @@ impl ReleaseDirectory {
     }
 
     fn read_regular(&self, name: &str) -> Result<Vec<u8>, WizardError> {
+        self.read_optional_regular(name)?.ok_or(WizardError::Io)
+    }
+
+    fn read_optional_regular(&self, name: &str) -> Result<Option<Vec<u8>>, WizardError> {
         self.revalidate()?;
         let name = CString::new(name).map_err(|_| WizardError::Io)?;
         // SAFETY: the retained private directory, fixed safe name, and flags are valid.
@@ -301,7 +305,11 @@ impl ReleaseDirectory {
             )
         };
         if descriptor < 0 {
-            return Err(WizardError::Io);
+            return if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) {
+                Ok(None)
+            } else {
+                Err(WizardError::Io)
+            };
         }
         // SAFETY: successful openat returns one owned descriptor.
         let mut file = unsafe { fs::File::from_raw_fd(descriptor) };
@@ -329,7 +337,94 @@ impl ReleaseDirectory {
             return Err(WizardError::Io);
         }
         self.revalidate()?;
-        Ok(bytes)
+        Ok(Some(bytes))
+    }
+    /// Publish one complete file; interrupted staging never exposes a partial final file.
+    fn write_atomic_or_verify(&self, name: &str, bytes: &[u8]) -> Result<(), WizardError> {
+        self.revalidate()?;
+        if let Some(existing) = self.read_optional_regular(name)? {
+            return if existing == bytes {
+                Ok(())
+            } else {
+                Err(WizardError::Io)
+            };
+        }
+        if bytes.is_empty() || bytes.len() as u64 > MAX_INPUT_BYTES {
+            return Err(WizardError::Io);
+        }
+        let mut random = [0_u8; 16];
+        let mut filled = 0;
+        while filled < random.len() {
+            // SAFETY: the remaining slice is writable for the requested length.
+            let count = unsafe {
+                libc::getrandom(
+                    random[filled..].as_mut_ptr().cast(),
+                    random.len() - filled,
+                    0,
+                )
+            };
+            if count < 0
+                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+            {
+                continue;
+            }
+            if count <= 0 {
+                return Err(WizardError::Io);
+            }
+            filled += count as usize;
+        }
+        let suffix: String = random.iter().map(|b| format!("{b:02x}")).collect();
+        let stage =
+            CString::new(format!(".installer-stage-{suffix}")).map_err(|_| WizardError::Io)?;
+        let final_name = CString::new(name).map_err(|_| WizardError::Io)?;
+        // SAFETY: retained private directory and fixed/generated safe single-component names.
+        let descriptor = unsafe {
+            libc::openat(
+                self.directory.as_raw_fd(),
+                stage.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if descriptor < 0 {
+            return Err(WizardError::Io);
+        }
+        // SAFETY: successful openat transferred one descriptor.
+        let mut file = unsafe { fs::File::from_raw_fd(descriptor) };
+        let middle = bytes.len() / 2;
+        file.write_all(&bytes[..middle])
+            .map_err(|_| WizardError::Io)?;
+        #[cfg(test)]
+        generation_checkpoint(name, "partial")?;
+        file.write_all(&bytes[middle..])
+            .map_err(|_| WizardError::Io)?;
+        file.sync_all().map_err(|_| WizardError::Io)?;
+        self.revalidate()?;
+        // Verify the named staging inode still is the retained complete private file.
+        if self.read_regular(stage.to_str().map_err(|_| WizardError::Io)?)? != bytes {
+            return Err(WizardError::Io);
+        }
+        // SAFETY: same retained private directory; NOREPLACE preserves any competing final file.
+        if unsafe {
+            libc::renameat2(
+                self.directory.as_raw_fd(),
+                stage.as_ptr(),
+                self.directory.as_raw_fd(),
+                final_name.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        } != 0
+        {
+            return Err(WizardError::Io);
+        }
+        self.directory.sync_all().map_err(|_| WizardError::Io)?;
+        self.revalidate()?;
+        if self.read_regular(name)? != bytes {
+            return Err(WizardError::Io);
+        }
+        #[cfg(test)]
+        generation_checkpoint(name, "published")?;
+        Ok(())
     }
 }
 
@@ -674,8 +769,7 @@ fn generate_installer_release_inputs_with(
         .inputs
         .canonical_bytes()
         .map_err(|_| WizardError::Discovery)?;
-    release.write_no_clobber("intent.json", &intent_bytes)?;
-    release.write_no_clobber("package-inputs.json", &input_bytes)?;
+    persist_installer_pair(&release, &intent_bytes, &input_bytes)?;
     let reopened_intent = release.read_regular("intent.json")?;
     let reopened_inputs = release.read_regular("package-inputs.json")?;
     if reopened_intent != intent_bytes || reopened_inputs != input_bytes {
@@ -724,7 +818,8 @@ mod installer_generation_tests {
             .map(|b| format!("{b:02x}"))
             .collect::<String>();
         let package = &p["locked_packages"][0];
-        let input = json!({"schema_version":2,"release_subject_sha256":subject,"installer_manifest_source":{"url":"https://github.com/earendil-works/pi/releases/download/v1.2.0/pi-coding-agent-install-package.json","size_bytes":p["installer_manifest"]["size_bytes"],"sha256":p["installer_manifest"]["sha256"]},"installer_lock_source":{"url":"https://github.com/earendil-works/pi/releases/download/v1.2.0/pi-coding-agent-install-package-lock.json","size_bytes":p["installer_lock"]["size_bytes"],"sha256":p["installer_lock"]["sha256"]},"locked_packages":[{"locator":package["locator"],"name":package["name"],"version":package["version"],"resolved_url":package["resolved_url"],"registry_integrity":package["registry_integrity"],"archive_size":1,"archive_sha256":package["archive_sha256"],"declaration_size":1,"declaration_sha256":p["pi_manifest"]["sha256"],"archive_member_count":2,"pruned_reasons":[]}],"pre_prune_package_count":2,"applicable_package_count":1});
+        let mut input = json!({"schema_version":2,"release_subject_sha256":subject,"installer_manifest_source":{"url":"https://github.com/earendil-works/pi/releases/download/v1.2.0/pi-coding-agent-install-package.json","size_bytes":p["installer_manifest"]["size_bytes"],"sha256":p["installer_manifest"]["sha256"]},"installer_lock_source":{"url":"https://github.com/earendil-works/pi/releases/download/v1.2.0/pi-coding-agent-install-package-lock.json","size_bytes":p["installer_lock"]["size_bytes"],"sha256":p["installer_lock"]["sha256"]},"locked_packages":[{"locator":package["locator"],"name":package["name"],"version":package["version"],"resolved_url":package["resolved_url"],"registry_integrity":package["registry_integrity"],"archive_size":1,"archive_sha256":package["archive_sha256"],"declaration_size":1,"declaration_sha256":p["pi_manifest"]["sha256"],"archive_member_count":2,"pruned_reasons":[]}],"pre_prune_package_count":2,"applicable_package_count":1});
+        input["auxiliary_inputs"] = json!([{"url":"https://nodejs.org/dist/v22.19.0/SHASUMS256.txt","size_bytes":"1","sha256":"1".repeat(64)}]);
         catalog_acquire::PiInstallerCandidateV1 {
             profile,
             inputs: catalog_acquire::PackageInputManifestV2::from_json(
@@ -789,6 +884,142 @@ mod installer_generation_tests {
         bytes.push(b'\n');
         assert!(parse_pi_discovery_policy(p, &bytes).is_err());
     }
+    #[test]
+    fn installer_generation_recovers_interrupted_pair_without_mutable_defaults() {
+        for interruption in [
+            "after-first-publication",
+            "during-intent",
+            "during-package-inputs",
+        ] {
+            let root = std::env::temp_dir().join(format!(
+                "wizard-pair-{interruption}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir(&root).unwrap();
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+            let policy = load_pi_discovery_policy().unwrap();
+            let request = GenerateReleaseInputsRequest {
+                repository_root: root,
+                sequence: 2,
+                pi_version: "1.2.0".into(),
+                node_version: "22.19.0".into(),
+                target: "linux_x86_64".into(),
+                generated_at: DateTime::<Utc>::from(std::time::SystemTime::now()),
+                validity_window: Duration::days(31),
+            };
+            let generated =
+                generate_installer_release_inputs_with(request.clone(), policy.clone(), |_| {
+                    Ok(candidate(&policy))
+                })
+                .unwrap();
+            let intent = fs::read(&generated.intent_path).unwrap();
+            let inputs = fs::read(&generated.package_inputs_path).unwrap();
+            fs::remove_file(&generated.package_inputs_path).unwrap();
+            if interruption == "during-intent" {
+                fs::remove_file(&generated.intent_path).unwrap();
+            }
+            if interruption != "after-first-publication" {
+                let stage = generated
+                    .intent_path
+                    .parent()
+                    .unwrap()
+                    .join(format!(".{interruption}.stage"));
+                fs::write(stage, b"{partial").unwrap();
+            }
+            let mut changed = policy;
+            changed.consumer_requirement = ">=0.2.0".into();
+            let mut resumed_request = request;
+            resumed_request.generated_at += Duration::days(1);
+            let resumed = generate_installer_release_inputs_with(resumed_request, changed, |_| {
+                panic!("interrupted pair must recover its exact retained selection")
+            })
+            .unwrap();
+            assert_eq!(fs::read(resumed.intent_path).unwrap(), intent);
+            assert_eq!(fs::read(resumed.package_inputs_path).unwrap(), inputs);
+        }
+    }
+
+    #[test]
+    fn installer_pair_atomic_publication_recovers_each_injected_interruption() {
+        for fault in [
+            ("intent.json", "partial"),
+            ("intent.json", "published"),
+            ("package-inputs.json", "partial"),
+        ] {
+            let root = std::env::temp_dir().join(format!(
+                "wizard-atomic-pair-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir(&root).unwrap();
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+            let policy = load_pi_discovery_policy().unwrap();
+            let request = GenerateReleaseInputsRequest {
+                repository_root: root.clone(),
+                sequence: 2,
+                pi_version: "1.2.0".into(),
+                node_version: "22.19.0".into(),
+                target: "linux_x86_64".into(),
+                generated_at: DateTime::<Utc>::from(std::time::SystemTime::now()),
+                validity_window: Duration::days(31),
+            };
+            GENERATION_INTERRUPTION.with(|selected| selected.set(Some(fault)));
+            assert_eq!(
+                generate_installer_release_inputs_with(request.clone(), policy.clone(), |_| Ok(
+                    candidate(&policy)
+                )),
+                Err(WizardError::Io)
+            );
+            let release = root.join(".release-work/sequence-2");
+            let journal_bytes = fs::read(release.join(INSTALLER_PAIR_JOURNAL)).unwrap();
+            let journal: InstallerPairJournal = serde_json::from_slice(&journal_bytes).unwrap();
+            let expected_intent = serde_jcs::to_vec(&journal.intent).unwrap();
+            let expected_inputs = serde_jcs::to_vec(&journal.package_inputs).unwrap();
+            if fault == ("intent.json", "partial") {
+                assert!(!release.join("intent.json").exists());
+            } else {
+                assert_eq!(
+                    fs::read(release.join("intent.json")).unwrap(),
+                    expected_intent
+                );
+            }
+            assert!(!release.join("package-inputs.json").exists());
+            let mut changed = policy;
+            changed.consumer_requirement = ">=0.2.0".into();
+            let mut resumed_request = request.clone();
+            resumed_request.generated_at += Duration::days(1);
+            let resumed =
+                generate_installer_release_inputs_with(resumed_request, changed.clone(), |_| {
+                    panic!("journal recovery must not rediscover")
+                })
+                .unwrap();
+            assert_eq!(fs::read(&resumed.intent_path).unwrap(), expected_intent);
+            assert_eq!(
+                fs::read(&resumed.package_inputs_path).unwrap(),
+                expected_inputs
+            );
+            assert_eq!(
+                fs::read(release.join(INSTALLER_PAIR_JOURNAL)).unwrap(),
+                journal_bytes
+            );
+            // A complete but replaced final file is rejected, never overwritten from the journal.
+            fs::write(&resumed.intent_path, b"replaced").unwrap();
+            assert!(
+                generate_installer_release_inputs_with(request, changed, |_| panic!(
+                    "tampering cannot trigger discovery"
+                ))
+                .is_err()
+            );
+            assert_eq!(fs::read(resumed.intent_path).unwrap(), b"replaced");
+        }
+    }
 }
 
 fn reopen_installer_release_inputs(
@@ -805,13 +1036,33 @@ fn reopen_installer_release_inputs(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(_) => Err(WizardError::Io),
     };
-    if !exists(&intent_path)? && !exists(&package_inputs_path)? {
+    if !exists(&intent_path)?
+        && !exists(&package_inputs_path)?
+        && !exists(&root.join(INSTALLER_PAIR_JOURNAL))?
+    {
         return Ok(None);
     }
     let work = WorkRoot::open(&request.repository_root)?;
     let release = work.open_or_create_release_directory(request.sequence)?;
-    let intent_bytes = release.read_regular("intent.json")?;
-    let input_bytes = release.read_regular("package-inputs.json")?;
+    let journal = release.read_optional_regular(INSTALLER_PAIR_JOURNAL)?;
+    let (intent_bytes, input_bytes) = if let Some(bytes) = &journal {
+        let journal: InstallerPairJournal =
+            serde_json::from_slice(bytes).map_err(|_| WizardError::Discovery)?;
+        if journal.schema_version != 2
+            || serde_jcs::to_vec(&journal).map_err(|_| WizardError::Discovery)? != *bytes
+        {
+            return Err(WizardError::Discovery);
+        }
+        (
+            serde_jcs::to_vec(&journal.intent).map_err(|_| WizardError::Discovery)?,
+            serde_jcs::to_vec(&journal.package_inputs).map_err(|_| WizardError::Discovery)?,
+        )
+    } else {
+        (
+            release.read_regular("intent.json")?,
+            release.read_regular("package-inputs.json")?,
+        )
+    };
     let intent = catalog_core::PiReleaseIntentV2::from_json(&intent_bytes)
         .map_err(|_| WizardError::Discovery)?;
     let inputs = catalog_acquire::PackageInputManifestV2::from_json(&input_bytes)
@@ -831,10 +1082,52 @@ fn reopen_installer_release_inputs(
     {
         return Err(WizardError::Discovery);
     }
+    // Validate the immutable selection before completing any missing publication.
+    persist_installer_pair(&release, &intent_bytes, &input_bytes)?;
     Ok(Some(GeneratedReleaseInputs {
         intent_path,
         package_inputs_path,
         intent_sha256: sha256(&intent_bytes),
         package_inputs_sha256: sha256(&input_bytes),
     }))
+}
+
+const INSTALLER_PAIR_JOURNAL: &str = "installer-inputs-v2.json";
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InstallerPairJournal {
+    schema_version: u16,
+    intent: serde_json::Value,
+    package_inputs: serde_json::Value,
+}
+fn persist_installer_pair(
+    release: &ReleaseDirectory,
+    intent: &[u8],
+    inputs: &[u8],
+) -> Result<(), WizardError> {
+    let journal = InstallerPairJournal {
+        schema_version: 2,
+        intent: serde_json::from_slice(intent).map_err(|_| WizardError::Discovery)?,
+        package_inputs: serde_json::from_slice(inputs).map_err(|_| WizardError::Discovery)?,
+    };
+    let bytes = serde_jcs::to_vec(&journal).map_err(|_| WizardError::Discovery)?;
+    release.write_atomic_or_verify(INSTALLER_PAIR_JOURNAL, &bytes)?;
+    release.write_atomic_or_verify("intent.json", intent)?;
+    release.write_atomic_or_verify("package-inputs.json", inputs)
+}
+
+#[cfg(test)]
+thread_local! {
+    static GENERATION_INTERRUPTION: std::cell::Cell<Option<(&'static str, &'static str)>> = const { std::cell::Cell::new(None) };
+}
+#[cfg(test)]
+fn generation_checkpoint(name: &str, step: &str) -> Result<(), WizardError> {
+    GENERATION_INTERRUPTION.with(|fault| {
+        if fault.get().is_some_and(|selected| selected == (name, step)) {
+            fault.set(None);
+            Err(WizardError::Io)
+        } else {
+            Ok(())
+        }
+    })
 }

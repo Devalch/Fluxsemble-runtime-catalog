@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "crates/catalog-core",
+  "crates/catalog-installer-verify",
   "crates/catalog-acquire",
   # Narrow fixed-latest transport is isolated so publisher cannot receive generic acquisition.
   "crates/catalog-latest-transport",

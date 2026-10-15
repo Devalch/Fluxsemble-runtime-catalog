@@ -10,6 +10,7 @@ default = []
 fixture-tools = ["catalog-core/fixture-tools"]
 
 [dependencies]
+catalog-installer-verify = { path = "../catalog-installer-verify" }
 catalog-core = { path = "../catalog-core" }
 ed25519-dalek.workspace = true
 libc.workspace = true
@@ -33,6 +34,9 @@ path = "src/bin/catalog-sign-fixture.rs"
 required-features = ["fixture-tools"]
 
 [dev-dependencies]
+base64 = "0.22"
+flate2 = "1"
+xz2 = "0.1"
 catalog-acquire = { path = "../catalog-acquire" }
 
 [[example]]

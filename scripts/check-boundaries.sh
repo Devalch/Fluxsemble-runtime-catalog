@@ -13,6 +13,7 @@ metadata = json.loads(subprocess.check_output([
 expected_names = [
     "catalog-acquire",
     "catalog-core",
+    "catalog-installer-verify",
     "catalog-latest-transport",
     "catalog-publish",
     "catalog-sign",
@@ -27,12 +28,14 @@ if actual_names != expected_names:
 workspace_names = set(expected_names)
 expected_internal_deps = {
     "catalog-core": [],
-    "catalog-acquire": [("catalog-core", "normal")],
+    "catalog-acquire": [("catalog-core", "normal"), ("catalog-installer-verify", "normal")],
+    "catalog-installer-verify": [("catalog-core", "normal")],
     # Deliberately no generic acquisition dependency: this package is the fixed-latest capability.
     "catalog-latest-transport": [],
     "catalog-sign": [
         ("catalog-acquire", "dev"),
         ("catalog-core", "normal"),
+        ("catalog-installer-verify", "normal"),
     ],
     "catalog-publish": [
         ("catalog-core", "dev"),
@@ -64,15 +67,24 @@ expected_external_deps = {
     ],
     "catalog-acquire": [
         ("base64", "normal"),
-        ("flate2", "normal"),
+        ("flate2", "dev"),
         ("libc", "normal"),
         ("reqwest", "normal"),
-        ("semver", "normal"),
         ("serde", "normal"),
         ("serde_jcs", "normal"),
         ("serde_json", "normal"),
         ("sha2", "normal"),
         ("tokio", "normal"),
+        ("xz2", "dev"),
+    ],
+    "catalog-installer-verify": [
+        ("base64", "normal"),
+        ("flate2", "normal"),
+        ("semver", "normal"),
+        ("serde", "normal"),
+        ("serde_jcs", "normal"),
+        ("serde_json", "normal"),
+        ("sha2", "normal"),
         ("xz2", "normal"),
     ],
     "catalog-latest-transport": [
@@ -82,13 +94,16 @@ expected_external_deps = {
         ("tokio", "normal"),
     ],
     "catalog-sign": [
+        ("base64", "dev"),
         ("ed25519-dalek", "normal"),
+        ("flate2", "dev"),
         ("libc", "normal"),
         ("serde", "normal"),
         ("serde_jcs", "normal"),
         ("serde_json", "normal"),
         ("sha2", "normal"),
         ("subtle", "normal"),
+        ("xz2", "dev"),
         ("zeroize", "normal"),
     ],
     "catalog-publish": [
@@ -113,6 +128,12 @@ expected_external_deps = {
         ("toml", "normal"),
     ],
 }
+
+# The isolated signer cannot load host liblzma; its pure verifier bundles the decoder.
+xz = next(d for d in packages["catalog-installer-verify"]["dependencies"] if d["name"] == "xz2")
+if xz["features"] != ["static"]:
+    print("shared installer verifier requires the exact static xz2 feature", file=sys.stderr)
+    sys.exit(1)
 
 def dependency_key(dependency):
     return (dependency["name"], dependency["kind"] or "normal")
@@ -214,6 +235,28 @@ capability_patterns = [
         r"\blibc::(?:socket|connect|bind|listen|accept|fork|exec[a-z]*|posix_spawn|system|popen)\b",
     ]
 ]
+
+# The shared owner may parse/read supplied readers only. It cannot open filesystem paths,
+# acquire bytes, launch processes, or access keys. Exact manifest dependencies are checked above.
+pure_patterns = capability_patterns + [
+    re.compile(r"\bstd::(?:fs|env)\b"),
+    re.compile(r"\b(?:File|OpenOptions)::(?:open|create|new)\b"),
+    re.compile(r"\b(?:SigningKey|DecodePrivateKey|read_production_signing_key)\b"),
+    re.compile(r"\b(?:reqwest|tokio|libc)::"),
+]
+def pure_boundary_errors(sources):
+    return [f"impure verifier capability in {name}: {pattern.pattern}"
+            for name, source in sources.items() for pattern in pure_patterns if pattern.search(source)]
+pure_sources = {str(path): path.read_text(encoding="utf-8")
+                for path in sorted(Path("crates/catalog-installer-verify/src").glob("*.rs"))}
+pure_errors = pure_boundary_errors(pure_sources)
+if pure_errors:
+    print(pure_errors[0], file=sys.stderr)
+    sys.exit(1)
+for mutation in ['std::fs::File::open("x")', 'std::process::Command::new("x")', 'reqwest::get("x")']:
+    if not pure_boundary_errors({"mutation.rs": mutation}):
+        print("pure verifier boundary scanner accepted a capability mutation", file=sys.stderr)
+        sys.exit(1)
 
 def signer_boundary_errors(sources):
     errors = []

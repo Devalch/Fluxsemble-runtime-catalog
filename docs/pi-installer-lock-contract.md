@@ -217,7 +217,7 @@ Changing a support URL requires a new subject and qualification.
 
 `PackageInputManifestV2` is a strict, bounded, immutable exact-archive observation:
 `schema_version: 2`, `release_subject_sha256`, `installer_manifest_source`,
-`installer_lock_source`, sorted `locked_packages`, `pre_prune_package_count` and
+`installer_lock_source`, sorted `auxiliary_inputs`, sorted `locked_packages`, `pre_prune_package_count` and
 `applicable_package_count`. Each source descriptor has `url`, canonical positive
 decimal-string `size_bytes` and lowercase SHA-256 `sha256`; its URL is the exact
 upstream asset route for the selected Pi version. Each observed locked package
@@ -228,6 +228,20 @@ counts are bounded JSON integers, retaining the legacy manifest convention.
 The pre-prune count includes the wrapper root plus every locked package; the
 applicable count includes applicable locked packages. Neither is a reference
 release equality gate.
+
+`auxiliary_inputs` is required and contains exact public response descriptors
+`{url, size_bytes, sha256}`, sorted uniquely by URL. It includes Node's selected
+`https://nodejs.org/dist/v<VERSION>/SHASUMS256.txt` and each exact registry
+name/version metadata response needed when the lock omits integrity. At most 513
+responses are permitted, each at most 4 MiB (Node checksums are further limited
+to 1 MiB by replay); they share the existing 2 GiB total discovery budget. The
+registry route is constructed by the original owner, including `%40`/`%2F`
+encoding for scoped names. Their exact bytes are transferred as inventory-bound
+objects, not published release support assets. Replay derives and checks the
+name/version/tarball/integrity supplementation and Node checksum/archive binding;
+profile SRI/hash claims do not replace these responses. Auxiliary observations
+change input/source evidence identity, while the release subject still binds the
+effective profile facts.
 
 `from_json` validates structure and provenance routes; `validate_for_profile`
 also binds the subject, every locked identity/archive fact, the Pi manifest,
@@ -316,6 +330,14 @@ strict public data imports are documented in their adjacent provenance file.
 The consumer requirement `>=0.1.0` comes from the reviewed immutable input receipt,
 not the producer package version. Persisted intents retain the selected policy;
 resuming them never rediscovers using changed packaged defaults.
+Schema2 generation durably publishes `installer-inputs-v2.json`, a strict canonical
+journal `{schema_version: 2, intent, package_inputs}`, before the two final files.
+Each write uses a private retained-directory staging file, fsync, and atomic
+no-clobber rename followed by directory fsync. Recovery validates the complete
+journal selection and exact bindings before finishing absent final files; partial
+staging files never become final inputs. Existing differing/partial final files
+are rejected, never overwritten. A complete pre-journal pair can be adopted after
+validation. Schema1 generation is unchanged.
 
 ### Verification owners and transfer boundaries
 
@@ -329,10 +351,21 @@ objects under final publication descriptors. Cancellation and the existing
 no-clobber transfer writer remain authoritative. Parsed observation records alone
 do not authorize materialization.
 
-The offline signer independently reopens the transfer, verifies the complete
-object set, original-to-final source bindings, immutable observation/profile
-facts, exact qualification bytes and build evidence. It obtains no production
-acquisition/network dependency. The publisher verifies signatures, exact support
+`catalog-installer-verify` owns the shared pure bounded archive, graph, engine,
+override, requiredness, JSON and platform policy. It accepts byte suppliers or
+already-open readers and has no filesystem-opening, HTTP, process or key capability.
+Existing acquisition V2 types and discovery request types are preserved through
+reexports; legacy archive file ownership checks stay in the acquisition adapter.
+The offline signer independently reopens the transfer and verifies the complete
+object set, original-to-final source bindings, exact qualification and build
+binding, then calls `verify_installer_release` on retained actual bytes. This
+replays the same shared policy and requires exact derived profile and observations
+before minting a qualified candidate or reading a signing key. Fabricated graphs,
+nonarchives, false extracted manifests, and omitted/replaced auxiliary responses
+fail even when the transfer's JSON and hashes are internally consistent. Signer
+has a normal dependency on only this pure owner, never production acquisition or
+network code. The shared owner enables xz2's static decoder feature so the
+isolated signer does not acquire a host liblzma loader dependency. The publisher verifies signatures, exact support
 names/sizes/digests against the catalog, and qualification subject/contract/check
 bindings before staging. Recovery repeats these checks against retained original
 signed evidence and retained bytes. Installer manifest, installer lock, Pi manifest,

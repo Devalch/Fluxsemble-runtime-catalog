@@ -248,8 +248,12 @@ impl VerifiedTransferredBundle {
     }
 
     fn read_small_file(&self, relative: &str) -> Result<Vec<u8>, SignError> {
+        self.read_bounded_file(relative, MAX_MANIFEST_BYTES)
+    }
+
+    fn read_bounded_file(&self, relative: &str, maximum: u64) -> Result<Vec<u8>, SignError> {
         let retained = self.files.get(relative).ok_or_else(bundle_rejected)?;
-        if retained.entry.size > MAX_MANIFEST_BYTES {
+        if retained.entry.size > maximum {
             return Err(bundle_rejected());
         }
         verify_retained_file(self, retained)?;
@@ -6243,45 +6247,14 @@ fn finalize_installer_candidate(
         .to_owned();
     let profile = source.intent().profile();
     let input_bytes = bundle.record_bytes("package_inputs")?;
-    let inputs: InstallerInputsV2 =
-        serde_json::from_slice(&input_bytes).map_err(|_| candidate_rejected())?;
-    if serde_jcs::to_vec(&inputs).map_err(|_| candidate_rejected())? != input_bytes
-        || inputs.schema_version != 2
-        || inputs.release_subject_sha256 != subject
-        || inputs.locked_packages.len() != profile.locked_packages().len()
-        || inputs.pre_prune_package_count as usize != inputs.locked_packages.len() + 1
-        || inputs.applicable_package_count as usize
-            != inputs
-                .locked_packages
-                .iter()
-                .filter(|p| p.pruned_reasons.is_empty())
-                .count()
-    {
+    let inputs = catalog_installer_verify::PackageInputManifestV2::from_json(&input_bytes)
+        .map_err(|_| candidate_rejected())?;
+    if inputs.canonical_bytes().map_err(|_| candidate_rejected())? != input_bytes {
         return Err(candidate_rejected());
     }
-    for (retained, descriptor, asset) in [
-        (
-            &inputs.installer_manifest_source,
-            profile.installer_manifest(),
-            "pi-coding-agent-install-package.json",
-        ),
-        (
-            &inputs.installer_lock_source,
-            profile.installer_lock(),
-            "pi-coding-agent-install-package-lock.json",
-        ),
-    ] {
-        if retained.url
-            != format!(
-                "https://github.com/earendil-works/pi/releases/download/v{}/{asset}",
-                profile.pi_package().version().as_str()
-            )
-            || retained.size_bytes != descriptor.size_bytes().get().to_string()
-            || retained.sha256 != descriptor.sha256().as_str()
-        {
-            return Err(candidate_rejected());
-        }
-    }
+    inputs
+        .validate_for_profile(profile)
+        .map_err(|_| candidate_rejected())?;
     let mut expected = BTreeMap::new();
     for component in profile.components() {
         for artifact in component.artifacts() {
@@ -6305,44 +6278,22 @@ fn finalize_installer_candidate(
             descriptor.sha256().as_str(),
         )?;
     }
-    for (observed, locked) in inputs.locked_packages.iter().zip(profile.locked_packages()) {
-        if observed.locator != locked.locator().as_str()
-            || observed.name != locked.name().as_str()
-            || observed.version != locked.version().as_str()
-            || observed.resolved_url != locked.resolved_url().as_str()
-            || observed.registry_integrity != locked.registry_integrity().as_str()
-            || observed.archive_sha256 != locked.archive_sha256().as_str()
-            || observed.declaration_size == 0
-            || observed.declaration_size > 64 * 1024
-            || !valid_sha256(&observed.declaration_sha256)
-            || (observed.archive_member_count == 0 || observed.archive_member_count > 32768)
-            || observed.pruned_reasons.windows(2).any(|p| p[0] >= p[1])
-            || observed.pruned_reasons.iter().any(|r| {
-                !matches!(
-                    r.as_str(),
-                    "declaration.cpu"
-                        | "declaration.os"
-                        | "declaration.libc"
-                        | "lock.cpu"
-                        | "lock.os"
-                        | "lock.libc"
-                )
-            })
-        {
-            return Err(candidate_rejected());
-        }
-        if observed.locator == profile.pi_package_locator().as_str()
-            && (observed.declaration_size != profile.pi_manifest().size_bytes().get()
-                || observed.declaration_sha256 != profile.pi_manifest().sha256().as_str()
-                || !observed.pruned_reasons.is_empty())
-        {
-            return Err(candidate_rejected());
-        }
+    for auxiliary in inputs.auxiliary_inputs() {
         insert_expected(
             &mut expected,
-            &observed.resolved_url,
-            observed.archive_size,
-            &observed.archive_sha256,
+            auxiliary.url(),
+            auxiliary.size_bytes(),
+            auxiliary.sha256(),
+        )?;
+    }
+    for locked in profile.locked_packages() {
+        insert_expected(
+            &mut expected,
+            locked.resolved_url().as_str(),
+            inputs
+                .archive_size_for(locked.locator().as_str())
+                .ok_or_else(candidate_rejected)?,
+            locked.archive_sha256().as_str(),
         )?;
     }
     let actual = bundle
@@ -6359,6 +6310,20 @@ fn finalize_installer_candidate(
     if actual != expected {
         return Err(candidate_rejected());
     }
+    // Inventory consistency is not verification authority: independently replay the original
+    // pure archive/graph policy over retained exact bytes before minting a signing candidate.
+    catalog_installer_verify::verify_installer_release(source.intent(), &inputs, |url, maximum| {
+        let object = bundle
+            .inventory
+            .objects()
+            .iter()
+            .find(|o| o.source_url().as_str() == url)
+            .ok_or(catalog_installer_verify::AcquireError::Graph)?;
+        bundle
+            .read_bounded_file(&format!("objects/{}", object.sha256()), maximum as u64)
+            .map_err(|_| catalog_installer_verify::AcquireError::Archive)
+    })
+    .map_err(|_| candidate_rejected())?;
     let mut support_assets = Vec::new();
     for descriptor in [
         profile.installer_manifest(),
@@ -6406,38 +6371,4 @@ fn finalize_installer_candidate(
     };
     require_candidate_bounds(&candidate)?;
     Ok(candidate)
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct InstallerInputsV2 {
-    schema_version: u16,
-    release_subject_sha256: String,
-    installer_manifest_source: InstallerSourceV2,
-    installer_lock_source: InstallerSourceV2,
-    locked_packages: Vec<InstallerPackageV2>,
-    pre_prune_package_count: u16,
-    applicable_package_count: u16,
-}
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct InstallerSourceV2 {
-    url: String,
-    size_bytes: String,
-    sha256: String,
-}
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct InstallerPackageV2 {
-    locator: String,
-    name: String,
-    version: String,
-    resolved_url: String,
-    registry_integrity: String,
-    archive_size: u64,
-    archive_sha256: String,
-    declaration_size: u64,
-    declaration_sha256: String,
-    archive_member_count: u32,
-    pruned_reasons: Vec<String>,
 }

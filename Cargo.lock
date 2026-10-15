@@ -65,10 +65,10 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "catalog-core",
+ "catalog-installer-verify",
  "flate2",
  "libc",
  "reqwest",
- "semver",
  "serde",
  "serde_jcs",
  "serde_json",
@@ -90,6 +90,21 @@ dependencies = [
  "serde_json",
  "sha2",
  "url",
+]
+
+[[package]]
+name = "catalog-installer-verify"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "catalog-core",
+ "flate2",
+ "semver",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "sha2",
+ "xz2",
 ]
 
 [[package]]
@@ -120,15 +135,19 @@ dependencies = [
 name = "catalog-sign"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "catalog-acquire",
  "catalog-core",
+ "catalog-installer-verify",
  "ed25519-dalek",
+ "flate2",
  "libc",
  "serde",
  "serde_jcs",
  "serde_json",
  "sha2",
  "subtle",
+ "xz2",
  "zeroize",
 ]
 
