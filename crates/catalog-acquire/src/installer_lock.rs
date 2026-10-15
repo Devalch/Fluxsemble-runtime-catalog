@@ -373,7 +373,10 @@ pub fn discover_pi_installer_release_with_transport(
         .ok_or(AcquireError::Graph)?;
     require_string(deps, PI, &request.pi_version)?;
     verify_closure(&records)?;
+    verify_root_overrides(&manifest, &lock, root, &records)?;
 
+    let mut admitted_declarations = BTreeMap::from([(String::new(), manifest.clone())]);
+    let mut pruned = BTreeSet::new();
     let mut descriptors = Vec::new();
     let mut observed = Vec::new();
     let mut pi_facts = None;
@@ -413,10 +416,8 @@ pub fn discover_pi_installer_release_with_transport(
         require_string(&declaration, "version", version)?;
         compare_dependencies(&declaration, record)?;
         let pruned_reasons = applicability_reasons(&declaration, record)?;
-        if !pruned_reasons.is_empty()
-            && record.get("optional").and_then(Value::as_bool) != Some(true)
-        {
-            return Err(AcquireError::Graph);
+        if !pruned_reasons.is_empty() {
+            pruned.insert(locator.as_str());
         }
         check_engine(&declaration, &request.node_version)?;
         check_engine(record, &request.node_version)?;
@@ -447,6 +448,7 @@ pub fn discover_pi_installer_release_with_transport(
                 descriptor.clone(),
             ));
         }
+        admitted_declarations.insert(locator.clone(), declaration);
         descriptors.push(descriptor);
         observed.push(PackageArchiveInput {
             locator: locator.clone(),
@@ -462,6 +464,11 @@ pub fn discover_pi_installer_release_with_transport(
             pruned_reasons,
         });
     }
+    let admitted_records = admitted_declarations
+        .iter()
+        .map(|(locator, declaration)| (locator.as_str(), declaration))
+        .collect();
+    verify_applicable_closure(&admitted_records, &records, &pruned)?;
     let (cli, cli_size, cli_sha256, pi_manifest, pi_size, pi) =
         pi_facts.ok_or(AcquireError::Graph)?;
     let node_name = format!("node-v{}-linux-x64.tar.xz", request.node_version);
@@ -633,42 +640,154 @@ fn resolve<'a>(
             .map_or("", |(parent, _)| parent);
     }
 }
-fn verify_closure(records: &BTreeMap<&str, &Map<String, Value>>) -> Result<(), AcquireError> {
-    let mut seen = BTreeSet::from([""]);
-    let mut pending = VecDeque::from([""]);
-    while let Some(locator) = pending.pop_front() {
-        let record = records.get(locator).ok_or(AcquireError::Graph)?;
-        for field in ["dependencies", "optionalDependencies", "peerDependencies"] {
-            let Some(deps) = record.get(field) else {
-                continue;
-            };
-            for (name, requirement) in deps.as_object().ok_or(AcquireError::Graph)? {
-                catalog_core::PackageName::from_str(name).map_err(|_| AcquireError::Graph)?;
-                let optional_peer = field == "peerDependencies"
-                    && record
-                        .get("peerDependenciesMeta")
-                        .and_then(|m| m.get(name))
-                        .and_then(|m| m.get("optional"))
-                        .and_then(Value::as_bool)
-                        == Some(true);
-                let Some(resolved) = resolve(locator, name, records) else {
-                    if optional_peer {
-                        continue;
-                    }
+/// Initial installer_policy 1 supports only flat exact overrides that agree with the
+/// entire reachable lock graph and do not relax the original dependency ranges.
+fn override_map(object: &Map<String, Value>) -> Result<BTreeMap<String, String>, AcquireError> {
+    let Some(value) = object.get("overrides") else {
+        return Ok(BTreeMap::new());
+    };
+    let map = value.as_object().ok_or(AcquireError::Graph)?;
+    if map.len() > MAX_PACKAGES {
+        return Err(AcquireError::Graph);
+    }
+    map.iter()
+        .map(|(name, value)| {
+            catalog_core::PackageName::from_str(name).map_err(|_| AcquireError::Graph)?;
+            let version = value.as_str().ok_or(AcquireError::Graph)?;
+            exact_version(version)?;
+            Ok((name.clone(), version.to_owned()))
+        })
+        .collect()
+}
+fn verify_root_overrides(
+    manifest: &Map<String, Value>,
+    lock: &Map<String, Value>,
+    lock_root: &Map<String, Value>,
+    records: &BTreeMap<&str, &Map<String, Value>>,
+) -> Result<(), AcquireError> {
+    let overrides = override_map(manifest)?;
+    for document in [lock, lock_root] {
+        if document.contains_key("overrides") && override_map(document)? != overrides {
+            return Err(AcquireError::Graph);
+        }
+    }
+    for (name, expected) in overrides {
+        let mut matched = false;
+        for (locator, record) in records {
+            if locator.rsplit("node_modules/").next() == Some(name.as_str()) {
+                matched = true;
+                if string(record, "version")? != expected {
                     return Err(AcquireError::Graph);
-                };
-                let version = string(records[resolved], "version")?;
-                if !npm_range_matches(requirement.as_str().ok_or(AcquireError::Graph)?, version)? {
-                    return Err(AcquireError::Graph);
-                }
-                if seen.insert(resolved) {
-                    pending.push_back(resolved);
                 }
             }
         }
+        if !matched {
+            return Err(AcquireError::Graph);
+        }
     }
-    if seen.len() != records.len() {
+    Ok(())
+}
+
+/// Required edges are derived from admitted declarations, never from lock optional flags.
+fn dependency_edges<'a>(
+    locator: &str,
+    record: &Map<String, Value>,
+    records: &BTreeMap<&'a str, &Map<String, Value>>,
+) -> Result<Vec<(&'a str, bool)>, AcquireError> {
+    let mut edges = Vec::new();
+    let optional = dependency_map(record, "optionalDependencies")?;
+    for field in ["dependencies", "optionalDependencies", "peerDependencies"] {
+        let Some(deps) = dependency_map(record, field)? else {
+            continue;
+        };
+        for (name, requirement) in deps {
+            catalog_core::PackageName::from_str(name).map_err(|_| AcquireError::Graph)?;
+            // npm optionalDependencies overrides the same name in dependencies.
+            if field == "dependencies" && optional.is_some_and(|map| map.contains_key(name)) {
+                continue;
+            }
+            let optional_peer = field == "peerDependencies"
+                && record
+                    .get("peerDependenciesMeta")
+                    .and_then(|m| m.get(name))
+                    .and_then(|m| m.get("optional"))
+                    .and_then(Value::as_bool)
+                    == Some(true);
+            let Some(resolved) = resolve(locator, name, records) else {
+                if optional_peer {
+                    continue;
+                }
+                return Err(AcquireError::Graph);
+            };
+            let version = string(records[resolved], "version")?;
+            if !npm_range_matches(requirement.as_str().ok_or(AcquireError::Graph)?, version)? {
+                return Err(AcquireError::Graph);
+            }
+            edges.push((resolved, field != "optionalDependencies" && !optional_peer));
+        }
+    }
+    Ok(edges)
+}
+fn verify_closure<'a>(
+    records: &BTreeMap<&'a str, &Map<String, Value>>,
+) -> Result<BTreeSet<&'a str>, AcquireError> {
+    let mut reachability = BTreeMap::from([("", true)]);
+    let mut pending = VecDeque::from([("", true)]);
+    while let Some((locator, required_path)) = pending.pop_front() {
+        let record = records.get(locator).ok_or(AcquireError::Graph)?;
+        for (resolved, required_edge) in dependency_edges(locator, record, records)? {
+            let required = required_path && required_edge;
+            match reachability.get(resolved).copied() {
+                None => {
+                    reachability.insert(resolved, required);
+                    pending.push_back((resolved, required));
+                }
+                Some(false) if required => {
+                    reachability.insert(resolved, true);
+                    pending.push_back((resolved, true));
+                }
+                _ => {}
+            }
+        }
+    }
+    if reachability.len() != records.len() {
         return Err(AcquireError::Graph);
+    }
+    Ok(reachability
+        .into_iter()
+        .filter_map(|(locator, required)| required.then_some(locator))
+        .collect())
+}
+fn verify_applicable_closure(
+    declarations: &BTreeMap<&str, &Map<String, Value>>,
+    locks: &BTreeMap<&str, &Map<String, Value>>,
+    pruned: &BTreeSet<&str>,
+) -> Result<(), AcquireError> {
+    let required = verify_closure(declarations)?;
+    for (locator, declaration) in declarations {
+        if locator.is_empty() {
+            continue;
+        }
+        let optional_flag = match locks
+            .get(locator)
+            .ok_or(AcquireError::Graph)?
+            .get("optional")
+        {
+            None => false,
+            Some(Value::Bool(flag)) => *flag,
+            _ => return Err(AcquireError::Graph),
+        };
+        let expected_optional = !required.contains(locator);
+        if optional_flag != expected_optional || (!expected_optional && pruned.contains(locator)) {
+            return Err(AcquireError::Graph);
+        }
+        if !pruned.contains(locator) {
+            for (target, required_edge) in dependency_edges(locator, declaration, declarations)? {
+                if required_edge && pruned.contains(target) {
+                    return Err(AcquireError::Graph);
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -747,5 +866,24 @@ mod spaced_range_tests {
         for malformed in [">=", ">= || <=22", ">=14.0.0 ||", ">= <22"] {
             assert!(npm_range_matches(malformed, "22.19.0").is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod override_tests {
+    use super::*;
+    #[test]
+    fn override_map_has_its_own_bounded_entry_limit() {
+        let overrides: Map<String, Value> = (0..MAX_PACKAGES)
+            .map(|i| (format!("package{i}"), json!("1.0.0")))
+            .collect();
+        let mut root = Map::from_iter([("overrides".into(), Value::Object(overrides))]);
+        assert_eq!(override_map(&root).unwrap().len(), MAX_PACKAGES);
+        root.get_mut("overrides")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("extra".into(), json!("1.0.0"));
+        assert!(override_map(&root).is_err());
     }
 }

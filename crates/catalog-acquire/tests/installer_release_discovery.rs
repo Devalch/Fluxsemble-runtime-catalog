@@ -129,10 +129,44 @@ fn discover_fixture_for_version(
     if mutation == "null-dependency-map" {
         dep_manifest["dependencies"] = Value::Null;
     }
-    if mutation == "required-platform-pruned" {
+    if matches!(
+        mutation,
+        "required-platform-pruned"
+            | "shared-upgrade-pruned"
+            | "false-optional-pruned"
+            | "shared-required-pruned"
+            | "valid-optional-pruned"
+            | "optional-parent-required-child-pruned"
+    ) {
         dep_manifest["os"] = json!(["darwin"]);
     }
     let mut pi_manifest = json!({"name":PI,"version":pi_version,"bin":{"pi":"dist/start.js"},"dependencies":{"dep":"^1.0.0"},"engines":{"node":">=22.19.0"}});
+    if matches!(
+        mutation,
+        "shared-required-pruned"
+            | "shared-required-applicable"
+            | "valid-optional-pruned"
+            | "valid-optional-applicable"
+            | "optional-parent-required-child-pruned"
+    ) {
+        pi_manifest.as_object_mut().unwrap().remove("dependencies");
+        pi_manifest["optionalDependencies"] = if mutation == "optional-parent-required-child-pruned"
+        {
+            json!({"bridge":"1.0.0"})
+        } else {
+            json!({"dep":"^1.0.0"})
+        };
+    }
+    if mutation == "optional-overlap" {
+        pi_manifest["dependencies"]["dep"] = json!("^2.0.0");
+        pi_manifest["optionalDependencies"] = json!({"dep":"^1.0.0"});
+    }
+    if mutation == "optional-overlap-effective-mismatch" {
+        pi_manifest["optionalDependencies"] = json!({"dep":"^2.0.0"});
+    }
+    if mutation == "outside-range-root-overrides" {
+        pi_manifest["dependencies"]["dep"] = json!("^2.0.0");
+    }
     if mutation == "unsupported-engine" {
         pi_manifest["engines"]["node"] = json!(">=23");
     }
@@ -158,10 +192,121 @@ fn discover_fixture_for_version(
     }
     let pi_archive = gzip(&tar(&entries));
     let mut root = json!({"name":"@earendil-works/pi-coding-agent-install","version":"7.0.0","private":true,"dependencies":{PI:pi_version},"engines":{"node":">=22.19.0"}});
-    if mutation == "larger-graph" {
+    if matches!(
+        mutation,
+        "larger-graph" | "two-version-graph" | "mixed-version-root-overrides"
+    ) {
         root["dependencies"]["extra"] = json!("1.0.0");
     }
+    if matches!(
+        mutation,
+        "shared-required-pruned" | "shared-required-applicable"
+    ) {
+        root["dependencies"]["dep"] = json!("^1.0.0");
+    }
+    if matches!(
+        mutation,
+        "shared-upgrade-pruned" | "shared-upgrade-applicable"
+    ) {
+        root["optionalDependencies"] = json!({"dep":"^1.0.0"});
+    }
+    if mutation == "root-overrides" {
+        root["overrides"] = json!({"dep":"2.0.0"});
+    }
+    if matches!(
+        mutation,
+        "valid-root-overrides"
+            | "equal-lock-overrides"
+            | "conflicting-lock-root-overrides"
+            | "conflicting-top-lock-overrides"
+            | "outside-range-root-overrides"
+            | "mixed-version-root-overrides"
+    ) {
+        root["overrides"] = json!({"dep":"1.0.0"});
+    }
+    if mutation == "unused-root-overrides" {
+        root["overrides"] = json!({"absent":"1.0.0"});
+    }
+    if mutation == "range-root-overrides" {
+        root["overrides"] = json!({"dep":"^1.0.0"});
+    }
+    if mutation == "nested-root-overrides" {
+        root["overrides"] = json!({"dep":{".":"1.0.0"}});
+    }
+    if mutation == "selector-root-overrides" {
+        root["overrides"] = json!({"dep@^1":"1.0.0"});
+    }
+    if mutation == "reference-root-overrides" {
+        root["overrides"] = json!({"dep":"$dep"});
+    }
+    if mutation == "oversized-root-overrides" {
+        root["overrides"] = Value::Object(
+            (0..513)
+                .map(|i| (format!("dep{i}"), json!("1.0.0")))
+                .collect(),
+        );
+    }
+    if mutation == "empty-root-overrides" {
+        root["overrides"] = json!({});
+    }
+    if mutation == "null-root-overrides" {
+        root["overrides"] = Value::Null;
+    }
     let mut lock = json!({"name":root["name"],"version":"7.0.0","lockfileVersion":3,"requires":true,"packages":{"":root.clone(),"node_modules/@earendil-works/pi-coding-agent":{"version":pi_version,"resolved":pi_url,"integrity":sri(&pi_archive),"dependencies":{"dep":"^1.0.0"}},"node_modules/dep":{"version":"1.0.0","resolved":DEP_URL}}});
+    if pi_manifest.get("optionalDependencies").is_some() {
+        let pi_lock = lock["packages"]["node_modules/@earendil-works/pi-coding-agent"]
+            .as_object_mut()
+            .unwrap();
+        if !mutation.starts_with("optional-overlap") {
+            pi_lock.remove("dependencies");
+        }
+        pi_lock.insert(
+            "optionalDependencies".into(),
+            pi_manifest["optionalDependencies"].clone(),
+        );
+    }
+    if matches!(
+        mutation,
+        "optional-overlap" | "optional-overlap-effective-mismatch" | "outside-range-root-overrides"
+    ) {
+        lock["packages"]["node_modules/@earendil-works/pi-coding-agent"]["dependencies"] =
+            pi_manifest["dependencies"].clone();
+    }
+    if matches!(
+        mutation,
+        "false-optional-pruned"
+            | "optional-overlap"
+            | "optional-overlap-effective-mismatch"
+            | "shared-upgrade-pruned"
+            | "false-optional-applicable"
+            | "shared-required-pruned"
+            | "valid-optional-pruned"
+            | "valid-optional-applicable"
+            | "optional-parent-required-child-pruned"
+    ) {
+        lock["packages"]["node_modules/dep"]["optional"] = json!(true);
+    }
+    if mutation == "valid-root-overrides" {
+        lock["packages"][""]
+            .as_object_mut()
+            .unwrap()
+            .remove("overrides");
+    }
+    if mutation == "conflicting-lock-root-overrides" {
+        lock["packages"][""]["overrides"] = json!({"dep":"2.0.0"});
+    }
+    if mutation == "conflicting-top-lock-overrides" {
+        lock["overrides"] = json!({"dep":"2.0.0"});
+    }
+    if mutation == "lock-root-overrides" {
+        lock["packages"][""]["overrides"] = json!({"dep":"2.0.0"});
+    }
+    if mutation == "equal-lock-overrides" {
+        lock["overrides"] = root["overrides"].clone();
+    }
+    if mutation == "top-lock-overrides" {
+        lock["overrides"] = json!({"dep":"2.0.0"});
+    }
     if mutation == "unsupported-lock" {
         lock["lockfileVersion"] = json!(2);
     }
@@ -269,6 +414,43 @@ fn discover_fixture_for_version(
             serde_json::to_vec(&pi_metadata).unwrap(),
         );
     }
+    if mutation == "optional-parent-required-child-pruned" {
+        let url = "https://registry.npmjs.org/bridge/-/bridge-1.0.0.tgz";
+        let archive = gzip(&tar(&[TarEntry::file(
+            "package/package.json",
+            br#"{"name":"bridge","version":"1.0.0","dependencies":{"dep":"^1.0.0"}}"#,
+        )]));
+        lock["packages"]["node_modules/bridge"] = json!({"version":"1.0.0","resolved":url,"integrity":sri(&archive),"dependencies":{"dep":"^1.0.0"},"optional":true});
+        responses.insert(
+            format!("{upstream}/pi-coding-agent-install-package-lock.json"),
+            serde_json::to_vec(&lock).unwrap(),
+        );
+        responses.insert(url.into(), archive);
+    }
+    if matches!(
+        mutation,
+        "two-version-graph" | "mixed-version-root-overrides"
+    ) {
+        let url = "https://registry.npmjs.org/extra/-/extra-1.0.0.tgz";
+        let archive = gzip(&tar(&[TarEntry::file(
+            "package/package.json",
+            br#"{"name":"extra","version":"1.0.0","dependencies":{"dep":"^1.0.0"}}"#,
+        )]));
+        lock["packages"]["node_modules/extra"] = json!({"version":"1.0.0","resolved":url,"integrity":sri(&archive),"dependencies":{"dep":"^1.0.0"}});
+        let nested_url = "https://registry.npmjs.org/dep/-/dep-1.0.1.tgz";
+        let nested = gzip(&tar(&[TarEntry::file(
+            "package/package.json",
+            br#"{"name":"dep","version":"1.0.1"}"#,
+        )]));
+        lock["packages"]["node_modules/extra/node_modules/dep"] =
+            json!({"version":"1.0.1","resolved":nested_url,"integrity":sri(&nested)});
+        responses.insert(
+            format!("{upstream}/pi-coding-agent-install-package-lock.json"),
+            serde_json::to_vec(&lock).unwrap(),
+        );
+        responses.insert(url.into(), archive);
+        responses.insert(nested_url.into(), nested);
+    }
     if mutation == "larger-graph" {
         let url = "https://registry.npmjs.org/extra/-/extra-1.0.0.tgz";
         let archive = gzip(&tar(&[TarEntry::file(
@@ -285,7 +467,38 @@ fn discover_fixture_for_version(
     }
     let mut r = request();
     r.pi_version = pi_version.into();
-    discover_pi_installer_release_with_transport(r, &Transport(responses))
+    let transport = Transport(responses);
+    if matches!(
+        mutation,
+        "root-overrides"
+            | "null-root-overrides"
+            | "lock-root-overrides"
+            | "top-lock-overrides"
+            | "unused-root-overrides"
+            | "range-root-overrides"
+            | "nested-root-overrides"
+            | "selector-root-overrides"
+            | "reference-root-overrides"
+            | "oversized-root-overrides"
+            | "conflicting-lock-root-overrides"
+            | "conflicting-top-lock-overrides"
+            | "outside-range-root-overrides"
+            | "mixed-version-root-overrides"
+    ) {
+        struct SupportOnlyTransport<'a>(&'a Transport);
+        impl ReleaseDiscoveryTransport for SupportOnlyTransport<'_> {
+            fn fetch(&self, url: &str, maximum: usize) -> Result<Vec<u8>, AcquireError> {
+                assert!(
+                    url.starts_with("https://github.com/earendil-works/pi/releases/download/"),
+                    "archive/registry acquisition before root override rejection: {url}"
+                );
+                self.0.fetch(url, maximum)
+            }
+        }
+        discover_pi_installer_release_with_transport(r, &SupportOnlyTransport(&transport))
+    } else {
+        discover_pi_installer_release_with_transport(r, &transport)
+    }
 }
 struct TarEntry {
     path: String,
@@ -580,4 +793,61 @@ fn npm_omitted_and_empty_dependency_maps_are_equivalent() {
 fn scoped_registry_supplementation_uses_the_exact_encoded_name_version_route() {
     assert!(discover_fixture("scoped-missing-integrity").is_ok());
     assert!(discover_fixture("scoped-substituted-name").is_err());
+}
+
+#[test]
+fn pruning_derives_requiredness_from_verified_edges_not_optional_flags() {
+    for mutation in [
+        "false-optional-pruned",
+        "false-optional-applicable",
+        "shared-required-pruned",
+        "shared-upgrade-pruned",
+        "optional-parent-required-child-pruned",
+        "optional-overlap-effective-mismatch",
+    ] {
+        assert!(discover_fixture(mutation).is_err(), "accepted {mutation}");
+    }
+    for mutation in [
+        "valid-optional-pruned",
+        "valid-optional-applicable",
+        "shared-required-applicable",
+        "shared-upgrade-applicable",
+        "optional-overlap",
+    ] {
+        assert!(discover_fixture(mutation).is_ok(), "rejected {mutation}");
+    }
+}
+
+#[test]
+fn root_overrides_require_a_bounded_exact_source_consistent_subset() {
+    for mutation in [
+        "root-overrides",
+        "null-root-overrides",
+        "lock-root-overrides",
+        "top-lock-overrides",
+        "unused-root-overrides",
+        "range-root-overrides",
+        "nested-root-overrides",
+        "selector-root-overrides",
+        "reference-root-overrides",
+        "oversized-root-overrides",
+        "conflicting-lock-root-overrides",
+        "conflicting-top-lock-overrides",
+        "outside-range-root-overrides",
+        "mixed-version-root-overrides",
+    ] {
+        assert_eq!(
+            discover_fixture(mutation).unwrap_err(),
+            AcquireError::Graph,
+            "accepted {mutation}"
+        );
+    }
+    for mutation in [
+        "valid-root-overrides",
+        "equal-lock-overrides",
+        "empty-root-overrides",
+        "two-version-graph",
+    ] {
+        assert!(discover_fixture(mutation).is_ok(), "rejected {mutation}");
+    }
 }

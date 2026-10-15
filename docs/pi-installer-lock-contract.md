@@ -245,3 +245,24 @@ Node support remains 22.19.0/linux_x86_64. Unsupported engine/dependency range
 forms fail closed; supported npm forms include exact/partial/wildcard versions,
 comparators, caret, tilde, whitespace conjunctions, unions and hyphen ranges with
 an exact upper version. No app-version inference or upstream execution occurs.
+
+### Initial installer policy 1 graph and override semantics
+
+Requiredness comes from verified wrapper/package declaration edges. A package
+reached through any required path is required, even if another path is optional;
+lock `optional` flags must agree with the derived result. npm optionalDependencies
+entries replace same-name dependencies as effective edges (range and requiredness),
+while both original maps stay bound to their verified source documents. An
+applicable package cannot have a required effective edge into a pruned package.
+Only packages reached exclusively through optional paths may be pruned.
+
+Installer-root overrides support a bounded flat map of at most 512 validated
+package names to exact versions. Every override must match at least one reachable
+locked package, and every matching locator must have that exact version. Original
+effective dependency-edge ranges remain enforced; root overrides do not authorize
+resolution outside those ranges. Selector-qualified keys, nested maps, ranges,
+`$` references, null and other types fail closed before package archive acquisition.
+An absent or empty map means no overrides. npm's omitted lock override field is
+allowed; any present top-level lock or lock-root override map must validate and
+equal the installer manifest map. Consumers must independently enforce this same installer_policy 1 subset and
+requiredness/applicable closure.
