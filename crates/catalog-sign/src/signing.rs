@@ -1542,7 +1542,7 @@ fn require_approved_production_tuple(intent: &InitialPiReleaseIntentV1) -> Resul
                     || metadata.shipped_shrinkwrap().artifact().size_bytes().get()
                         != SHRINKWRAP_SIZE
             }
-            ProviderExtensionV1::None => true,
+            ProviderExtensionV1::None | ProviderExtensionV1::PiInstallerLock(_) => true,
         }
     {
         return Err(candidate_rejected());
@@ -1558,7 +1558,9 @@ fn verify_complete_object_graph(
     let release = intent.release().catalog_release();
     let metadata = match release.provider_extension() {
         ProviderExtensionV1::Pi(metadata) => metadata.as_ref(),
-        ProviderExtensionV1::None => return Err(candidate_rejected()),
+        ProviderExtensionV1::None | ProviderExtensionV1::PiInstallerLock(_) => {
+            return Err(candidate_rejected());
+        }
     };
     let node = release
         .components()
@@ -5449,7 +5451,9 @@ mod tests {
             let release = intent.release().catalog_release();
             let metadata = match release.provider_extension() {
                 ProviderExtensionV1::Pi(metadata) => metadata.as_ref(),
-                ProviderExtensionV1::None => panic!("approved evidence has no Pi metadata"),
+                ProviderExtensionV1::None | ProviderExtensionV1::PiInstallerLock(_) => {
+                    panic!("approved evidence has no Pi metadata")
+                }
             };
             let node = &release.components()[0].artifacts()[0];
             let pi = &release.components()[1].artifacts()[0];

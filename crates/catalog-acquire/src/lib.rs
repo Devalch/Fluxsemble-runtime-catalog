@@ -650,7 +650,9 @@ fn pi_metadata(
 ) -> Result<&PiCatalogExtensionMetadata, AcquireError> {
     match intent.release().catalog_release().provider_extension() {
         ProviderExtensionV1::Pi(metadata) => Ok(metadata),
-        ProviderExtensionV1::None => Err(AcquireError::Input),
+        ProviderExtensionV1::None | ProviderExtensionV1::PiInstallerLock(_) => {
+            Err(AcquireError::Input)
+        }
     }
 }
 

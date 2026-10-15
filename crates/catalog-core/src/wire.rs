@@ -11,6 +11,10 @@ use url::Url;
 
 use crate::CoreError;
 
+#[path = "pi_installer_lock.rs"]
+mod pi_installer_lock;
+pub use pi_installer_lock::*;
+
 pub const CATALOG_SCHEMA_VERSION: u16 = 1;
 pub const MAX_CATALOG_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_PROVIDERS: usize = 16;
@@ -424,6 +428,8 @@ impl PlainTextReleaseMetadata {
 pub enum ProviderExtensionV1 {
     None,
     Pi(Box<PiCatalogExtensionMetadata>),
+    #[serde(rename = "pi_installer_lock_v1")]
+    PiInstallerLock(Box<PiInstallerLockMetadataV1>),
 }
 
 impl ProviderExtensionV1 {
@@ -438,6 +444,12 @@ impl ProviderExtensionV1 {
             ProviderExtensionWire::None => {
                 require(provider_id != PI_PROVIDER_ID)?;
                 Ok(Self::None)
+            }
+            ProviderExtensionWire::PiInstallerLock(wire) => {
+                require(provider_id == PI_PROVIDER_ID)?;
+                let metadata = PiInstallerLockMetadataV1::from_wire(*wire, allowed_origins)?;
+                metadata.validate_release(release_version, components)?;
+                Ok(Self::PiInstallerLock(Box::new(metadata)))
             }
             ProviderExtensionWire::Pi(metadata) => {
                 require(provider_id == PI_PROVIDER_ID)?;
@@ -1387,6 +1399,8 @@ struct ArtifactInventoryWire {
 enum ProviderExtensionWire {
     None,
     Pi(Box<PiCatalogExtensionWire>),
+    #[serde(rename = "pi_installer_lock_v1")]
+    PiInstallerLock(Box<pi_installer_lock::PiInstallerLockWire>),
 }
 
 #[derive(Deserialize)]

@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "release_subject_sha256": "984bfc0dc24559f286cc12c248334318ce3ff50cc7fc5f01bb2aa15d88460133",
+  "required_contracts": {
+    "installer_policy": 1,
+    "lockfile_version": 3,
+    "pi_rpc": 1,
+    "pi_session": 1,
+    "execution_payload": 3,
+    "tool_wire": 1,
+    "channel_layout": 2,
+    "native_auth": 1,
+    "resource_policy_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+    "tool_policy_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+    "execution_policy_sha256": "4444444444444444444444444444444444444444444444444444444444444444"
+  },
+  "consumer_requirement": ">=0.1.0",
+  "verification_build": {
+    "consumer_version": "0.1.0",
+    "implementation_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "application_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+    "daemon_sha256": "6666666666666666666666666666666666666666666666666666666666666666",
+    "compatibility_profile_id": "builtin-pi-installer-lock-contracts-v1",
+    "compatibility_profile_sha256": "7777777777777777777777777777777777777777777777777777777777777777"
+  },
+  "results": {
+    "installation": "pass",
+    "sdk_auth": "pass",
+    "session_resume": "pass",
+    "streaming_tools": "pass",
+    "lifecycle": "pass"
+  }
+}

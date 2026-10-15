@@ -1,0 +1,11 @@
+{
+  "duplicate-field.json": "e23b226f34892b3283c46d41d19a8ede6ae705e91dcf28214fa041960cf5af83",
+  "pi-root-substituted-for-wrapper.json": "9f45e6f41122e2abfdda3beeb4fb8b082df3902eec327aab4ad030b4846a5f7b",
+  "subject.sha256": "cda65183a93cb0450101af37a856fac001b4493c0289d45e153c29a4f4610fe4",
+  "unknown-contract.json": "c5db4f7c434187e4376d69f8693f08c50a89b644443d25f16aabf522050c631e",
+  "unsafe-path.json": "d493085283914574b3308155f83dfcd9b625b3faa2b10b5c542020cb1d274d84",
+  "valid-metadata.json": "f97bac8001614eb3ecc781a870c58fd11a470c0afd27658895781fae8f7c127f",
+  "valid-qualification.json": "361442a604ba19806e30467057049a9403695d141a2d2170b1e590ed7af20b14",
+  "valid-wrapper-root.json": "e15cc35db5784281b006d2edc35de9a58c20548c1337c06bf4b3380f3d7aac1f",
+  "wrong-locator-identity.json": "63993b01526f88a5cc69573923a6d88ccb151400655ee1bff46a6246ad998d29"
+}

@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "pi_package": {
+    "name": "@earendil-works/pi-coding-agent",
+    "version": "1.2.0"
+  },
+  "node_version": "22.19.0",
+  "target": "linux_x86_64",
+  "consumer_requirement": ">=0.1.0",
+  "required_contracts": {
+    "installer_policy": 1,
+    "lockfile_version": 3,
+    "pi_rpc": 1,
+    "pi_session": 1,
+    "execution_payload": 3,
+    "tool_wire": 1,
+    "channel_layout": 2,
+    "native_auth": 1,
+    "resource_policy_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+    "tool_policy_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+    "execution_policy_sha256": "4444444444444444444444444444444444444444444444444444444444444444"
+  },
+  "installer_root": {
+    "name": "@earendil-works/pi-coding-agent",
+    "version": "1.2.0"
+  },
+  "pi_package_locator": "node_modules/@earendil-works/pi-coding-agent",
+  "cli_entrypoint": "dist/cli.js",
+  "installer_manifest": {
+    "url": "https://example.com/package.json",
+    "size_bytes": "1",
+    "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+  },
+  "installer_lock": {
+    "url": "https://example.com/package-lock.json",
+    "size_bytes": "1",
+    "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+  },
+  "pi_manifest": {
+    "url": "https://example.com/pi-package.json",
+    "size_bytes": "1",
+    "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+  },
+  "components": [
+    {
+      "component_id": "builtin:node",
+      "version": "22.19.0",
+      "artifacts": [
+        {
+          "artifact_id": "builtin:node:archive",
+          "url": "https://example.com/node.tar.xz",
+          "size_bytes": "1",
+          "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+          "inventory": [
+            {
+              "path": "bin/node",
+              "size_bytes": "1",
+              "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "component_id": "builtin:pi",
+      "version": "1.2.0",
+      "artifacts": [
+        {
+          "artifact_id": "builtin:pi:archive",
+          "url": "https://example.com/pi.tgz",
+          "size_bytes": "1",
+          "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+          "inventory": [
+            {
+              "path": "dist/cli.js",
+              "size_bytes": "1",
+              "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "pi_component_id": "builtin:pi",
+  "pi_artifact_id": "builtin:pi:archive",
+  "node_component_id": "builtin:node",
+  "node_artifact_id": "builtin:node:archive",
+  "registry_integrity": "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+  "locked_packages": [
+    {
+      "locator": "node_modules/@earendil-works/pi-coding-agent",
+      "name": "@earendil-works/pi-coding-agent",
+      "version": "1.2.0",
+      "resolved_url": "https://example.com/pi.tgz",
+      "registry_integrity": "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+      "archive_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+    }
+  ]
+}
