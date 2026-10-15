@@ -5,6 +5,7 @@ mod canonical;
 mod qualification;
 mod signature;
 mod source;
+mod source_v2;
 mod wire;
 
 pub use bundle::*;
@@ -12,6 +13,7 @@ pub use canonical::{canonical_catalog_payload, catalog_payload_sha256};
 pub use qualification::*;
 pub use signature::*;
 pub use source::*;
+pub use source_v2::*;
 pub use wire::*;
 
 /// Closed, non-echoing failures from the data-only catalog core.

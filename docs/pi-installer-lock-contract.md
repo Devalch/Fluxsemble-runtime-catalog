@@ -266,3 +266,76 @@ An absent or empty map means no overrides. npm's omitted lock override field is
 allowed; any present top-level lock or lock-root override map must validate and
 equal the installer manifest map. Consumers must independently enforce this same installer_policy 1 subset and
 requiredness/applicable closure.
+
+## Producer source and handoff version 2
+
+Legacy producer intent/source/qualification formats remain unchanged.
+`PiReleaseIntentV2` is a bounded strict object with `schema_version: 2`, positive
+canonical decimal-string `sequence`, matching `tag`, `generated_at`, `expires_at`,
+`title`, `notes`, and `profile`. The profile already contains final support URLs
+under the selected catalog sequence. It has no qualification or final-catalog
+hash. Its publication metadata is validated through the catalog-v1 owner.
+
+`CatalogSourceV2` is exactly `{schema_version: 2, intent, build, qualification}`.
+`build` retains `FluxsembleBuildBindingV1`'s five fields. `qualification` contains
+`relative_path` (safe, bounded, under `qualifications/`, ending `.json`) and
+`sha256` (the raw SHA-256 of the exact qualification asset). `finalize(bytes)`
+requires the canonical JCS qualification encoding with no trailing newline,
+checks the raw reference digest, complete passes, subject, contracts, consumer
+requirement, tested consumer version, and all five existing build-binding fields.
+It then constructs the catalog-v1 payload with the exact qualification size/hash
+and `qualification-<raw-sha256>.json` URL. No serialization changes occur after
+hashing. The consumer qualification parser remains independent of this producer
+canonical-output convention. Source parsing and finalization produce inert data.
+
+The tested behavioral profile digest is SHA-256 of JCS of
+`{schema_version: 1, profile_id: "builtin-pi-installer-lock-contracts-v1",
+required_contracts: <typed-contracts>}` followed by exactly one LF. The producer
+reconstructs this serialization and compares its digest to verification-build
+evidence. Its independent known answer is the admitted public manifest SHA-256
+`3fb5c10c327b14a8537b1a748961ca034d8685ac71f20132ee5039b12b315747`.
+Application/daemon hashes bind the recorded tested build to the selected source;
+they do not require installing consumers to have those executable hashes.
+
+New wizard states use schema version 2; resumed schema-1 states retain the legacy
+flow. `export_request`, `import_handoff`, and `resume_qualification` dispatch by
+that version. The current request is exactly `schema_version: 2`,
+`kind: "pi_installer_lock_v1"`, numeric `sequence`, `release_subject_sha256`,
+`input_bundle_sha256`, `intent`, `catalog_source_commit`,
+`catalog_source_tree_sha256`, and `trusted_signing_keyring_sha256`. The input bundle
+hash identifies the transferred inputs; it is not a future final-catalog hash.
+The existing `manifest-v1.json` handoff filename now carries this explicit
+versioned request. The return still contains exactly canonical
+`build-binding-v1.json` and `qualification-v1.json`; imported evidence is an
+explicit legacy/current enum. Current instructions use an existing supported
+build and unchanged contracts. The final catalog is assembled only after import.
+
+New generation receives explicit policy loaded from this repository's embedded
+`resources/pi/consumer-policy-v1.json` and `supported-contracts-v1.json`. These
+strict public data imports are documented in their adjacent provenance file.
+The consumer requirement `>=0.1.0` comes from the reviewed immutable input receipt,
+not the producer package version. Persisted intents retain the selected policy;
+resuming them never rediscovers using changed packaged defaults.
+
+### Verification owners and transfer boundaries
+
+The original `catalog-acquire` owner handles both versions of `acquire-intent`
+and `acquire-source`. Current acquisition refetches the retained original upstream
+installer sources under exact size/hash bounds, reruns Task 3's full original graph,
+archive, engine, and closure verifier, and compares the complete derived profile
+and observations. It extracts the Pi manifest again from its verified archive.
+Only after those checks does it materialize installer manifest/lock/Pi manifest
+objects under final publication descriptors. Cancellation and the existing
+no-clobber transfer writer remain authoritative. Parsed observation records alone
+do not authorize materialization.
+
+The offline signer independently reopens the transfer, verifies the complete
+object set, original-to-final source bindings, immutable observation/profile
+facts, exact qualification bytes and build evidence. It obtains no production
+acquisition/network dependency. The publisher verifies signatures, exact support
+names/sizes/digests against the catalog, and qualification subject/contract/check
+bindings before staging. Recovery repeats these checks against retained original
+signed evidence and retained bytes. Installer manifest, installer lock, Pi manifest,
+and qualification are required assets; omissions or substitutions fail even when
+the transfer and bundle manifest are internally consistent. No new key authority
+is introduced by a parser, source record, qualification record, or bundle inventory.

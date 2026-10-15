@@ -141,6 +141,12 @@ struct InputWire {
     applicable_package_count: u16,
 }
 impl PackageInputManifestV2 {
+    pub fn archive_size_for(&self, locator: &str) -> Option<u64> {
+        self.locked_packages
+            .iter()
+            .find(|p| p.locator == locator)
+            .map(|p| p.archive_size)
+    }
     pub fn from_json(bytes: &[u8]) -> Result<Self, AcquireError> {
         if bytes.len() > MAX_INPUT_BYTES {
             return Err(AcquireError::Graph);

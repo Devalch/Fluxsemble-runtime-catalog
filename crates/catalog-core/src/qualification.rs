@@ -312,3 +312,62 @@ struct QualificationWire {
     release_owner_approved_at: String,
     residual_risks: Vec<String>,
 }
+
+/// Bind inert current-format evidence to the exact release subject and tested consumer.
+/// This performs data consistency checks only; acquisition, signing and consumer admission
+/// retain their own authority and must verify the original inputs independently.
+pub fn verify_pi_release_qualification(
+    profile: &crate::PiReleaseProfileV1,
+    qualification: &crate::PiReleaseQualificationV1,
+) -> Result<(), CoreError> {
+    let subject = crate::pi_release_subject_sha256(profile)?;
+    let subject_hex: String = subject.iter().map(|byte| format!("{byte:02x}")).collect();
+    require(qualification.release_subject_sha256().as_str() == subject_hex)?;
+    require(qualification.required_contracts() == profile.required_contracts())?;
+    require(qualification.consumer_requirement() == profile.consumer_requirement())?;
+    require(qualification.is_complete_pass())?;
+    let profile_digest = pi_required_contracts_profile_sha256(profile.required_contracts())?;
+    let profile_hex: String = profile_digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    require(
+        qualification
+            .verification_build()
+            .compatibility_profile_id()
+            == "builtin-pi-installer-lock-contracts-v1",
+    )?;
+    require(
+        qualification
+            .verification_build()
+            .compatibility_profile_sha256()
+            .as_str()
+            == profile_hex,
+    )?;
+    let requirement = semver::VersionReq::parse(profile.consumer_requirement().as_str())
+        .map_err(|_| invalid())?;
+    let tested_version = semver::Version::parse(
+        qualification
+            .verification_build()
+            .consumer_version()
+            .as_str(),
+    )
+    .map_err(|_| invalid())?;
+    require(requirement.matches(&tested_version))
+}
+
+/// SHA-256 of the public behavioral manifest: JCS object followed by one LF.
+/// This projection depends only on behavioral contracts, never a Pi archive or build binary.
+pub fn pi_required_contracts_profile_sha256(
+    contracts: &crate::PiRequiredContractsV1,
+) -> Result<[u8; 32], CoreError> {
+    use sha2::{Digest, Sha256};
+    let manifest = serde_json::json!({
+        "schema_version": 1,
+        "profile_id": "builtin-pi-installer-lock-contracts-v1",
+        "required_contracts": contracts,
+    });
+    let mut bytes = serde_jcs::to_vec(&manifest).map_err(|_| invalid())?;
+    bytes.push(b'\n');
+    Ok(Sha256::digest(&bytes).into())
+}

@@ -570,6 +570,7 @@ fn verify_transferred_signed_bundle_with(
     .map_err(|_| rejected())?;
     verify_signed_release_inventory(&inventory, &release_manifest).map_err(|_| rejected())?;
     verify_release_bindings(&files, &release_manifest, &checksums_bytes)?;
+    verify_installer_support(catalog.payload(), &release_manifest, &files)?;
 
     let verified = VerifiedTransferredSignedBundle {
         root,
@@ -2723,6 +2724,7 @@ fn verify_operation(
     .map_err(|_| rejected())?;
     verify_signed_release_inventory(&inventory, release_manifest).map_err(|_| rejected())?;
     verify_release_bindings(&retained, release_manifest, &checksums_bytes)?;
+    verify_installer_support(catalog.payload(), release_manifest, &retained)?;
 
     let actual_support_assets = release_manifest
         .assets()
@@ -3848,4 +3850,40 @@ mod persistent_arithmetic_tests {
         assert!(!directory_nlink_matches(0, 4));
         assert!(!directory_nlink_matches(3, 4));
     }
+}
+
+fn verify_installer_support(
+    payload: &CatalogPayloadV1,
+    manifest: &SignedReleaseBundleManifestV1,
+    files: &BTreeMap<String, RetainedFile>,
+) -> Result<(), PublishError> {
+    catalog_core::verify_pi_release_bundle_assets(payload, manifest).map_err(|_| rejected())?;
+    for provider in payload.providers() {
+        for release in provider.releases() {
+            let catalog_core::ProviderExtensionV1::PiInstallerLock(metadata) =
+                release.provider_extension()
+            else {
+                continue;
+            };
+            let descriptor = metadata.qualification();
+            let name = catalog_core::pi_support_asset_name(
+                descriptor.url().as_str(),
+                descriptor.sha256().as_str(),
+                manifest.tag().as_str(),
+            )
+            .map_err(|_| rejected())?;
+            let file = files.get(&name).ok_or_else(rejected)?;
+            if file.size != descriptor.size_bytes().get()
+                || file.sha256 != descriptor.sha256().as_str()
+            {
+                return Err(rejected());
+            }
+            let bytes = read_descriptor(&file.file, file.size)?;
+            let qualification = catalog_core::PiReleaseQualificationV1::from_json(&bytes)
+                .map_err(|_| rejected())?;
+            catalog_core::verify_pi_release_qualification(metadata.profile(), &qualification)
+                .map_err(|_| rejected())?;
+        }
+    }
+    Ok(())
 }

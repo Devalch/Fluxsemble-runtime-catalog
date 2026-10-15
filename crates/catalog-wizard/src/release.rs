@@ -39,7 +39,7 @@ use crate::{
     key_rotation::{verify_active_signing_key, verify_signed_bundle_key},
     npm::{
         NodeDistributionVersionSource, NodeVersionSource, NpmPiVersionSource, PiVersionSource,
-        choose_pi_version, suggest_node_version,
+        choose_pi_version,
     },
     prompt::{Prompter, confirm_yes_no, require_phrase},
     qualification::{self, verify_consumer_keyring_readiness},
@@ -201,21 +201,16 @@ pub fn run_release(
     let pi_version = choose_pi_version(&pi_versions, requested_pi)?;
 
     let node_versions = NodeDistributionVersionSource.available_node_versions()?;
-    let node_version = match options.node {
-        Some(version) if node_versions.iter().any(|available| available == &version) => version,
-        Some(_) => return Err(WizardError::Discovery),
-        None => {
-            let suggested = suggest_node_version(&node_versions, &config.default_node_channel)?;
-            if !confirm_yes_no(
-                prompter,
-                &format!("Use suggested Node {suggested}? [Y/n]: "),
-                true,
-            )? {
-                return Err(WizardError::UserDeclined);
-            }
-            suggested
-        }
-    };
+    let node_version = select_installer_node(&node_versions, options.node.as_deref())?;
+    if options.node.is_none()
+        && !confirm_yes_no(
+            prompter,
+            &format!("Use supported Node {node_version}? [Y/n]: "),
+            true,
+        )?
+    {
+        return Err(WizardError::UserDeclined);
+    }
     let mode = match options.mode {
         Some(mode) => mode,
         None => match prompter.ask("Release mode (dry-run/publish): ")?.as_str() {
@@ -243,7 +238,7 @@ pub fn run_release(
         return Err(WizardError::State);
     }
     let state = WizardState {
-        schema_version: 1,
+        schema_version: 2,
         sequence,
         pi_version,
         node_version,
@@ -488,7 +483,7 @@ impl ReleaseMachine for ProductionRelease<'_> {
     }
 
     fn generate_inputs(&mut self) -> Result<(), WizardError> {
-        let generated = generate_release_inputs(GenerateReleaseInputsRequest {
+        let request = GenerateReleaseInputsRequest {
             repository_root: self.repo.clone(),
             sequence: self.state.sequence,
             pi_version: self.state.pi_version.clone(),
@@ -496,7 +491,15 @@ impl ReleaseMachine for ProductionRelease<'_> {
             target: self.state.target.clone(),
             generated_at: DateTime::<Utc>::from(SystemTime::now()),
             validity_window: ChronoDuration::days(31),
-        })?;
+        };
+        let generated = if self.state.schema_version == 2 {
+            crate::intent::generate_installer_release_inputs(
+                request,
+                crate::intent::load_pi_discovery_policy()?,
+            )?
+        } else {
+            generate_release_inputs(request)?
+        };
         if generated.intent_path != self.state.work_dir.join("intent.json")
             || generated.package_inputs_path != self.state.work_dir.join("package-inputs.json")
         {
@@ -522,6 +525,20 @@ impl ReleaseMachine for ProductionRelease<'_> {
 
     fn assemble_intent(&mut self) -> Result<(), WizardError> {
         let output = self.state.work_dir.join("unsigned-candidate");
+        if self.state.schema_version == 2 {
+            catalog_acquire::verify_transferred_bundle(
+                &self.state.work_dir.join("acquired-transfer"),
+            )
+            .map_err(|_| WizardError::Qualification)?;
+            let bytes =
+                read_bounded_regular(&self.state.work_dir.join("intent.json"), 8 * 1024 * 1024)?;
+            let intent = catalog_core::PiReleaseIntentV2::from_json(&bytes)
+                .map_err(|_| WizardError::Qualification)?;
+            if serde_jcs::to_vec(&intent).map_err(|_| WizardError::Qualification)? != bytes {
+                return Err(WizardError::Qualification);
+            }
+            return write_exact_or_verify(&output, &bytes);
+        }
         if output.exists() {
             read_canonical_candidate(&output).map(|_| ())
         } else {
@@ -583,7 +600,32 @@ impl ReleaseMachine for ProductionRelease<'_> {
         }
         let initial = read_canonical_candidate(&self.state.work_dir.join("unsigned-candidate"))?;
         let final_bytes = read_canonical_candidate(&final_candidate)?;
-        if initial != final_bytes {
+        if self.state.schema_version == 2 {
+            let source = catalog_core::CatalogSourceV2::from_json(&read_bounded_regular(
+                &source,
+                8 * 1024 * 1024,
+            )?)
+            .map_err(|_| WizardError::Qualification)?;
+            let qualification = read_bounded_regular(
+                &self
+                    .state
+                    .work_dir
+                    .join("imported-qualification/qualification-v1.json"),
+                catalog_core::MAX_PI_QUALIFICATION_BYTES as u64,
+            )?;
+            if initial
+                != serde_jcs::to_vec(source.intent()).map_err(|_| WizardError::Qualification)?
+                || final_bytes
+                    != serde_jcs::to_vec(
+                        &source
+                            .finalize(&qualification)
+                            .map_err(|_| WizardError::Qualification)?,
+                    )
+                    .map_err(|_| WizardError::Qualification)?
+            {
+                return Err(WizardError::Qualification);
+            }
+        } else if initial != final_bytes {
             return Err(WizardError::Qualification);
         }
         Ok(())
@@ -735,9 +777,21 @@ fn verified_signing_context(
             .join("imported-qualification/qualification-v1.json"),
         8 * 1024 * 1024,
     )?;
-    let approved = catalog_core::CompatibilityQualificationV1::from_json(&qualification_bytes)
+    if state.schema_version == 2 {
+        let path = build_installer_catalog_source(state)?;
+        let source = catalog_core::CatalogSourceV2::from_json(&read_bounded_regular(
+            &path,
+            8 * 1024 * 1024,
+        )?)
         .map_err(|_| WizardError::Qualification)?;
-    verify_consumer_keyring_readiness(&approved, production_keyring().sha256())?;
+        source
+            .finalize(&qualification_bytes)
+            .map_err(|_| WizardError::Qualification)?;
+    } else {
+        let approved = catalog_core::CompatibilityQualificationV1::from_json(&qualification_bytes)
+            .map_err(|_| WizardError::Qualification)?;
+        verify_consumer_keyring_readiness(&approved, production_keyring().sha256())?;
+    }
 
     let config = PrivateSigningConfig::load(&private_config_root()?.join("signing-key.json"))?;
     let active = verify_active_signing_key(&config.private_key_path, launcher_config)?;
@@ -1327,6 +1381,9 @@ fn read_recoverable_file(path: &Path, maximum: u64) -> Result<Vec<u8>, WizardErr
 }
 
 fn build_catalog_source(state: &WizardState) -> Result<PathBuf, WizardError> {
+    if state.schema_version == 2 {
+        return build_installer_catalog_source(state);
+    }
     let intent_bytes = read_bounded_regular(&state.work_dir.join("intent.json"), 8 * 1024 * 1024)?;
     let intent = InitialPiReleaseIntentV1::from_json(&intent_bytes)
         .map_err(|_| WizardError::Qualification)?;
@@ -1384,6 +1441,18 @@ fn build_catalog_source(state: &WizardState) -> Result<PathBuf, WizardError> {
 
 fn read_canonical_candidate(path: &Path) -> Result<Vec<u8>, WizardError> {
     let bytes = read_bounded_regular(path, 8 * 1024 * 1024)?;
+    if serde_json::from_slice::<serde_json::Value>(&bytes)
+        .map_err(|_| WizardError::Qualification)?["schema_version"]
+        == 2
+    {
+        let intent = catalog_core::PiReleaseIntentV2::from_json(&bytes)
+            .map_err(|_| WizardError::Qualification)?;
+        return if serde_jcs::to_vec(&intent).map_err(|_| WizardError::Qualification)? == bytes {
+            Ok(bytes)
+        } else {
+            Err(WizardError::Qualification)
+        };
+    }
     let payload = CatalogPayloadV1::from_json(&bytes).map_err(|_| WizardError::Qualification)?;
     if serde_jcs::to_vec(&payload).map_err(|_| WizardError::Qualification)? != bytes {
         return Err(WizardError::Qualification);
@@ -2867,4 +2936,75 @@ mod tests {
             Some("Dry run complete; no signing or publishing was performed.")
         );
     }
+}
+
+fn build_installer_catalog_source(state: &WizardState) -> Result<PathBuf, WizardError> {
+    let intent_bytes = read_bounded_regular(&state.work_dir.join("intent.json"), 8 * 1024 * 1024)?;
+    let intent = catalog_core::PiReleaseIntentV2::from_json(&intent_bytes)
+        .map_err(|_| WizardError::Qualification)?;
+    if intent.sequence() != state.sequence
+        || intent.profile().pi_package().version().as_str() != state.pi_version
+        || intent.profile().node_version().as_str() != state.node_version
+        || intent.profile().target().as_str() != state.target
+    {
+        return Err(WizardError::Qualification);
+    }
+    let build_bytes = read_bounded_regular(
+        &state
+            .work_dir
+            .join("imported-qualification/build-binding-v1.json"),
+        64 * 1024,
+    )?;
+    let build = catalog_core::FluxsembleBuildBindingV1::from_json(&build_bytes)
+        .map_err(|_| WizardError::Qualification)?;
+    let qualification = read_bounded_regular(
+        &state
+            .work_dir
+            .join("imported-qualification/qualification-v1.json"),
+        catalog_core::MAX_PI_QUALIFICATION_BYTES as u64,
+    )?;
+    let digest = format!("{:x}", Sha256::digest(&qualification));
+    let relative = format!("qualifications/pi-release-{digest}.json");
+    let source_bytes = serde_jcs::to_vec(&json!({
+        "schema_version": 2,
+        "intent": intent,
+        "build": build,
+        "qualification": {"relative_path": relative, "sha256": digest},
+    }))
+    .map_err(|_| WizardError::Qualification)?;
+    let source = catalog_core::CatalogSourceV2::from_json(&source_bytes)
+        .map_err(|_| WizardError::Qualification)?;
+    source
+        .finalize(&qualification)
+        .map_err(|_| WizardError::Qualification)?;
+    write_exact_or_verify(&state.work_dir.join(&relative), &qualification)?;
+    let path = state.work_dir.join(format!(
+        "catalog-v1-sequence-{}-source.json",
+        state.sequence
+    ));
+    write_exact_or_verify(&path, &source_bytes)?;
+    Ok(path)
+}
+
+#[cfg(test)]
+mod installer_node_tests {
+    use super::*;
+    #[test]
+    fn new_installer_release_selects_supported_node_instead_of_latest_in_channel() {
+        let available = vec!["22.99.0".to_owned(), "22.19.0".to_owned()];
+        assert_eq!(select_installer_node(&available, None).unwrap(), "22.19.0");
+        assert!(select_installer_node(&available, Some("22.99.0")).is_err());
+        assert!(select_installer_node(&["22.99.0".into()], None).is_err());
+    }
+}
+
+fn select_installer_node(
+    available: &[String],
+    requested: Option<&str>,
+) -> Result<String, WizardError> {
+    const SUPPORTED: &str = "22.19.0";
+    if requested.is_some_and(|v| v != SUPPORTED) || !available.iter().any(|v| v == SUPPORTED) {
+        return Err(WizardError::Discovery);
+    }
+    Ok(SUPPORTED.into())
 }

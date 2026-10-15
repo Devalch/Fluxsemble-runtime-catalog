@@ -67,6 +67,7 @@ expected_external_deps = {
         ("flate2", "normal"),
         ("libc", "normal"),
         ("reqwest", "normal"),
+        ("semver", "normal"),
         ("serde", "normal"),
         ("serde_jcs", "normal"),
         ("serde_json", "normal"),
@@ -1504,7 +1505,10 @@ subprocess.run(
     check=True,
     stdout=subprocess.DEVNULL,
 )
-production_binary = Path("target/debug/catalog-publish").read_bytes()
+import json
+metadata = json.loads(subprocess.check_output(["cargo", "metadata", "--no-deps", "--format-version", "1"], text=True))
+production_path = Path(metadata["target_directory"]) / "debug" / "catalog-publish"
+production_binary = production_path.read_bytes()
 fixture_public_key = bytes([
     0x03, 0xA1, 0x07, 0xBF, 0xF3, 0xCE, 0x10, 0xBE,
     0x1D, 0x70, 0xDD, 0x18, 0xE7, 0x4B, 0xC0, 0x99,
@@ -1520,7 +1524,7 @@ for forbidden in [
         print("fixture authority compiled into production catalog-publish", file=sys.stderr)
         sys.exit(1)
 production_symbols = subprocess.check_output(
-    ["nm", "-C", "target/debug/catalog-publish"], stderr=subprocess.DEVNULL
+    ["nm", "-C", str(production_path)], stderr=subprocess.DEVNULL
 )
 if b"verify_transferred_fixture_signed_bundle" in production_symbols:
     print("fixture verifier symbol compiled into production catalog-publish", file=sys.stderr)

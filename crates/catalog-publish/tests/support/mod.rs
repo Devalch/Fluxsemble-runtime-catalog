@@ -48,13 +48,24 @@ impl Drop for TempTree {
 }
 
 pub fn fixture_transfer(root: &Path, sequence: u64, support: &[u8]) {
+    fixture_transfer_custom(root, sequence, support, None, BTreeMap::new(), None)
+}
+fn fixture_transfer_custom(
+    root: &Path,
+    sequence: u64,
+    support: &[u8],
+    payload_override: Option<Value>,
+    mut extra: BTreeMap<String, Vec<u8>>,
+    omitted: Option<String>,
+) {
     let bundle = root.join("signed-release-bundle");
     fs::DirBuilder::new().mode(0o700).create(root).unwrap();
     fs::DirBuilder::new().mode(0o700).create(&bundle).unwrap();
 
     let signing_key = fixture_signing_key();
     let payload_source = include_bytes!("../../../../conformance/catalog-v1/valid-payload.json");
-    let mut payload_value: Value = serde_json::from_slice(payload_source).unwrap();
+    let mut payload_value: Value =
+        payload_override.unwrap_or_else(|| serde_json::from_slice(payload_source).unwrap());
     payload_value["sequence"] = json!(sequence.to_string());
     let payload =
         CatalogPayloadV1::from_json(&serde_json::to_vec(&payload_value).unwrap()).unwrap();
@@ -72,6 +83,14 @@ pub fn fixture_transfer(root: &Path, sequence: u64, support: &[u8]) {
 
     let qualification_sha256 = sha256(support);
     let support_name = format!("qualification-{qualification_sha256}.json");
+    extra.insert(support_name.clone(), support.to_vec());
+    if let Some(name) = omitted {
+        extra.remove(&name);
+    }
+    let assets = extra
+        .iter()
+        .map(|(name, bytes)| json!({"name":name,"size":bytes.len(),"sha256":sha256(bytes)}))
+        .collect::<Vec<_>>();
     let unsigned_value = json!({
         "schema_version": 1,
         "source_commit": "0123456789abcdef0123456789abcdef01234567",
@@ -83,11 +102,7 @@ pub fn fixture_transfer(root: &Path, sequence: u64, support: &[u8]) {
             "size": catalog.len() as u64,
             "sha256": sha256(&catalog),
         },
-        "assets": [{
-            "name": support_name,
-            "size": support.len() as u64,
-            "sha256": sha256(support),
-        }],
+        "assets": assets,
         "signature": {"key_id": FIXTURE_KEY_ID, "signature": "A".repeat(86)},
     });
     let unsigned =
@@ -100,12 +115,12 @@ pub fn fixture_transfer(root: &Path, sequence: u64, support: &[u8]) {
 
     let mut files = BTreeMap::from([
         ("catalog-v1.json".to_owned(), catalog),
-        (support_name, support.to_vec()),
         (
             "signed-release-bundle-manifest-v1.json".to_owned(),
             manifest,
         ),
     ]);
+    files.extend(extra);
     let checksums = files
         .iter()
         .map(|(name, bytes)| format!("{}  {name}\n", sha256(bytes)))
@@ -275,4 +290,58 @@ fn make_tree_owner_writable(path: &Path) -> std::io::Result<()> {
         }
     }
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+}
+
+#[allow(dead_code)]
+pub fn fixture_installer_transfer(root: &Path, sequence: u64, omitted: Option<&str>) {
+    let mut profile: Value = serde_json::from_slice(include_bytes!(
+        "../../../catalog-core/tests/fixtures/catalog/pi-installer-v1/valid-wrapper-root.json"
+    ))
+    .unwrap();
+    let mut extra = BTreeMap::new();
+    let mut omitted_name = None;
+    for role in ["installer_manifest", "installer_lock", "pi_manifest"] {
+        let bytes = role.as_bytes().to_vec();
+        let name = format!("{role}-{}.json", sha256(&bytes));
+        profile[role] = json!({"url":format!("https://github.com/Devalch/Fluxsemble-runtime-catalog/releases/download/catalog-v1-sequence-{sequence}/{name}"),"size_bytes":bytes.len().to_string(),"sha256":sha256(&bytes)});
+        if omitted == Some(role) {
+            omitted_name = Some(name.clone());
+        }
+        extra.insert(name, bytes);
+    }
+    let p =
+        catalog_core::PiReleaseProfileV1::from_json(&serde_jcs::to_vec(&profile).unwrap()).unwrap();
+    let mut q: Value = serde_json::from_slice(include_bytes!(
+        "../../../catalog-core/tests/fixtures/catalog/pi-installer-v1/valid-qualification.json"
+    ))
+    .unwrap();
+    q["release_subject_sha256"] = json!(
+        catalog_core::pi_release_subject_sha256(&p)
+            .unwrap()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    );
+    q["verification_build"]["compatibility_profile_sha256"] = json!(
+        catalog_core::pi_required_contracts_profile_sha256(p.required_contracts())
+            .unwrap()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    );
+    let bytes = serde_jcs::to_vec(&q).unwrap();
+    let mut build = q["verification_build"].clone();
+    build.as_object_mut().unwrap().remove("consumer_version");
+    let source=catalog_core::CatalogSourceV2::from_json(&serde_jcs::to_vec(&json!({"schema_version":2,"intent":{"schema_version":2,"sequence":sequence.to_string(),"tag":format!("catalog-v1-sequence-{sequence}"),"generated_at":"2026-10-15T00:00:00Z","expires_at":"2026-11-15T00:00:00Z","title":"Synthetic","notes":"Fixture","profile":profile},"build":build,"qualification":{"relative_path":"qualifications/current.json","sha256":sha256(&bytes)}})).unwrap()).unwrap();
+    if omitted == Some("qualification") {
+        omitted_name = Some(format!("qualification-{}.json", sha256(&bytes)));
+    }
+    fixture_transfer_custom(
+        root,
+        sequence,
+        &bytes,
+        Some(serde_json::to_value(source.finalize(&bytes).unwrap()).unwrap()),
+        extra,
+        omitted_name,
+    );
 }

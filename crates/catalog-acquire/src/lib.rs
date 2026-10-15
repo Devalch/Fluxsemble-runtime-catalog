@@ -1,12 +1,14 @@
 mod archive;
 mod bundle_writer;
 mod http;
+mod installer_acquire;
 mod installer_lock;
 mod npm;
 
 pub use archive::*;
 pub use bundle_writer::*;
 pub use http::*;
+pub use installer_acquire::*;
 pub use installer_lock::*;
 pub use npm::*;
 

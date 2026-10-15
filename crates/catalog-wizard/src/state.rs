@@ -262,7 +262,7 @@ const fn phase_rank(phase: ReleasePhase) -> u8 {
 }
 
 fn validate_state(state: &WizardState) -> Result<(), WizardError> {
-    if state.schema_version != 1
+    if !matches!(state.schema_version, 1 | 2)
         || state.sequence == 0
         || state.pi_version.is_empty()
         || state.node_version.is_empty()

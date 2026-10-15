@@ -374,6 +374,7 @@ impl UnsignedReleaseCandidateV1 {
     }
 }
 
+#[cfg(test)]
 struct SignReleaseRequest<'a> {
     pub bundle: &'a VerifiedTransferredBundle,
     pub source: &'a CatalogSourceV1,
@@ -808,6 +809,7 @@ fn require_candidate_bounds(candidate: &UnsignedReleaseCandidateV1) -> Result<()
     Ok(())
 }
 
+#[cfg(test)]
 fn sign_release(request: SignReleaseRequest<'_>) -> Result<SignedReleaseBundleV1, SignError> {
     let candidate = finalize_candidate(request.bundle, request.source, request.qualification)?;
     let output = OutputPreflight::new(request.output)?;
@@ -2977,12 +2979,7 @@ pub fn assemble_release_intent_from_path(
 
 pub fn finalize_candidate_from_path(path: &Path) -> Result<UnsignedReleaseCandidateV1, SignError> {
     let bundle = verify_transferred_bundle(path)?;
-    let source = CatalogSourceV1::from_json(&bundle.record_bytes("catalog_source")?)
-        .map_err(|_| candidate_rejected())?;
-    let qualification =
-        CompatibilityQualificationV1::from_json(&bundle.record_bytes("qualification")?)
-            .map_err(|_| candidate_rejected())?;
-    finalize_candidate(&bundle, &source, &qualification)
+    finalize_versioned_candidate(&bundle)
 }
 
 pub(crate) fn run_isolated_cli(
@@ -3011,12 +3008,7 @@ pub(crate) fn run_isolated_cli(
         }
         "finalize" => {
             let values = exact_flags(&args[1..], &["--input", "--output"])?;
-            let source = CatalogSourceV1::from_json(&bundle.record_bytes("catalog_source")?)
-                .map_err(|_| candidate_rejected())?;
-            let qualification =
-                CompatibilityQualificationV1::from_json(&bundle.record_bytes("qualification")?)
-                    .map_err(|_| candidate_rejected())?;
-            let candidate = finalize_candidate(bundle, &source, &qualification)?;
+            let candidate = finalize_versioned_candidate(bundle)?;
             write_candidate(Path::new(&values[1]), &candidate)?;
             Ok(format!(
                 "finalized runtime_semantic_sha256={}",
@@ -3025,18 +3017,21 @@ pub(crate) fn run_isolated_cli(
         }
         "sign" => {
             let values = exact_flags(&args[1..], &["--input", "--key", "--output"])?;
-            let source = CatalogSourceV1::from_json(&bundle.record_bytes("catalog_source")?)
-                .map_err(|_| candidate_rejected())?;
-            let qualification =
-                CompatibilityQualificationV1::from_json(&bundle.record_bytes("qualification")?)
-                    .map_err(|_| candidate_rejected())?;
-            let signed = sign_release(SignReleaseRequest {
-                bundle,
-                source: &source,
-                qualification: &qualification,
-                key_path: Path::new(&values[1]),
-                output: Path::new(&values[2]),
-            })?;
+            let candidate = finalize_versioned_candidate(bundle)?;
+            let output = OutputPreflight::new(Path::new(&values[2]))?;
+            let signing_key = read_production_signing_key(Path::new(&values[1]))?;
+            let signed_bytes = sign_candidate(
+                &candidate,
+                signing_key.as_dalek(),
+                active_production_key_identity().key_id(),
+            )?;
+            drop(signing_key);
+            verify_signed_bytes(&signed_bytes, SignatureVerificationPolicy::Production)?;
+            let signed = write_signed_output(
+                output,
+                signed_bytes,
+                SignatureVerificationPolicy::Production,
+            )?;
             Ok(format!(
                 "signed key_id={} tag={}",
                 signed.manifest.signature().key_id().as_str(),
@@ -3055,12 +3050,7 @@ pub(crate) fn run_isolated_cli(
 pub(crate) fn recover_production_isolated_output(
     bundle: &VerifiedTransferredBundle,
 ) -> Result<(), SignError> {
-    let source = CatalogSourceV1::from_json(&bundle.record_bytes("catalog_source")?)
-        .map_err(|_| candidate_rejected())?;
-    let qualification =
-        CompatibilityQualificationV1::from_json(&bundle.record_bytes("qualification")?)
-            .map_err(|_| candidate_rejected())?;
-    let candidate = finalize_candidate(bundle, &source, &qualification)?;
+    let candidate = finalize_versioned_candidate(bundle)?;
     recover_signed_output(
         Path::new("/output/signed-release-bundle"),
         &candidate,
@@ -6198,4 +6188,256 @@ mod tests {
             let _ = fs::remove_dir_all(&self.path);
         }
     }
+}
+
+fn finalize_versioned_candidate(
+    bundle: &VerifiedTransferredBundle,
+) -> Result<UnsignedReleaseCandidateV1, SignError> {
+    let bytes = bundle.record_bytes("catalog_source")?;
+    let value: Value = serde_json::from_slice(&bytes).map_err(|_| candidate_rejected())?;
+    if value["schema_version"] == 2 {
+        return finalize_installer_candidate(bundle, &bytes);
+    }
+    let source = CatalogSourceV1::from_json(&bytes).map_err(|_| candidate_rejected())?;
+    let qualification =
+        CompatibilityQualificationV1::from_json(&bundle.record_bytes("qualification")?)
+            .map_err(|_| candidate_rejected())?;
+    finalize_candidate(bundle, &source, &qualification)
+}
+
+fn finalize_installer_candidate(
+    bundle: &VerifiedTransferredBundle,
+    source_bytes: &[u8],
+) -> Result<UnsignedReleaseCandidateV1, SignError> {
+    bundle.reverify_all()?;
+    let source =
+        catalog_core::CatalogSourceV2::from_json(source_bytes).map_err(|_| candidate_rejected())?;
+    let qualification = bundle.record_bytes("qualification")?;
+    let payload = source
+        .finalize(&qualification)
+        .map_err(|_| candidate_rejected())?;
+    let subject = encode_hex(
+        &catalog_core::pi_release_subject_sha256(source.intent().profile())
+            .map_err(|_| candidate_rejected())?,
+    );
+    if bundle.inventory.source_kind() != InputSourceKind::CatalogSource
+        || serde_jcs::to_vec(&source).map_err(|_| candidate_rejected())? != source_bytes
+        || bundle.inventory.source_sha256().as_str()
+            != encode_hex(
+                &catalog_core::catalog_source_v2_digest(&source)
+                    .map_err(|_| candidate_rejected())?,
+            )
+        || bundle.inventory.compatibility_input_sha256().as_str() != subject
+    {
+        return Err(candidate_rejected());
+    }
+    let source_commit = bundle
+        .source_commit()
+        .filter(|s| valid_commit(s))
+        .ok_or_else(candidate_rejected)?
+        .to_owned();
+    let source_tree_sha256 = bundle
+        .source_tree_sha256()
+        .filter(|s| valid_sha256(s))
+        .ok_or_else(candidate_rejected)?
+        .to_owned();
+    let profile = source.intent().profile();
+    let input_bytes = bundle.record_bytes("package_inputs")?;
+    let inputs: InstallerInputsV2 =
+        serde_json::from_slice(&input_bytes).map_err(|_| candidate_rejected())?;
+    if serde_jcs::to_vec(&inputs).map_err(|_| candidate_rejected())? != input_bytes
+        || inputs.schema_version != 2
+        || inputs.release_subject_sha256 != subject
+        || inputs.locked_packages.len() != profile.locked_packages().len()
+        || inputs.pre_prune_package_count as usize != inputs.locked_packages.len() + 1
+        || inputs.applicable_package_count as usize
+            != inputs
+                .locked_packages
+                .iter()
+                .filter(|p| p.pruned_reasons.is_empty())
+                .count()
+    {
+        return Err(candidate_rejected());
+    }
+    for (retained, descriptor, asset) in [
+        (
+            &inputs.installer_manifest_source,
+            profile.installer_manifest(),
+            "pi-coding-agent-install-package.json",
+        ),
+        (
+            &inputs.installer_lock_source,
+            profile.installer_lock(),
+            "pi-coding-agent-install-package-lock.json",
+        ),
+    ] {
+        if retained.url
+            != format!(
+                "https://github.com/earendil-works/pi/releases/download/v{}/{asset}",
+                profile.pi_package().version().as_str()
+            )
+            || retained.size_bytes != descriptor.size_bytes().get().to_string()
+            || retained.sha256 != descriptor.sha256().as_str()
+        {
+            return Err(candidate_rejected());
+        }
+    }
+    let mut expected = BTreeMap::new();
+    for component in profile.components() {
+        for artifact in component.artifacts() {
+            insert_expected(
+                &mut expected,
+                artifact.url().as_str(),
+                artifact.size_bytes().get(),
+                artifact.sha256().as_str(),
+            )?;
+        }
+    }
+    for descriptor in [
+        profile.installer_manifest(),
+        profile.installer_lock(),
+        profile.pi_manifest(),
+    ] {
+        insert_expected(
+            &mut expected,
+            descriptor.url().as_str(),
+            descriptor.size_bytes().get(),
+            descriptor.sha256().as_str(),
+        )?;
+    }
+    for (observed, locked) in inputs.locked_packages.iter().zip(profile.locked_packages()) {
+        if observed.locator != locked.locator().as_str()
+            || observed.name != locked.name().as_str()
+            || observed.version != locked.version().as_str()
+            || observed.resolved_url != locked.resolved_url().as_str()
+            || observed.registry_integrity != locked.registry_integrity().as_str()
+            || observed.archive_sha256 != locked.archive_sha256().as_str()
+            || observed.declaration_size == 0
+            || observed.declaration_size > 64 * 1024
+            || !valid_sha256(&observed.declaration_sha256)
+            || (observed.archive_member_count == 0 || observed.archive_member_count > 32768)
+            || observed.pruned_reasons.windows(2).any(|p| p[0] >= p[1])
+            || observed.pruned_reasons.iter().any(|r| {
+                !matches!(
+                    r.as_str(),
+                    "declaration.cpu"
+                        | "declaration.os"
+                        | "declaration.libc"
+                        | "lock.cpu"
+                        | "lock.os"
+                        | "lock.libc"
+                )
+            })
+        {
+            return Err(candidate_rejected());
+        }
+        if observed.locator == profile.pi_package_locator().as_str()
+            && (observed.declaration_size != profile.pi_manifest().size_bytes().get()
+                || observed.declaration_sha256 != profile.pi_manifest().sha256().as_str()
+                || !observed.pruned_reasons.is_empty())
+        {
+            return Err(candidate_rejected());
+        }
+        insert_expected(
+            &mut expected,
+            &observed.resolved_url,
+            observed.archive_size,
+            &observed.archive_sha256,
+        )?;
+    }
+    let actual = bundle
+        .inventory
+        .objects()
+        .iter()
+        .map(|o| {
+            (
+                o.sha256().as_str().to_owned(),
+                (o.source_url().as_str().to_owned(), o.size()),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    if actual != expected {
+        return Err(candidate_rejected());
+    }
+    let mut support_assets = Vec::new();
+    for descriptor in [
+        profile.installer_manifest(),
+        profile.installer_lock(),
+        profile.pi_manifest(),
+    ] {
+        let name = catalog_core::pi_support_asset_name(
+            descriptor.url().as_str(),
+            descriptor.sha256().as_str(),
+            source.intent().tag().as_str(),
+        )
+        .map_err(|_| candidate_rejected())?;
+        let bytes = bundle.read_small_file(&format!("objects/{}", descriptor.sha256().as_str()))?;
+        if bytes.len() as u64 != descriptor.size_bytes().get()
+            || sha256(&bytes) != descriptor.sha256().as_str()
+        {
+            return Err(candidate_rejected());
+        }
+        support_assets.push(CandidateAsset {
+            name,
+            sha256: sha256(&bytes),
+            bytes,
+        });
+    }
+    let qualification_sha256 = sha256(&qualification);
+    support_assets.push(CandidateAsset {
+        name: format!("qualification-{qualification_sha256}.json"),
+        sha256: qualification_sha256.clone(),
+        bytes: qualification,
+    });
+    support_assets.sort_by(|a, b| a.name.cmp(&b.name));
+    if support_assets.windows(2).any(|p| p[0].name == p[1].name) {
+        return Err(candidate_rejected());
+    }
+    let candidate = UnsignedReleaseCandidateV1 {
+        canonical_payload: canonical_catalog_payload(&payload).map_err(|_| candidate_rejected())?,
+        runtime_semantic_sha256: subject,
+        tag: source.intent().tag().as_str().into(),
+        support_assets,
+        final_bindings: Some(FinalBindings {
+            source_commit,
+            source_tree_sha256,
+            qualification_sha256,
+        }),
+    };
+    require_candidate_bounds(&candidate)?;
+    Ok(candidate)
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct InstallerInputsV2 {
+    schema_version: u16,
+    release_subject_sha256: String,
+    installer_manifest_source: InstallerSourceV2,
+    installer_lock_source: InstallerSourceV2,
+    locked_packages: Vec<InstallerPackageV2>,
+    pre_prune_package_count: u16,
+    applicable_package_count: u16,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct InstallerSourceV2 {
+    url: String,
+    size_bytes: String,
+    sha256: String,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct InstallerPackageV2 {
+    locator: String,
+    name: String,
+    version: String,
+    resolved_url: String,
+    registry_integrity: String,
+    archive_size: u64,
+    archive_sha256: String,
+    declaration_size: u64,
+    declaration_sha256: String,
+    archive_member_count: u32,
+    pruned_reasons: Vec<String>,
 }

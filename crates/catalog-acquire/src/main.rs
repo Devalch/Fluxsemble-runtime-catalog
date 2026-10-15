@@ -94,7 +94,22 @@ fn run() -> Result<Summary, AcquireError> {
         }
         "acquire-intent" => {
             let values = exact_flags(&args[1..], &["--intent", "--package-inputs", "--output"])?;
-            let intent = InitialPiReleaseIntentV1::from_json(&read_input(Path::new(&values[0]))?)
+            let intent_bytes = read_input(Path::new(&values[0]))?;
+            if serde_json::from_slice::<serde_json::Value>(&intent_bytes)
+                .map_err(|_| AcquireError::Input)?["schema_version"]
+                == 2
+            {
+                let intent = catalog_core::PiReleaseIntentV2::from_json(&intent_bytes)
+                    .map_err(|_| AcquireError::Input)?;
+                return run_acquire_installer(
+                    catalog_acquire::AcquireInstallerReleaseSource::Intent { intent },
+                    catalog_acquire::PackageInputManifestV2::from_json(&read_input(Path::new(
+                        &values[1],
+                    ))?)?,
+                    PathBuf::from(&values[2]),
+                );
+            }
+            let intent = InitialPiReleaseIntentV1::from_json(&intent_bytes)
                 .map_err(|_| AcquireError::Input)?;
             let package_inputs =
                 PackageInputManifestV1::from_json(&read_input(Path::new(&values[1]))?)?;
@@ -117,8 +132,30 @@ fn run() -> Result<Summary, AcquireError> {
             )?;
             let source_path = Path::new(&values[0]);
             let source_root = RetainedInputRoot::open(source_path)?;
-            let source = CatalogSourceV1::from_json(&source_root.read_source()?)
-                .map_err(|_| AcquireError::Input)?;
+            let source_bytes = source_root.read_source()?;
+            if serde_json::from_slice::<serde_json::Value>(&source_bytes)
+                .map_err(|_| AcquireError::Input)?["schema_version"]
+                == 2
+            {
+                let source = catalog_core::CatalogSourceV2::from_json(&source_bytes)
+                    .map_err(|_| AcquireError::Input)?;
+                let qualification_bytes =
+                    source_root.read_relative(source.qualification().relative_path().as_str())?;
+                return run_acquire_installer(
+                    catalog_acquire::AcquireInstallerReleaseSource::Final {
+                        source: Box::new(source),
+                        qualification_bytes,
+                        source_commit: values[2].clone(),
+                        source_tree_sha256: values[3].clone(),
+                    },
+                    catalog_acquire::PackageInputManifestV2::from_json(&read_input(Path::new(
+                        &values[1],
+                    ))?)?,
+                    PathBuf::from(&values[4]),
+                );
+            }
+            let source =
+                CatalogSourceV1::from_json(&source_bytes).map_err(|_| AcquireError::Input)?;
             let qualification = CompatibilityQualificationV1::from_json(
                 &source_root.read_relative(source.qualification().relative_path().as_str())?,
             )
@@ -533,4 +570,22 @@ mod tests {
             let _ = fs::remove_dir_all(&self.path);
         }
     }
+}
+
+fn run_acquire_installer(
+    source: catalog_acquire::AcquireInstallerReleaseSource,
+    package_inputs: catalog_acquire::PackageInputManifestV2,
+    output: PathBuf,
+) -> Result<Summary, AcquireError> {
+    let cache = TemporaryCache::new()?;
+    runtime()?.block_on(catalog_acquire::acquire_installer_release(
+        catalog_acquire::AcquireInstallerReleaseRequest {
+            source,
+            package_inputs,
+            cache_root: cache.path().to_owned(),
+            output: output.clone(),
+            cancellation: AcquisitionCancellation::new(),
+        },
+    ))?;
+    summary(verify_transferred_bundle(&output)?)
 }

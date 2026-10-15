@@ -679,3 +679,47 @@ struct ReleaseBundleSignatureWire {
     key_id: String,
     signature: String,
 }
+
+/// Cross-bind current-format support descriptors to the signed release asset set.
+/// Cryptographic verification and retained file-byte checks remain with the caller.
+pub fn verify_pi_release_bundle_assets(
+    payload: &crate::CatalogPayloadV1,
+    manifest: &SignedReleaseBundleManifestV1,
+) -> Result<(), CoreError> {
+    for provider in payload.providers() {
+        for release in provider.releases() {
+            let crate::ProviderExtensionV1::PiInstallerLock(metadata) =
+                release.provider_extension()
+            else {
+                continue;
+            };
+            require(
+                manifest.tag().as_str() == format!("catalog-v1-sequence-{}", payload.sequence()),
+            )?;
+            require(
+                manifest.qualification_sha256().as_str()
+                    == metadata.qualification().sha256().as_str(),
+            )?;
+            for descriptor in [
+                metadata.profile().installer_manifest(),
+                metadata.profile().installer_lock(),
+                metadata.profile().pi_manifest(),
+                metadata.qualification(),
+            ] {
+                let name = crate::pi_support_asset_name(
+                    descriptor.url().as_str(),
+                    descriptor.sha256().as_str(),
+                    manifest.tag().as_str(),
+                )?;
+                let asset = manifest
+                    .assets()
+                    .iter()
+                    .find(|asset| asset.name().as_str() == name)
+                    .ok_or_else(invalid)?;
+                require(asset.size() == descriptor.size_bytes().get())?;
+                require(asset.sha256().as_str() == descriptor.sha256().as_str())?;
+            }
+        }
+    }
+    Ok(())
+}

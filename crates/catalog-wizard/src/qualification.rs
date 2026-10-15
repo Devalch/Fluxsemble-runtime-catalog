@@ -33,7 +33,7 @@ const README: &str = "Fluxsemble qualification request\n\nUpdate Fluxsemble's ex
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct QualificationRequest {
+pub struct LegacyQualificationRequest {
     schema_version: u16,
     sequence: u64,
     pi_version: String,
@@ -46,7 +46,7 @@ pub struct QualificationRequest {
     trusted_signing_keyring_sha256: String,
 }
 
-impl QualificationRequest {
+impl LegacyQualificationRequest {
     #[must_use]
     pub fn candidate_sha256(&self) -> &str {
         &self.candidate_sha256
@@ -61,18 +61,26 @@ impl QualificationRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportedQualification {
     build: FluxsembleBuildBindingV1,
-    qualification: CompatibilityQualificationV1,
+    qualification: QualificationEvidence,
 }
 
 impl ImportedQualification {
     #[must_use]
     pub fn pi_version(&self) -> &str {
-        self.qualification.pi_version().as_str()
+        match &self.qualification {
+            QualificationEvidence::Legacy(q) => q.pi_version().as_str(),
+            QualificationEvidence::Installer { profile, .. } => {
+                profile.pi_package().version().as_str()
+            }
+        }
     }
 
     #[must_use]
     pub fn node_version(&self) -> &str {
-        self.qualification.node_version().as_str()
+        match &self.qualification {
+            QualificationEvidence::Legacy(q) => q.node_version().as_str(),
+            QualificationEvidence::Installer { profile, .. } => profile.node_version().as_str(),
+        }
     }
 
     #[must_use]
@@ -81,7 +89,7 @@ impl ImportedQualification {
     }
 
     #[must_use]
-    pub fn qualification(&self) -> &CompatibilityQualificationV1 {
+    pub fn qualification(&self) -> &QualificationEvidence {
         &self.qualification
     }
 }
@@ -126,12 +134,15 @@ pub fn export_request(
     candidate_dir: &Path,
     output: &Path,
 ) -> Result<QualificationRequest, WizardError> {
+    if state.schema_version == 2 {
+        return export_installer_request(state, candidate_dir, output);
+    }
     validate_state_identity(state)?;
     let candidate = catalog_acquire::verify_transferred_bundle(candidate_dir)
         .map_err(|_| WizardError::Qualification)?;
     candidate_intent_for_state(state, candidate_dir)?;
     let keyring_sha256 = production_keyring().sha256();
-    let request = QualificationRequest {
+    let request = LegacyQualificationRequest {
         schema_version: 1,
         sequence: state.sequence,
         pi_version: state.pi_version.clone(),
@@ -178,7 +189,7 @@ pub fn export_request(
         let _ = fs::remove_dir_all(&stage);
     }
     result?;
-    Ok(request)
+    Ok(QualificationRequest::Legacy(request))
 }
 
 pub fn verify_existing_request(
@@ -186,6 +197,9 @@ pub fn verify_existing_request(
     candidate_dir: &Path,
     output: &Path,
 ) -> Result<(), WizardError> {
+    if state.schema_version == 2 {
+        return verify_installer_request(state, candidate_dir, output);
+    }
     validate_state_identity(state)?;
     let metadata = fs::symlink_metadata(output).map_err(|_| WizardError::Qualification)?;
     if !metadata.is_dir()
@@ -203,7 +217,7 @@ pub fn verify_existing_request(
         return Err(WizardError::Qualification);
     }
     let request_bytes = read_immutable_regular(&output.join(REQUEST_MANIFEST_NAME))?;
-    let request: QualificationRequest = parse_canonical(&request_bytes)?;
+    let request: LegacyQualificationRequest = parse_canonical(&request_bytes)?;
     let keyring_sha256 = production_keyring().sha256();
     validate_request(state, &request, keyring_sha256)?;
     let source_candidate = catalog_acquire::verify_transferred_bundle(candidate_dir)
@@ -231,6 +245,9 @@ pub fn import_handoff(
     handoff_dir: &Path,
     keyring_sha256: &str,
 ) -> Result<ImportedQualification, WizardError> {
+    if state.schema_version == 2 {
+        return import_installer_handoff(state, handoff_dir, keyring_sha256);
+    }
     if state.phase != ReleasePhase::AwaitingQualification {
         return Err(WizardError::Qualification);
     }
@@ -241,7 +258,7 @@ pub fn import_handoff(
         .join("qualification-request")
         .join(REQUEST_MANIFEST_NAME);
     let request_bytes = read_bounded_regular(&request_path, true)?;
-    let request: QualificationRequest = parse_canonical(&request_bytes)?;
+    let request: LegacyQualificationRequest = parse_canonical(&request_bytes)?;
     validate_request(state, &request, keyring_sha256)?;
     let candidate = catalog_acquire::verify_transferred_bundle(
         &state.work_dir.join("qualification-request/candidate"),
@@ -319,7 +336,7 @@ pub fn import_handoff(
     advanced.save(&state.work_dir.join("wizard-state.json"))?;
     Ok(ImportedQualification {
         build,
-        qualification,
+        qualification: QualificationEvidence::Legacy(qualification),
     })
 }
 
@@ -407,7 +424,7 @@ fn read_candidate_intent(candidate_dir: &Path) -> Result<InitialPiReleaseIntentV
 
 fn validate_request(
     state: &WizardState,
-    request: &QualificationRequest,
+    request: &LegacyQualificationRequest,
     keyring_sha256: &str,
 ) -> Result<(), WizardError> {
     if request.schema_version != 1
@@ -427,7 +444,7 @@ fn validate_request(
 }
 
 fn validate_state_identity(state: &WizardState) -> Result<(), WizardError> {
-    if state.schema_version != 1
+    if !matches!(state.schema_version, 1 | 2)
         || state.sequence == 0
         || state.pi_version.is_empty()
         || state.node_version.is_empty()
@@ -1193,4 +1210,408 @@ mod tests {
         }
         Ok(())
     }
+}
+
+#[cfg(test)]
+mod installer_qualification_tests {
+    use super::*;
+    use catalog_acquire::{
+        BundleRecord, PublicBundleObject, VerifiedBundleWriteRequest, write_verified_bundle,
+    };
+    use serde_json::{Value, json};
+    #[test]
+    fn qualification_imports_existing_build_after_subject_request_without_profile_recompilation() {
+        for version in ["1.2.0", "1.3.0"] {
+            let root = std::env::temp_dir().join(format!(
+                "wizard-pi-v2-{version}-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir(&root).unwrap();
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+            let mut p: Value = serde_json::from_slice(include_bytes!(
+                "../../catalog-core/tests/fixtures/catalog/pi-installer-v1/valid-wrapper-root.json"
+            ))
+            .unwrap();
+            for pointer in [
+                "/pi_package/version",
+                "/components/1/version",
+                "/locked_packages/0/version",
+            ] {
+                *p.pointer_mut(pointer).unwrap() = json!(version);
+            }
+            for key in ["installer_manifest", "installer_lock", "pi_manifest"] {
+                p[key]["url"] = json!(format!(
+                    "https://github.com/Devalch/Fluxsemble-runtime-catalog/releases/download/catalog-v1-sequence-2/{key}-{}.json",
+                    p[key]["sha256"].as_str().unwrap()
+                ));
+            }
+            let intent=catalog_core::PiReleaseIntentV2::from_json(&serde_jcs::to_vec(&json!({"schema_version":2,"sequence":"2","tag":"catalog-v1-sequence-2","generated_at":"2026-10-15T00:00:00Z","expires_at":"2026-11-15T00:00:00Z","title":"Candidate","notes":"Fixture","profile":p})).unwrap()).unwrap();
+            let subject =
+                encode_sha256(&catalog_core::pi_release_subject_sha256(intent.profile()).unwrap());
+            let bytes = b"fixture-object";
+            let file = root.join("input");
+            fs::write(&file, bytes).unwrap();
+            fs::set_permissions(&file, fs::Permissions::from_mode(0o400)).unwrap();
+            write_verified_bundle(
+                VerifiedBundleWriteRequest {
+                    source_kind: catalog_core::InputSourceKind::ReleaseIntent,
+                    source_sha256: encode_sha256(
+                        &catalog_core::pi_release_intent_v2_digest(&intent).unwrap(),
+                    ),
+                    compatibility_input_sha256: subject.clone(),
+                    source_commit: None,
+                    source_tree_sha256: None,
+                    records: vec![BundleRecord {
+                        role: "release_intent".into(),
+                        bytes: serde_jcs::to_vec(&intent).unwrap(),
+                    }],
+                    objects: vec![
+                        PublicBundleObject::verified_file(
+                            fs::File::open(&file).unwrap(),
+                            "https://example.com/a".into(),
+                            bytes.len() as u64,
+                            sha256(bytes),
+                        )
+                        .unwrap(),
+                    ],
+                },
+                &root.join("candidate"),
+            )
+            .unwrap();
+            let state = WizardState {
+                schema_version: 2,
+                sequence: 2,
+                pi_version: version.into(),
+                node_version: "22.19.0".into(),
+                target: "linux_x86_64".into(),
+                mode: crate::cli::RunMode::DryRun,
+                phase: ReleasePhase::AwaitingQualification,
+                signing_key_generation: 2,
+                catalog_source_commit: "1".repeat(40),
+                catalog_source_tree_sha256: "2".repeat(64),
+                work_dir: root.clone(),
+            };
+            export_request(
+                &state,
+                &root.join("candidate"),
+                &root.join("qualification-request"),
+            )
+            .unwrap();
+            verify_existing_request(
+                &state,
+                &root.join("candidate"),
+                &root.join("qualification-request"),
+            )
+            .unwrap();
+            let request: Value = serde_json::from_slice(
+                &fs::read(root.join("qualification-request/manifest-v1.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(request["release_subject_sha256"], subject);
+            assert!(request.get("candidate_sha256").is_none());
+            let mut q: Value = serde_json::from_slice(include_bytes!(
+                "../../catalog-core/tests/fixtures/catalog/pi-installer-v1/valid-qualification.json"
+            ))
+            .unwrap();
+            q["release_subject_sha256"] = json!(subject);
+            q["verification_build"]["compatibility_profile_sha256"] = json!(encode_sha256(
+                &catalog_core::pi_required_contracts_profile_sha256(
+                    intent.profile().required_contracts()
+                )
+                .unwrap()
+            ));
+            let mut build = q["verification_build"].clone();
+            build.as_object_mut().unwrap().remove("consumer_version");
+            let returned = root.join("returned");
+            fs::create_dir(&returned).unwrap();
+            fs::set_permissions(&returned, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::write(
+                returned.join("build-binding-v1.json"),
+                serde_jcs::to_vec(&build).unwrap(),
+            )
+            .unwrap();
+            fs::write(
+                returned.join("qualification-v1.json"),
+                serde_jcs::to_vec(&q).unwrap(),
+            )
+            .unwrap();
+            let imported =
+                import_handoff(&state, &returned, production_keyring().sha256()).unwrap();
+            assert_eq!(imported.pi_version(), version);
+            build["application_sha256"] = json!("9".repeat(64));
+            fs::write(
+                returned.join("build-binding-v1.json"),
+                serde_jcs::to_vec(&build).unwrap(),
+            )
+            .unwrap();
+            assert!(import_handoff(&state, &returned, production_keyring().sha256()).is_err());
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QualificationEvidence {
+    Legacy(CompatibilityQualificationV1),
+    Installer {
+        profile: catalog_core::PiReleaseProfileV1,
+        qualification: catalog_core::PiReleaseQualificationV1,
+    },
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum QualificationRequest {
+    Legacy(LegacyQualificationRequest),
+    Installer(InstallerQualificationRequest),
+}
+impl QualificationRequest {
+    pub fn candidate_sha256(&self) -> &str {
+        match self {
+            Self::Legacy(r) => r.candidate_sha256(),
+            Self::Installer(r) => &r.input_bundle_sha256,
+        }
+    }
+    pub fn trusted_signing_keyring_sha256(&self) -> &str {
+        match self {
+            Self::Legacy(r) => r.trusted_signing_keyring_sha256(),
+            Self::Installer(r) => &r.trusted_signing_keyring_sha256,
+        }
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstallerQualificationRequest {
+    schema_version: u16,
+    kind: String,
+    sequence: u64,
+    release_subject_sha256: String,
+    input_bundle_sha256: String,
+    intent: serde_json::Value,
+    catalog_source_commit: String,
+    catalog_source_tree_sha256: String,
+    trusted_signing_keyring_sha256: String,
+}
+const INSTALLER_README: &str = "Fluxsemble Pi installer qualification request\n\nUse the existing supported consumer build and its unchanged behavioral contracts to test the exact release profile in manifest-v1.json. No release-specific profile recompilation is required. Bind qualification-v1.json to release_subject_sha256 and record every required passing check. Return canonical JCS files build-binding-v1.json and qualification-v1.json. The final catalog is assembled after qualification.\n\nThese public inputs confer no signing, publishing, credential or remote mutation authority.\n";
+
+fn installer_intent_for_state(
+    state: &WizardState,
+    candidate: &Path,
+) -> Result<catalog_core::PiReleaseIntentV2, WizardError> {
+    let manifest: CandidateTransferManifest = parse_canonical(&read_bounded_regular(
+        &candidate.join("transfer-manifest-v1.json"),
+        true,
+    )?)?;
+    let matching = manifest
+        .records
+        .iter()
+        .filter(|r| r.role == "release_intent")
+        .collect::<Vec<_>>();
+    let [record] = matching.as_slice() else {
+        return Err(WizardError::Qualification);
+    };
+    validate_sha256(&record.sha256)?;
+    if record.relative_path != format!("records/{}", record.sha256) {
+        return Err(WizardError::Qualification);
+    }
+    let bytes = read_bounded_regular(&candidate.join(&record.relative_path), true)?;
+    if sha256(&bytes) != record.sha256 {
+        return Err(WizardError::Qualification);
+    }
+    let intent = catalog_core::PiReleaseIntentV2::from_json(&bytes)
+        .map_err(|_| WizardError::Qualification)?;
+    let verified = catalog_acquire::verify_transferred_bundle(candidate)
+        .map_err(|_| WizardError::Qualification)?;
+    let inventory = verified.verified_input();
+    if manifest.schema_version != 1
+        || manifest.kind != "verified_input"
+        || manifest.source_commit.is_some()
+        || manifest.source_tree_sha256.is_some()
+        || serde_jcs::to_vec(&intent).map_err(|_| WizardError::Qualification)? != bytes
+        || inventory.source_kind() != catalog_core::InputSourceKind::ReleaseIntent
+        || inventory.source_sha256().as_str()
+            != encode_sha256(
+                &catalog_core::pi_release_intent_v2_digest(&intent)
+                    .map_err(|_| WizardError::Qualification)?,
+            )
+        || inventory.compatibility_input_sha256().as_str()
+            != encode_sha256(
+                &catalog_core::pi_release_subject_sha256(intent.profile())
+                    .map_err(|_| WizardError::Qualification)?,
+            )
+        || intent.sequence() != state.sequence
+        || intent.profile().pi_package().version().as_str() != state.pi_version
+        || intent.profile().node_version().as_str() != state.node_version
+        || intent.profile().target().as_str() != state.target
+    {
+        return Err(WizardError::Qualification);
+    }
+    Ok(intent)
+}
+fn installer_request(
+    state: &WizardState,
+    candidate: &Path,
+    keyring: &str,
+) -> Result<InstallerQualificationRequest, WizardError> {
+    validate_state_identity(state)?;
+    validate_sha256(keyring)?;
+    let intent = installer_intent_for_state(state, candidate)?;
+    let bundle = catalog_acquire::verify_transferred_bundle(candidate)
+        .map_err(|_| WizardError::Qualification)?;
+    Ok(InstallerQualificationRequest {
+        schema_version: 2,
+        kind: "pi_installer_lock_v1".into(),
+        sequence: state.sequence,
+        release_subject_sha256: encode_sha256(
+            &catalog_core::pi_release_subject_sha256(intent.profile())
+                .map_err(|_| WizardError::Qualification)?,
+        ),
+        input_bundle_sha256: bundle.bundle_sha256().into(),
+        intent: serde_json::to_value(intent).map_err(|_| WizardError::Qualification)?,
+        catalog_source_commit: state.catalog_source_commit.clone(),
+        catalog_source_tree_sha256: state.catalog_source_tree_sha256.clone(),
+        trusted_signing_keyring_sha256: keyring.into(),
+    })
+}
+fn export_installer_request(
+    state: &WizardState,
+    candidate: &Path,
+    output: &Path,
+) -> Result<QualificationRequest, WizardError> {
+    let request = installer_request(state, candidate, production_keyring().sha256())?;
+    let stage = create_stage(output, "qualification-request")?;
+    let result = (|| {
+        let export_root = stage.join("candidate-export");
+        let mut builder = DirBuilder::new();
+        builder.mode(0o700);
+        builder.create(&export_root).map_err(|_| WizardError::Io)?;
+        catalog_acquire::export_transfer_bundle(candidate, &export_root.join("candidate"))
+            .map_err(|_| WizardError::Qualification)?;
+        fs::rename(export_root.join("candidate"), stage.join("candidate"))
+            .map_err(|_| WizardError::Io)?;
+        let evidence = stage.parent().ok_or(WizardError::Io)?.join(format!(
+            ".qualification-acquire-evidence.{}.{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| WizardError::Io)?
+                .as_nanos()
+        ));
+        rename_no_replace(&export_root, &evidence)?;
+        write_immutable(
+            &stage.join(REQUEST_MANIFEST_NAME),
+            &serde_jcs::to_vec(&request).map_err(|_| WizardError::Qualification)?,
+        )?;
+        write_immutable(&stage.join("README.txt"), INSTALLER_README.as_bytes())?;
+        fs::set_permissions(&stage, fs::Permissions::from_mode(0o500))
+            .map_err(|_| WizardError::Io)?;
+        rename_no_replace(&stage, output)
+    })();
+    if result.is_err() {
+        let _ = make_tree_writable(&stage);
+        let _ = fs::remove_dir_all(&stage);
+    }
+    result?;
+    Ok(QualificationRequest::Installer(request))
+}
+fn verify_installer_request(
+    state: &WizardState,
+    candidate: &Path,
+    output: &Path,
+) -> Result<(), WizardError> {
+    let meta = fs::symlink_metadata(output).map_err(|_| WizardError::Qualification)?;
+    if !meta.is_dir()
+        || meta.file_type().is_symlink()
+        || meta.uid() != current_euid()
+        || meta.permissions().mode() & 0o7777 != 0o500
+        || exact_directory_names(output, 3)?
+            != BTreeSet::from([
+                REQUEST_MANIFEST_NAME.into(),
+                "README.txt".into(),
+                "candidate".into(),
+            ])
+        || read_immutable_regular(&output.join("README.txt"))? != INSTALLER_README.as_bytes()
+    {
+        return Err(WizardError::Qualification);
+    }
+    let actual: InstallerQualificationRequest = parse_canonical(&read_immutable_regular(
+        &output.join(REQUEST_MANIFEST_NAME),
+    )?)?;
+    if actual != installer_request(state, candidate, production_keyring().sha256())?
+        || actual
+            != installer_request(
+                state,
+                &output.join("candidate"),
+                production_keyring().sha256(),
+            )?
+    {
+        return Err(WizardError::Qualification);
+    }
+    Ok(())
+}
+fn import_installer_handoff(
+    state: &WizardState,
+    handoff: &Path,
+    keyring: &str,
+) -> Result<ImportedQualification, WizardError> {
+    if state.phase != ReleasePhase::AwaitingQualification {
+        return Err(WizardError::Qualification);
+    }
+    let root = state.work_dir.join("qualification-request");
+    let request: InstallerQualificationRequest = parse_canonical(&read_bounded_regular(
+        &root.join(REQUEST_MANIFEST_NAME),
+        true,
+    )?)?;
+    let expected = installer_request(state, &root.join("candidate"), keyring)?;
+    if request != expected
+        || exact_directory_names(handoff, 2)?
+            != BTreeSet::from([BUILD_BINDING_NAME.into(), QUALIFICATION_NAME.into()])
+    {
+        return Err(WizardError::Qualification);
+    }
+    let build_bytes = read_bounded_regular(&handoff.join(BUILD_BINDING_NAME), true)?;
+    let bytes = read_bounded_regular(&handoff.join(QUALIFICATION_NAME), true)?;
+    let build = FluxsembleBuildBindingV1::from_json(&build_bytes)
+        .map_err(|_| WizardError::Qualification)?;
+    let qualification = catalog_core::PiReleaseQualificationV1::from_json(&bytes)
+        .map_err(|_| WizardError::Qualification)?;
+    let intent = installer_intent_for_state(state, &root.join("candidate"))?;
+    if serde_jcs::to_vec(&build).map_err(|_| WizardError::Qualification)? != build_bytes
+        || serde_jcs::to_vec(&qualification).map_err(|_| WizardError::Qualification)? != bytes
+    {
+        return Err(WizardError::Qualification);
+    }
+    catalog_core::verify_pi_release_qualification(intent.profile(), &qualification)
+        .map_err(|_| WizardError::Qualification)?;
+    catalog_core::verify_pi_verification_build(&build, &qualification)
+        .map_err(|_| WizardError::Qualification)?;
+    let request_bytes = serde_jcs::to_vec(&request).map_err(|_| WizardError::Qualification)?;
+    let receipt = serde_jcs::to_vec(&serde_json::json!({
+        "schema_version": 2,
+        "kind": "pi_installer_lock_v1",
+        "sequence": state.sequence,
+        "release_subject_sha256": request.release_subject_sha256,
+        "request_sha256": sha256(&request_bytes),
+        "build_binding_sha256": sha256(&build_bytes),
+        "qualification_sha256": sha256(&bytes),
+    }))
+    .map_err(|_| WizardError::Qualification)?;
+    ensure_imported_output(
+        &state.work_dir.join("imported-qualification"),
+        &build_bytes,
+        &bytes,
+        &receipt,
+    )?;
+    let mut advanced = state.clone();
+    advanced.phase = ReleasePhase::QualificationImported;
+    advanced.save(&state.work_dir.join("wizard-state.json"))?;
+    Ok(ImportedQualification {
+        build,
+        qualification: QualificationEvidence::Installer {
+            profile: intent.profile().clone(),
+            qualification,
+        },
+    })
 }

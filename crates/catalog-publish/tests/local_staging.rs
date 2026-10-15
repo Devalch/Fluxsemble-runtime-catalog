@@ -598,3 +598,30 @@ fn persistent_state_count_bytes_names_and_enumeration_work_are_bounded() {
     assert!(local::stage_local(&verified, &state).is_err());
     assert_eq!(persistent_object_snapshot(&state), with_oversized_name);
 }
+
+#[test]
+fn installer_bundle_requires_qualified_support_assets_before_staging_and_recovery() {
+    for omitted in [
+        None,
+        Some("installer_manifest"),
+        Some("installer_lock"),
+        Some("pi_manifest"),
+        Some("qualification"),
+    ] {
+        let temp = TempTree::new("installer-assets");
+        let transfer = temp.path("transfer");
+        support::fixture_installer_transfer(&transfer, 42, omitted);
+        let result = local::verify_transferred_fixture_signed_bundle(&transfer);
+        if omitted.is_some() {
+            assert!(result.is_err(), "accepted omitted {omitted:?}");
+            assert!(!temp.path("state").exists());
+        } else {
+            let verified = result.unwrap();
+            assert_eq!(
+                local::stage_local(&verified, &temp.path("state")).unwrap(),
+                PublishOutcome::Staged
+            );
+            assert!(local::recover_local(&temp.path("state")).is_ok());
+        }
+    }
+}

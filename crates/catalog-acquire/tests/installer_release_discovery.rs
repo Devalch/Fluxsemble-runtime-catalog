@@ -70,7 +70,16 @@ fn installer_discovery_fails_closed_on_bad_graph_or_archive() {
 fn installer_discovery_requires_explicit_policy_before_fetch() {
     let mut r = request();
     r.installer_policy = None;
-    assert!(discover_pi_installer_release_with_transport(r, &Transport(BTreeMap::new())).is_err());
+    struct NoFetch;
+    impl ReleaseDiscoveryTransport for NoFetch {
+        fn fetch(&self, _: &str, _: usize) -> Result<Vec<u8>, AcquireError> {
+            panic!("discovery fetched before rejecting absent explicit policy")
+        }
+    }
+    assert_eq!(
+        discover_pi_installer_release_with_transport(r, &NoFetch),
+        Err(AcquireError::Input)
+    );
 }
 #[test]
 fn npm_partial_upper_engine_bound_includes_the_entire_major() {
@@ -118,6 +127,42 @@ fn discover_fixture_for_version(
     mutation: &str,
     pi_version: &str,
 ) -> Result<catalog_acquire::PiInstallerCandidateV1, AcquireError> {
+    let transport = fixture_transport(mutation, pi_version);
+    let mut r = request();
+    r.pi_version = pi_version.into();
+    if matches!(
+        mutation,
+        "root-overrides"
+            | "null-root-overrides"
+            | "lock-root-overrides"
+            | "top-lock-overrides"
+            | "unused-root-overrides"
+            | "range-root-overrides"
+            | "nested-root-overrides"
+            | "selector-root-overrides"
+            | "reference-root-overrides"
+            | "oversized-root-overrides"
+            | "conflicting-lock-root-overrides"
+            | "conflicting-top-lock-overrides"
+            | "outside-range-root-overrides"
+            | "mixed-version-root-overrides"
+    ) {
+        struct SupportOnlyTransport<'a>(&'a Transport);
+        impl ReleaseDiscoveryTransport for SupportOnlyTransport<'_> {
+            fn fetch(&self, url: &str, maximum: usize) -> Result<Vec<u8>, AcquireError> {
+                assert!(
+                    url.starts_with("https://github.com/earendil-works/pi/releases/download/"),
+                    "archive/registry acquisition before root override rejection: {url}"
+                );
+                self.0.fetch(url, maximum)
+            }
+        }
+        discover_pi_installer_release_with_transport(r, &SupportOnlyTransport(&transport))
+    } else {
+        discover_pi_installer_release_with_transport(r, &transport)
+    }
+}
+fn fixture_transport(mutation: &str, pi_version: &str) -> Transport {
     let pi_url = format!(
         "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/pi-coding-agent-{pi_version}.tgz"
     );
@@ -465,41 +510,9 @@ fn discover_fixture_for_version(
         );
         responses.insert(url.into(), archive);
     }
-    let mut r = request();
-    r.pi_version = pi_version.into();
-    let transport = Transport(responses);
-    if matches!(
-        mutation,
-        "root-overrides"
-            | "null-root-overrides"
-            | "lock-root-overrides"
-            | "top-lock-overrides"
-            | "unused-root-overrides"
-            | "range-root-overrides"
-            | "nested-root-overrides"
-            | "selector-root-overrides"
-            | "reference-root-overrides"
-            | "oversized-root-overrides"
-            | "conflicting-lock-root-overrides"
-            | "conflicting-top-lock-overrides"
-            | "outside-range-root-overrides"
-            | "mixed-version-root-overrides"
-    ) {
-        struct SupportOnlyTransport<'a>(&'a Transport);
-        impl ReleaseDiscoveryTransport for SupportOnlyTransport<'_> {
-            fn fetch(&self, url: &str, maximum: usize) -> Result<Vec<u8>, AcquireError> {
-                assert!(
-                    url.starts_with("https://github.com/earendil-works/pi/releases/download/"),
-                    "archive/registry acquisition before root override rejection: {url}"
-                );
-                self.0.fetch(url, maximum)
-            }
-        }
-        discover_pi_installer_release_with_transport(r, &SupportOnlyTransport(&transport))
-    } else {
-        discover_pi_installer_release_with_transport(r, &transport)
-    }
+    Transport(responses)
 }
+
 struct TarEntry {
     path: String,
     data: Vec<u8>,
@@ -850,4 +863,75 @@ fn root_overrides_require_a_bounded_exact_source_consistent_subset() {
     ] {
         assert!(discover_fixture(mutation).is_ok(), "rejected {mutation}");
     }
+}
+
+#[test]
+fn acquisition_reverifies_original_support_sources_before_materialization() {
+    use catalog_core::PiReleaseIntentV2;
+    let transport = fixture_transport("matching-missing-integrity-supplement", "1.2.0");
+    let candidate = discover_pi_installer_release_with_transport(request(), &transport).unwrap();
+    let intent = PiReleaseIntentV2::from_json(&serde_jcs::to_vec(&json!({"schema_version":2,"sequence":"9","tag":"catalog-v1-sequence-9","generated_at":"2026-10-01T00:00:00Z","expires_at":"2026-11-01T00:00:00Z","title":"Pi","notes":"test only","profile":candidate.profile})).unwrap()).unwrap();
+    let root = std::env::temp_dir().join(format!(
+        "pi-acquire-v2-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&root).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let request = |name: &str| catalog_acquire::AcquireInstallerReleaseRequest {
+        source: catalog_acquire::AcquireInstallerReleaseSource::Intent {
+            intent: intent.clone(),
+        },
+        package_inputs: candidate.inputs.clone(),
+        cache_root: root.join(name),
+        output: root.join(format!("{name}-bundle")),
+        cancellation: catalog_acquire::AcquisitionCancellation::new(),
+    };
+    for name in ["matching", "changed", "changed-observation"] {
+        std::fs::create_dir(root.join(name)).unwrap();
+        std::fs::set_permissions(root.join(name), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let verified =
+        catalog_acquire::acquire_installer_release_with_transport(request("matching"), &transport)
+            .unwrap();
+    for descriptor in [
+        candidate.profile.installer_manifest(),
+        candidate.profile.installer_lock(),
+        candidate.profile.pi_manifest(),
+    ] {
+        assert!(
+            verified
+                .objects()
+                .iter()
+                .any(|o| o.source_url().as_str() == descriptor.url().as_str()
+                    && o.sha256().as_str() == descriptor.sha256().as_str()
+                    && o.size() == descriptor.size_bytes().get())
+        );
+    }
+    let mut altered = fixture_transport("matching-missing-integrity-supplement", "1.2.0");
+    altered
+        .0
+        .get_mut(candidate.inputs.installer_manifest_source().url())
+        .unwrap()
+        .push(b' ');
+    assert!(
+        catalog_acquire::acquire_installer_release_with_transport(request("changed"), &altered)
+            .is_err()
+    );
+    assert!(!root.join("changed-bundle").exists());
+    let mut observed = serde_json::to_value(&candidate.inputs).unwrap();
+    observed["locked_packages"][0]["archive_member_count"] = json!(999);
+    let mut altered_request = request("changed-observation");
+    altered_request.package_inputs =
+        catalog_acquire::PackageInputManifestV2::from_json(&serde_jcs::to_vec(&observed).unwrap())
+            .unwrap();
+    assert!(
+        catalog_acquire::acquire_installer_release_with_transport(altered_request, &transport)
+            .is_err()
+    );
+    assert!(!root.join("changed-observation-bundle").exists());
 }
