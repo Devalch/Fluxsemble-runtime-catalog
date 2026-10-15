@@ -104,6 +104,7 @@ fn assert_closed_rejection(mutation: Mutation) {
 
 fn request() -> DiscoverPiReleaseRequest {
     DiscoverPiReleaseRequest {
+        installer_policy: None,
         sequence: 2,
         generated_at: "2026-09-01T00:00:00Z".to_owned(),
         expires_at: "2026-10-01T00:00:00Z".to_owned(),
@@ -390,4 +391,23 @@ fn sri(bytes: &[u8]) -> String {
         "sha512-{}",
         base64::engine::general_purpose::STANDARD.encode(Sha512::digest(bytes))
     )
+}
+
+#[test]
+fn legacy_discovery_rejects_installer_policy_before_fetching() {
+    let fixture = PublicReleaseFixture::new(Mutation::None);
+    let contracts: Value = serde_json::from_slice(include_bytes!(
+        "fixtures/pi-installer/supported-contracts-v1.json"
+    ))
+    .unwrap();
+    let mut r = request();
+    r.installer_policy = Some(catalog_acquire::PiInstallerDiscoveryPolicy {
+        consumer_requirement: ">=0.1.0".into(),
+        required_contracts: catalog_core::PiRequiredContractsV1::from_json(
+            &serde_json::to_vec(&contracts["required_contracts"]).unwrap(),
+        )
+        .unwrap(),
+    });
+    assert_eq!(fixture.discover(r).unwrap_err(), AcquireError::Input);
+    assert_eq!(fixture.transport.fetch_count.get(), 0);
 }

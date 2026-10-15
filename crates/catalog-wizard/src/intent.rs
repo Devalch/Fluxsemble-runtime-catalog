@@ -69,6 +69,7 @@ fn generate_release_inputs_with(
     let generated_at = generated_at.to_rfc3339_opts(SecondsFormat::Secs, true);
     let expires_at = expires_at.to_rfc3339_opts(SecondsFormat::Secs, true);
     let discovered = discover(DiscoverPiReleaseRequest {
+        installer_policy: None,
         sequence: request.sequence,
         generated_at: generated_at.clone(),
         expires_at: expires_at.clone(),

@@ -196,3 +196,52 @@ a later Pi release, and subject changes while excluding the final qualification
 descriptor. Subject expected bytes were calculated independently using sorted
 compact JSON (the synthetic fixture contains only ASCII strings and small
 integers, for which this equals JCS), uint64 big-endian length and SHA-256.
+
+## Producer discovery inputs
+
+`catalog-acquire::discover_pi_installer_release(DiscoverPiReleaseRequest)` and its
+local-transport counterpart return an inert `PiInstallerCandidateV1 { profile,
+inputs }`. The request's `installer_policy: Some(PiInstallerDiscoveryPolicy)`
+supplies an explicit consumer requirement and validated required contracts;
+missing policy fails before fetching. Legacy discovery requires `None` and
+continues to require Pi's legacy shipped shrinkwrap. The wizard's existing legacy
+caller supplies `None`.
+
+Installer discovery requests exactly the versioned Pi release assets
+`https://github.com/earendil-works/pi/releases/download/v<VERSION>/pi-coding-agent-install-package.json`
+and `pi-coding-agent-install-package-lock.json`. It reuses the credential-free
+transport's closed release-asset redirect policy. Original source descriptors are
+retained independently from the profile's planned catalog sequence support URLs.
+All profile support URLs are finalized before computing the qualification subject.
+Changing a support URL requires a new subject and qualification.
+
+`PackageInputManifestV2` is a strict, bounded, immutable exact-archive observation:
+`schema_version: 2`, `release_subject_sha256`, `installer_manifest_source`,
+`installer_lock_source`, sorted `locked_packages`, `pre_prune_package_count` and
+`applicable_package_count`. Each source descriptor has `url`, canonical positive
+decimal-string `size_bytes` and lowercase SHA-256 `sha256`; its URL is the exact
+upstream asset route for the selected Pi version. Each observed locked package
+has `locator`, `name`, `version`, `resolved_url`, `registry_integrity`,
+`archive_size`, `archive_sha256`, `declaration_size`, `declaration_sha256`,
+`archive_member_count` and sorted finite `pruned_reasons`. Observation sizes and
+counts are bounded JSON integers, retaining the legacy manifest convention.
+The pre-prune count includes the wrapper root plus every locked package; the
+applicable count includes applicable locked packages. Neither is a reference
+release equality gate.
+
+`from_json` validates structure and provenance routes; `validate_for_profile`
+also binds the subject, every locked identity/archive fact, the Pi manifest,
+and source sizes/digests to the planned profile descriptors. Neither operation
+validates fetched bytes or grants acquisition/publication/installation authority.
+Later acquisition must refetch the retained original source descriptors with
+exact byte bounds and hashes, re-extract the Pi manifest from its verified archive,
+and verify both source and planned publication bindings before materializing
+support objects. Candidate discovery does not produce a qualified catalog record.
+
+Discovery admits only a reachable, complete lock-v3 graph (at most 512 locked
+packages); absent lock integrity requires exact matching name/version/tarball
+registry evidence. Every archive is independently verified and inspected.
+Node support remains 22.19.0/linux_x86_64. Unsupported engine/dependency range
+forms fail closed; supported npm forms include exact/partial/wildcard versions,
+comparators, caret, tilde, whitespace conjunctions, unions and hyphen ranges with
+an exact upper version. No app-version inference or upstream execution occurs.

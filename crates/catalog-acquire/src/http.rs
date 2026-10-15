@@ -2011,3 +2011,72 @@ pub(crate) fn validate_redirect_chain_for_test(
     }
     Ok(())
 }
+
+/// Apply the existing closed redirect policy to discovery bytes without a known digest yet.
+/// Initial GitHub permission is restricted to the exact Pi installer assets by its caller.
+pub(crate) fn validate_discovery_redirect(
+    initial: &str,
+    current: &str,
+    location: &str,
+) -> Result<String, AcquireError> {
+    let initial = Url::parse(initial).map_err(|_| AcquireError::InvalidPolicy)?;
+    let current = Url::parse(current).map_err(|_| AcquireError::RedirectDenied)?;
+    if !crate::installer_lock::is_installer_asset_url(initial.as_str()) {
+        // Legacy npm/Node discovery rejected redirects; only the new exact assets gain permission.
+        return Err(AcquireError::RedirectDenied);
+    }
+    let profile = RedirectProfile::GitHubReleaseAsset;
+    let allowed = BTreeSet::from([
+        HttpsOrigin("https://github.com".to_owned()),
+        HttpsOrigin("https://release-assets.githubusercontent.com".to_owned()),
+    ]);
+    validate_hop(&current, profile, TransportMode::Production)?;
+    validate_redirect_source(&current, profile)?;
+    let next = redirect_target(&current, location)?;
+    if next.host_str() == Some(GITHUB_HOST) && next != initial {
+        return Err(AcquireError::RedirectDenied);
+    }
+    validate_redirect_target(&next, &allowed, profile, TransportMode::Production)?;
+    Ok(next.as_str().to_owned())
+}
+
+#[cfg(test)]
+mod installer_discovery_redirect_tests {
+    use super::*;
+    #[test]
+    fn installer_asset_redirects_use_the_existing_closed_origin_policy() {
+        let initial = "https://github.com/earendil-works/pi/releases/download/v1.2.0/pi-coding-agent-install-package.json";
+        assert!(validate_discovery_redirect(initial, initial, "https://release-assets.githubusercontent.com/github-production-release-asset/1/asset?signature=public").is_ok());
+        for target in [
+            "https://objects.githubusercontent.com/asset?signature=public",
+            "https://evil.example/asset",
+            "https://github.com/elsewhere/repo/releases/download/v1.2.0/asset",
+            "https://release-assets.githubusercontent.com/asset",
+            "https://user:secret@release-assets.githubusercontent.com/asset?sig=x",
+        ] {
+            assert!(
+                validate_discovery_redirect(initial, initial, target).is_err(),
+                "accepted {target}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod legacy_discovery_redirect_tests {
+    use super::*;
+    #[test]
+    fn legacy_discovery_does_not_gain_redirect_permission() {
+        let npm = "https://registry.npmjs.org/package/-/package-1.0.0.tgz";
+        assert!(
+            validate_discovery_redirect(
+                npm,
+                npm,
+                "https://registry.npmjs.org/other/-/other-1.0.0.tgz"
+            )
+            .is_err()
+        );
+        let node = "https://nodejs.org/dist/v22.19.0/SHASUMS256.txt";
+        assert!(validate_discovery_redirect(node, node, "https://nodejs.org/other").is_err());
+    }
+}

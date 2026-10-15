@@ -1449,3 +1449,19 @@ struct LockedPackageWire {
     registry_integrity: String,
     archive_sha256: String,
 }
+
+// Public, inert validated inputs for credential-free installer discovery.
+macro_rules! scalar_from_str {
+    ($ty:ty) => {
+        impl std::str::FromStr for $ty {
+            type Err = CoreError;
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                Self::parse(value.to_owned())
+            }
+        }
+    };
+}
+scalar_from_str!(ExactVersion);
+scalar_from_str!(PackageName);
+scalar_from_str!(InventoryPath);
+scalar_from_str!(CompatibilityRange);

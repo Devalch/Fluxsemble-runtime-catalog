@@ -391,3 +391,47 @@ fn subject_binds_every_descriptor_field_and_coupled_identity() {
         assert_ne!(subject(&changed), expected);
     }
 }
+
+#[test]
+fn discovery_scalar_inputs_reuse_strict_inert_validation() {
+    use catalog_core::{CompatibilityRange, ExactVersion, InventoryPath, PackageName};
+    assert!("1.2.0".parse::<ExactVersion>().is_ok());
+    assert!("1.2.0-pre".parse::<ExactVersion>().is_ok());
+    for invalid in ["latest", "01.2.0", "1.2"] {
+        assert!(invalid.parse::<ExactVersion>().is_err());
+    }
+    assert!(
+        "@earendil-works/pi-coding-agent"
+            .parse::<PackageName>()
+            .is_ok()
+    );
+    assert!("../substitute".parse::<PackageName>().is_err());
+    assert!("dist/cli.js".parse::<InventoryPath>().is_ok());
+    assert!("../escape".parse::<InventoryPath>().is_err());
+    assert!(">=0.1.0".parse::<CompatibilityRange>().is_ok());
+    assert!("latest".parse::<CompatibilityRange>().is_err());
+}
+
+#[test]
+fn standalone_required_contracts_reject_duplicates_unknowns_and_size() {
+    let profile: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "fixtures/catalog/pi-installer-v1/valid-wrapper-root.json"
+    ))
+    .unwrap();
+    let bytes = serde_json::to_vec(&profile["required_contracts"]).unwrap();
+    assert!(catalog_core::PiRequiredContractsV1::from_json(&bytes).is_ok());
+    let text = String::from_utf8(bytes).unwrap();
+    assert!(
+        catalog_core::PiRequiredContractsV1::from_json(
+            text.replacen("{", "{\"installer_policy\":1,", 1).as_bytes()
+        )
+        .is_err()
+    );
+    assert!(
+        catalog_core::PiRequiredContractsV1::from_json(
+            text.replacen("{", "{\"extra\":1,", 1).as_bytes()
+        )
+        .is_err()
+    );
+    assert!(catalog_core::PiRequiredContractsV1::from_json(&vec![b' '; 65537]).is_err());
+}

@@ -474,3 +474,17 @@ fn temp_file() -> PathBuf {
         NEXT.fetch_add(1, Ordering::Relaxed)
     ))
 }
+
+#[test]
+fn external_installer_pi_archive_does_not_impersonate_a_legacy_shrinkwrap_root() {
+    let bytes = gzip(&tar(&[
+        TarEntry::file("package/package.json", br#"{"name":"@earendil-works/pi-coding-agent","version":"1.2.0","bin":{"pi":"dist/cli.js"}}"#),
+        TarEntry::file("package/dist/cli.js", b"cli"),
+    ]));
+    let url =
+        "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/pi-coding-agent-1.2.0.tgz";
+    let mut archive = verified(bytes.clone(), url, None);
+    assert!(verify_npm_archive_shape(&mut archive, false).is_ok());
+    let mut archive = verified(bytes, url, None);
+    assert!(verify_npm_archive_shape(&mut archive, true).is_err());
+}

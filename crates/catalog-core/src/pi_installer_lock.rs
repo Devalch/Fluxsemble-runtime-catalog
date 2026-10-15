@@ -23,6 +23,12 @@ pub struct PiRequiredContractsV1 {
 }
 
 impl PiRequiredContractsV1 {
+    /// Strict inert public contract input; this does not grant compatibility admission.
+    pub fn from_json(bytes: &[u8]) -> Result<Self, CoreError> {
+        require(bytes.len() <= MAX_PI_QUALIFICATION_BYTES)?;
+        Self::from_wire(serde_json::from_slice(bytes).map_err(|_| invalid())?)
+    }
+
     fn from_wire(w: PiRequiredContractsWire) -> Result<Self, CoreError> {
         require(
             (

@@ -46,6 +46,7 @@ pub struct DiscoverPiReleaseRequest {
     pub title: String,
     pub notes: String,
     pub target: String,
+    pub installer_policy: Option<crate::PiInstallerDiscoveryPolicy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +77,9 @@ pub fn discover_pi_release_with_transport(
     transport: &dyn ReleaseDiscoveryTransport,
 ) -> Result<DiscoveredPiRelease, AcquireError> {
     validate_discovery_request(&request)?;
+    if request.installer_policy.is_some() {
+        return Err(AcquireError::Input);
+    }
 
     let root_metadata_url = npm_metadata_url(ROOT_NAME, &request.pi_version)?;
     let root_metadata = transport.fetch(&root_metadata_url, MAX_METADATA_BYTES)?;
@@ -261,12 +265,12 @@ pub fn discover_pi_release_with_transport(
     })
 }
 
-struct HttpReleaseDiscoveryTransport {
+pub(crate) struct HttpReleaseDiscoveryTransport {
     client: reqwest::blocking::Client,
 }
 
 impl HttpReleaseDiscoveryTransport {
-    fn new() -> Result<Self, AcquireError> {
+    pub(crate) fn new() -> Result<Self, AcquireError> {
         let client = reqwest::blocking::Client::builder()
             .https_only(true)
             .use_rustls_tls()
@@ -284,11 +288,34 @@ impl HttpReleaseDiscoveryTransport {
 impl ReleaseDiscoveryTransport for HttpReleaseDiscoveryTransport {
     fn fetch(&self, url: &str, maximum_bytes: usize) -> Result<Vec<u8>, AcquireError> {
         require_fixed_discovery_url(url)?;
-        let response = self
-            .client
-            .get(url)
-            .send()
-            .map_err(|_| AcquireError::Transport)?;
+        let mut current = url.to_owned();
+        let mut visited = HashSet::from([current.clone()]);
+        let response = loop {
+            let response = self
+                .client
+                .get(&current)
+                .send()
+                .map_err(|_| AcquireError::Transport)?;
+            if !response.status().is_redirection() {
+                break response;
+            }
+            if visited.len() > 5 {
+                return Err(AcquireError::TooManyRedirects);
+            }
+            let mut locations = response.headers().get_all(reqwest::header::LOCATION).iter();
+            let location = locations
+                .next()
+                .and_then(|v| v.to_str().ok())
+                .ok_or(AcquireError::RedirectDenied)?;
+            if locations.next().is_some() {
+                return Err(AcquireError::RedirectDenied);
+            }
+            let next = crate::http::validate_discovery_redirect(url, &current, location)?;
+            if !visited.insert(next.clone()) {
+                return Err(AcquireError::RedirectDenied);
+            }
+            current = next;
+        };
         if response.status() != reqwest::StatusCode::OK {
             return Err(AcquireError::UnexpectedStatus);
         }
@@ -310,7 +337,9 @@ impl ReleaseDiscoveryTransport for HttpReleaseDiscoveryTransport {
     }
 }
 
-fn validate_discovery_request(request: &DiscoverPiReleaseRequest) -> Result<(), AcquireError> {
+pub(crate) fn validate_discovery_request(
+    request: &DiscoverPiReleaseRequest,
+) -> Result<(), AcquireError> {
     if request.sequence == 0
         || request.target != "linux_x86_64"
         || !valid_version(&request.pi_version)
@@ -321,7 +350,7 @@ fn validate_discovery_request(request: &DiscoverPiReleaseRequest) -> Result<(), 
     Ok(())
 }
 
-fn npm_metadata_url(name: &str, version: &str) -> Result<String, AcquireError> {
+pub(crate) fn npm_metadata_url(name: &str, version: &str) -> Result<String, AcquireError> {
     if name.is_empty() || !valid_version(version) {
         return Err(AcquireError::Input);
     }
@@ -329,7 +358,7 @@ fn npm_metadata_url(name: &str, version: &str) -> Result<String, AcquireError> {
     Ok(format!("{NPM_ORIGIN}/{encoded}/{version}"))
 }
 
-fn parse_npm_metadata(
+pub(crate) fn parse_npm_metadata(
     bytes: &[u8],
     expected_name: &str,
     expected_version: &str,
@@ -362,7 +391,10 @@ fn parse_npm_metadata(
     Ok((tarball.to_owned(), integrity.to_owned()))
 }
 
-fn parse_node_checksum(bytes: &[u8], expected_name: &str) -> Result<String, AcquireError> {
+pub(crate) fn parse_node_checksum(
+    bytes: &[u8],
+    expected_name: &str,
+) -> Result<String, AcquireError> {
     if bytes.is_empty() || bytes.len() > MAX_CHECKSUM_BYTES {
         return Err(AcquireError::Input);
     }
@@ -382,7 +414,7 @@ fn parse_node_checksum(bytes: &[u8], expected_name: &str) -> Result<String, Acqu
     found.ok_or(AcquireError::Input)
 }
 
-fn verified_bytes(
+pub(crate) fn verified_bytes(
     bytes: Vec<u8>,
     url: &str,
     sri: Option<&str>,
@@ -424,14 +456,15 @@ fn require_fixed_discovery_url(url: &str) -> Result<(), AcquireError> {
     if url.len() > 4096
         || url.contains(['?', '#', '\\'])
         || (!url.starts_with(&format!("{NPM_ORIGIN}/"))
-            && !url.starts_with(&format!("{NODE_ORIGIN}/")))
+            && !url.starts_with(&format!("{NODE_ORIGIN}/"))
+            && !crate::installer_lock::is_installer_asset_url(url))
     {
         return Err(AcquireError::InvalidPolicy);
     }
     Ok(())
 }
 
-fn require_registry_url(url: &str) -> Result<(), AcquireError> {
+pub(crate) fn require_registry_url(url: &str) -> Result<(), AcquireError> {
     if url.starts_with(&format!("{NPM_ORIGIN}/"))
         && !url.contains(['?', '#', '\\'])
         && url.len() <= 4096
@@ -992,7 +1025,7 @@ fn verify_root_documents(
 
 type LockPackageRecord = (String, Map<String, Value>);
 
-fn lock_package_records(
+pub(crate) fn lock_package_records(
     shrinkwrap: &Map<String, Value>,
 ) -> Result<Vec<LockPackageRecord>, AcquireError> {
     let packages = shrinkwrap
@@ -1081,7 +1114,7 @@ fn dependency_resolves(locator: &str, name: &str, locators: &BTreeSet<&str>) -> 
     locators.contains(format!("node_modules/{name}").as_str())
 }
 
-fn applicability_reasons(
+pub(crate) fn applicability_reasons(
     declaration: &Map<String, Value>,
     lock: &Map<String, Value>,
 ) -> Result<Vec<String>, AcquireError> {
@@ -1119,7 +1152,10 @@ fn selector_allows(value: &Value, target: &str) -> Result<bool, AcquireError> {
     Ok(positives.is_empty() || positives.iter().any(|value| **value == target))
 }
 
-fn parse_json_object(bytes: &[u8], maximum: usize) -> Result<Map<String, Value>, AcquireError> {
+pub(crate) fn parse_json_object(
+    bytes: &[u8],
+    maximum: usize,
+) -> Result<Map<String, Value>, AcquireError> {
     if bytes.is_empty() || bytes.len() > maximum {
         return Err(AcquireError::Graph);
     }
@@ -1131,7 +1167,7 @@ fn parse_json_object(bytes: &[u8], maximum: usize) -> Result<Map<String, Value>,
         .ok_or(AcquireError::Graph)
 }
 
-fn require_string(
+pub(crate) fn require_string(
     object: &Map<String, Value>,
     field: &str,
     expected: &str,
@@ -1143,18 +1179,18 @@ fn require_string(
     }
 }
 
-fn sha256(bytes: &[u8]) -> String {
+pub(crate) fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn valid_sha256(value: &str) -> bool {
+pub(crate) fn valid_sha256(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
-fn valid_sri(value: &str) -> bool {
+pub(crate) fn valid_sri(value: &str) -> bool {
     value.len() == 95
         && value.starts_with("sha512-")
         && base64::engine::general_purpose::STANDARD
@@ -1162,7 +1198,7 @@ fn valid_sri(value: &str) -> bool {
             .is_ok_and(|bytes| bytes.len() == 64)
 }
 
-fn reject_duplicate_json(bytes: &[u8]) -> Result<(), AcquireError> {
+pub(crate) fn reject_duplicate_json(bytes: &[u8]) -> Result<(), AcquireError> {
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     NoDuplicates::deserialize(&mut deserializer).map_err(|_| AcquireError::Graph)?;
     deserializer.end().map_err(|_| AcquireError::Graph)
@@ -1675,7 +1711,7 @@ mod tests {
         output.finish().unwrap()
     }
 
-    fn sha256(bytes: &[u8]) -> String {
+    pub(crate) fn sha256(bytes: &[u8]) -> String {
         format!("{:x}", Sha256::digest(bytes))
     }
 

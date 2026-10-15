@@ -163,6 +163,14 @@ pub(crate) struct NpmArchiveInspection {
 }
 
 impl NpmArchiveInspection {
+    /// Resolve an entrypoint relative to the single admitted npm archive root.
+    pub(crate) fn package_regular_fact(&self, relative: &str) -> Option<(u64, String)> {
+        self.regular_facts.iter().find_map(|(path, fact)| {
+            let (_, member) = path.split_once('/')?;
+            (member == relative).then(|| (fact.size, hex_lower(&fact.sha256)))
+        })
+    }
+
     pub(crate) fn regular_fact(&self, path: &str) -> Option<(u64, String)> {
         self.regular_facts
             .get(path)
