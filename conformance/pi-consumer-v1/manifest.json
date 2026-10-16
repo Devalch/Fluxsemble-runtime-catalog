@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "evidence_scope": "Synthetic A/B workflow public DATA, not authentic future SDK qualification",
+  "source_repository": "Fluxsemble",
+  "source_base_commit": "efc097cb2c263622477342156029aa0ea9b8e0d9",
+  "entries": [
+    {
+      "path": "a-envelope.json",
+      "size": 5341,
+      "sha256": "50d5f92ff485fe22592ebbc497d9a3e1d584bd6f4836e17b1d206deebeb103be"
+    },
+    {
+      "path": "a-qualification.json",
+      "size": 1162,
+      "sha256": "75096921dfebb96eb647456acb2ac1f2df2107c1eb61c6668c7b974150aae381"
+    },
+    {
+      "path": "b-envelope.json",
+      "size": 5341,
+      "sha256": "388218987d2471707c3e61181b4f17d56e0fec637af3b5cc16052d0706b0281c"
+    },
+    {
+      "path": "b-qualification.json",
+      "size": 1162,
+      "sha256": "5bcf8b170f394c6d0d554e7072611d21a11e93f749c674d95e15379ab2cb8909"
+    },
+    {
+      "path": "reference.json",
+      "size": 149,
+      "sha256": "e090dc2d4c6dda6e09527ea241af91d3adbb964cf9c439003f506f7c3c7594f6"
+    }
+  ]
+}
