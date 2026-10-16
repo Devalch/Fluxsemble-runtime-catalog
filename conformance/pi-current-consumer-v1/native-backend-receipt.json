@@ -1,0 +1,36 @@
+{
+  "profile": "native-auth-backend-v2",
+  "baseSha256": "f7892e3b06d84821f67bc98b78b75631c97c5bfb479d5c33199824ff0a26e473",
+  "patchSha256": "2e3e58d5f1cd52f38f25e75153032ea356b7aa7702a339f73a3a23c40f76fafc",
+  "sourceSha256": "03361dbb8400b36d3016de4781ccc4aac9b4f7cc14bc40d95b3686d8c5919d4c",
+  "version": "0.11.2+fluxsemble.native-auth.3",
+  "contractVersion": 2,
+  "status": "built-unqualified",
+  "schemaSha256": "74de38ad9860acc83b9b303ca744fb2e6a787f69746e13e5c9b36f7df8e72fcc",
+  "generatedHeaderSha256": "c6708e6bde2024a68bc6d297de3d5d7698988c62858e4a0fc12576fb228bed63",
+  "buildKind": "reviewed-local-host-gcc",
+  "compilerVersion": "gcc (GCC) 16.2.1 20260819 (Red Hat 16.2.1-2)\nCopyright (C) 2026 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.",
+  "compilerSha256": "153e46b4657620f2baef1b4a70b4b4f275772faa5b0fb9e415697e87ebcb7fea",
+  "configSha256": "20b45f88d4fb55e1502c671c0606f84b72ac76f4342c82bf6d61122ab9a9622d",
+  "recipeSha256": "cddad746bf8cd6b79127f60e4e43ff859026088904c87bd66779ac60e9cc6140",
+  "environment": {
+    "PATH": "/usr/bin:/bin",
+    "LANG": "C",
+    "LC_ALL": "C",
+    "TZ": "UTC",
+    "SOURCE_DATE_EPOCH": "1776932425"
+  },
+  "translationUnits": [
+    "bubblewrap.c",
+    "fluxsemble-finalize.c",
+    "fluxsemble-native-finalize.c",
+    "fluxsemble-native-grammar.c",
+    "bind-mount.c",
+    "network.c",
+    "utils.c"
+  ],
+  "localToolchainEvidence": "trusted-host-build-not-exhaustive",
+  "artifactSha256": "7baf3c8abb730f40656eac7a998fbecb98fcbd686bbacf8864d22830ea2b020e",
+  "artifactSize": 123000,
+  "producerSha256": "8672511d57827e2471b8a247e6f53638260c4b75b7c145422c44c121a8bc3f3f"
+}

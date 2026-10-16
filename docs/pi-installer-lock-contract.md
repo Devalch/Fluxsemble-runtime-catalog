@@ -10,9 +10,7 @@ hash, and even an all-pass qualification record do not authorize installation,
 execution, publication, or display of an untrusted candidate. Consumer admission
 must verify the original signed catalog, qualification descriptor bytes, subject,
 required contracts, consumer version requirement, Node/target support, installed
-inputs and probes through the respective owners. In the Task 1 implementation,
-existing runtime/acquisition/signing paths explicitly reject the new extension;
-Task 4 owns compatible consumer admission.
+inputs and probes through the respective owners. Current consumer admission and producer finalization use their independent original owners; parser success alone is never an admission result.
 
 ## Encoding and bounds
 
@@ -372,3 +370,22 @@ signed evidence and retained bytes. Installer manifest, installer lock, Pi manif
 and qualification are required assets; omissions or substitutions fail even when
 the transfer and bundle manifest are internally consistent. No new key authority
 is introduced by a parser, source record, qualification record, or bundle inventory.
+
+## Current qualification handoff
+
+The producer finalizes the profile before qualification: four role references use `component:node`, `component:pi`, `artifact:node-linux-x86_64` and `artifact:pi-coding-agent`. The three support descriptors use one canonical positive sequence and exact `pi-installer-package-SHA.json`, `pi-installer-lock-SHA.json` and `pi-package-SHA.json` names under the producer release URL. Sizes and hashes retain authenticated preparation bytes. Qualification binds this final subject; a preparation-profile receipt cannot be silently relabeled.
+
+`build-binding-v1.json` has exactly `implementation_commit`, `application_sha256`, `daemon_sha256`, `compatibility_profile_id` and `compatibility_profile_sha256`, in JCS without a trailing newline. The qualification's verification build adds `consumer_version`. Reuse requires actual unchanged binaries, compiled contracts and relevant source closure. An exact reference version or lock digest is never part of the stable compatibility profile.
+
+The independent npm-range conformance corpus contains 61 immutable oracle vectors in `conformance/npm-range-v1`, with provenance. Selector semantics include `any` and explicit target exclusions. The offline indexed-data guard scans every indexed blob in bounded 64 KiB chunks, with a finite 32 MiB per-blob and 64 MiB aggregate budget; public Node evidence receives no object exemption.
+
+The explicit local integration test `release::genuine_offline_qualification_handoff_prepares_unsigned_candidate` is ignored during ordinary tests. With a returned genuine two-file handoff and a new output directory, a maintainer can run:
+
+```bash
+CATALOG_GENUINE_QUALIFICATION_HANDOFF=/OWNER/PRIVATE/RETURNED \
+CATALOG_GENUINE_QUALIFICATION_OUTPUT=/OWNER/PRIVATE/NEW_OUTPUT \
+CARGO_NET_OFFLINE=true cargo test --offline --locked -p catalog-wizard --lib \
+  release::genuine_offline_qualification_handoff_prepares_unsigned_candidate -- --ignored --exact --nocapture
+```
+
+This requires committed clean producer source, verifies C-local authenticated public inputs through the original acquisition owner, exports/verifies the exact request, imports the consumer records under compiled production public trust, and prepares a retained **unsigned** candidate. Both environment inputs are mandatory; absent or invalid inputs fail. It never accesses a private signing key, contacts a network, signs, publishes or activates. Ordinary synthetic qualification tests are not substitutes for this explicit genuine-data integration.

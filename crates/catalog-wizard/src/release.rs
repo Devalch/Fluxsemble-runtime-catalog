@@ -3008,3 +3008,179 @@ fn select_installer_node(
     }
     Ok(SUPPORTED.into())
 }
+
+// Explicit public-data integration, never part of ordinary synthetic qualification.
+#[cfg(test)]
+#[test]
+#[ignore = "requires exact genuine public handoff and a new owner-controlled output root"]
+fn genuine_offline_qualification_handoff_prepares_unsigned_candidate() {
+    use catalog_acquire::{AcquireError, ReleaseDiscoveryTransport};
+    use std::collections::BTreeMap;
+    struct RetainedPublicData(BTreeMap<String, Vec<u8>>);
+    impl ReleaseDiscoveryTransport for RetainedPublicData {
+        fn fetch(&self, url: &str, maximum: usize) -> Result<Vec<u8>, AcquireError> {
+            self.0
+                .get(url)
+                .filter(|bytes| bytes.len() <= maximum)
+                .cloned()
+                .ok_or(AcquireError::Input)
+        }
+    }
+    let handoff = PathBuf::from(
+        std::env::var_os("CATALOG_GENUINE_QUALIFICATION_HANDOFF")
+            .expect("explicit public handoff required"),
+    );
+    let output = PathBuf::from(
+        std::env::var_os("CATALOG_GENUINE_QUALIFICATION_OUTPUT")
+            .expect("explicit new output required"),
+    );
+    assert!(handoff.is_absolute() && output.is_absolute());
+    assert!(!output.exists(), "never replace prior output");
+    assert_eq!(
+        output.parent().unwrap().canonicalize().unwrap(),
+        output.parent().unwrap()
+    );
+    let parent = output.parent().unwrap().metadata().unwrap();
+    // SAFETY: geteuid has no preconditions.
+    assert_eq!(parent.uid(), unsafe { libc::geteuid() });
+    assert_eq!(parent.mode() & 0o022, 0);
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap();
+    let status = Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=all"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        status.status.success() && status.stdout.is_empty(),
+        "exact committed producer source required"
+    );
+    let identity = source_identity(&repo).unwrap();
+    let input_root = repo.join("conformance/pi-installer-release-v1");
+    let admission_bytes = fs::read(input_root.join("input-admission-v1.json")).unwrap();
+    assert_eq!(
+        format!("{:x}", Sha256::digest(&admission_bytes)),
+        "20b4402e9bedbb2c92caa2b04f4ee7552740c0c2ac2eb8c331c8e3f72f87db07"
+    );
+    let admission: serde_json::Value = serde_json::from_slice(&admission_bytes).unwrap();
+    let mut objects = BTreeMap::new();
+    for row in admission["files"].as_array().unwrap() {
+        let hash = row["sha256"].as_str().unwrap();
+        assert_eq!(row["path"], format!("objects/{hash}"));
+        let bytes = fs::read(input_root.join("public-inputs/objects").join(hash)).unwrap();
+        assert_eq!(bytes.len().to_string(), row["size_bytes"].as_str().unwrap());
+        assert_eq!(format!("{:x}", Sha256::digest(&bytes)), hash);
+        assert!(
+            objects
+                .insert(row["url"].as_str().unwrap().to_owned(), bytes)
+                .is_none()
+        );
+    }
+    let evidence: serde_json::Value = serde_json::from_slice(
+        &fs::read(input_root.join("generated/evidence-manifest-v2.json")).unwrap(),
+    )
+    .unwrap();
+    for row in evidence["derived_inputs"].as_array().unwrap() {
+        assert_eq!(row["path"], "derived-node-checksums.txt");
+        let bytes = fs::read(input_root.join("generated/derived-node-checksums.txt")).unwrap();
+        assert_eq!(bytes.len().to_string(), row["size_bytes"].as_str().unwrap());
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&bytes)),
+            row["sha256"].as_str().unwrap()
+        );
+        assert!(
+            objects
+                .insert(row["url"].as_str().unwrap().to_owned(), bytes)
+                .is_none()
+        );
+    }
+    let intent_bytes =
+        fs::read(input_root.join("generated/initial-release-intent-v2.json")).unwrap();
+    let inputs_bytes =
+        fs::read(input_root.join("generated/package-input-manifest-v2.json")).unwrap();
+    assert_eq!(
+        format!("{:x}", Sha256::digest(&intent_bytes)),
+        evidence["intent_sha256"].as_str().unwrap()
+    );
+    assert_eq!(
+        format!("{:x}", Sha256::digest(&inputs_bytes)),
+        evidence["package_inputs_sha256"].as_str().unwrap()
+    );
+    let intent = catalog_core::PiReleaseIntentV2::from_json(&intent_bytes).unwrap();
+    let inputs = catalog_acquire::PackageInputManifestV2::from_json(&inputs_bytes).unwrap();
+    let qualification_bytes = fs::read(handoff.join("qualification-v1.json")).unwrap();
+    let qualification =
+        catalog_core::PiReleaseQualificationV1::from_json(&qualification_bytes).unwrap();
+    catalog_core::verify_pi_release_qualification(intent.profile(), &qualification).unwrap();
+    fs::create_dir(&output).unwrap();
+    fs::set_permissions(&output, fs::Permissions::from_mode(0o700)).unwrap();
+    let cache = output.join("cache");
+    fs::create_dir(&cache).unwrap();
+    fs::set_permissions(&cache, fs::Permissions::from_mode(0o700)).unwrap();
+    let transport = RetainedPublicData(objects);
+    catalog_acquire::acquire_installer_release_with_transport(
+        catalog_acquire::AcquireInstallerReleaseRequest {
+            source: catalog_acquire::AcquireInstallerReleaseSource::Intent {
+                intent: intent.clone(),
+            },
+            package_inputs: inputs.clone(),
+            cache_root: cache.clone(),
+            output: output.join("candidate"),
+            cancellation: catalog_acquire::AcquisitionCancellation::new(),
+        },
+        &transport,
+    )
+    .unwrap();
+    let state = WizardState {
+        schema_version: 2,
+        sequence: intent.sequence(),
+        pi_version: intent.profile().pi_package().version().as_str().into(),
+        node_version: intent.profile().node_version().as_str().into(),
+        target: intent.profile().target().as_str().into(),
+        mode: RunMode::DryRun,
+        phase: ReleasePhase::AwaitingQualification,
+        signing_key_generation: 2,
+        catalog_source_commit: identity.0.clone(),
+        catalog_source_tree_sha256: identity.1.clone(),
+        work_dir: output.clone(),
+    };
+    fs::write(output.join("intent.json"), &intent_bytes).unwrap();
+    crate::qualification::export_request(
+        &state,
+        &output.join("candidate"),
+        &output.join("qualification-request"),
+    )
+    .unwrap();
+    crate::qualification::verify_existing_request(
+        &state,
+        &output.join("candidate"),
+        &output.join("qualification-request"),
+    )
+    .unwrap();
+    crate::qualification::import_handoff(&state, &handoff, production_keyring().sha256()).unwrap();
+    let source_path = build_installer_catalog_source(&state).unwrap();
+    let source = catalog_core::CatalogSourceV2::from_json(&fs::read(source_path).unwrap()).unwrap();
+    let verified = catalog_acquire::acquire_installer_release_with_transport(
+        catalog_acquire::AcquireInstallerReleaseRequest {
+            source: catalog_acquire::AcquireInstallerReleaseSource::Final {
+                source: Box::new(source),
+                qualification_bytes,
+                source_commit: identity.0.clone(),
+                source_tree_sha256: identity.1.clone(),
+            },
+            package_inputs: inputs,
+            cache_root: cache,
+            output: output.join("unsigned-candidate"),
+            cancellation: catalog_acquire::AcquisitionCancellation::new(),
+        },
+        &transport,
+    )
+    .unwrap();
+    assert_eq!(source_identity(&repo).unwrap(), identity);
+    assert!(verified.objects().len() > 100);
+    let retained =
+        catalog_acquire::verify_transferred_bundle(&output.join("unsigned-candidate")).unwrap();
+    println!("unsigned genuine candidate {}", retained.bundle_sha256());
+}

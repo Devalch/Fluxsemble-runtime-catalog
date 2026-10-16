@@ -171,7 +171,10 @@ fn selector_allows(value: &Value, target: &str) -> Result<bool, AcquireError> {
         .iter()
         .filter(|value| !value.starts_with('!'))
         .collect::<Vec<_>>();
-    Ok(positives.is_empty() || positives.iter().any(|value| **value == target))
+    Ok(positives.is_empty()
+        || positives
+            .iter()
+            .any(|value| **value == target || **value == "any"))
 }
 
 pub fn parse_json_object(bytes: &[u8], maximum: usize) -> Result<Map<String, Value>, AcquireError> {
@@ -296,5 +299,21 @@ impl<'de> de::Visitor<'de> for NoDuplicateVisitor {
             map.next_value::<NoDuplicates>()?;
         }
         Ok(NoDuplicates)
+    }
+}
+
+#[cfg(test)]
+mod selector_tests {
+    use super::*;
+    #[test]
+    fn npm_any_selector_preserves_explicit_exclusion() {
+        for target in ["linux", "x64", "glibc"] {
+            assert!(selector_allows(&serde_json::json!(["any"]), target).unwrap());
+            assert!(
+                !selector_allows(&serde_json::json!(["any", format!("!{target}")]), target)
+                    .unwrap()
+            );
+            assert!(!selector_allows(&serde_json::json!(["other"]), target).unwrap());
+        }
     }
 }

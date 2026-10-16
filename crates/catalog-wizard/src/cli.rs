@@ -77,7 +77,7 @@ catalog-wizard resume [options]
 Continue an interrupted release.
 
 Options:
-  --qualification <path>  Supply a returned Fluxsemble qualification handoff.
+  --qualification <path>  Supply exact final-profile qualification and verified consumer build.
   --config <path>         Use a specific wizard config file.
   -h, --help              Show this help.
 ";

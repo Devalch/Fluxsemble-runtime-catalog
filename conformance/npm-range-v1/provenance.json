@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "kind": "immutable-public-npm-conformance-data",
+  "oracle_package": {
+    "archive_sha256": "d85045d4300d7d57c891336b95df532e73f34c22ffcd222452b6d08b9d127d5d",
+    "locator": "node_modules/semver",
+    "name": "semver",
+    "registry_integrity": "sha512-Y7/KDsb8LjooZpwaqGyulO6DQlksgCncchHGk+sZIY4SBvUocMBEFH5Ur1fI4dV+Jvl0w6cjvucaIi40puRioA==",
+    "resolved_url": "https://registry.npmjs.org/semver/-/semver-7.8.5.tgz",
+    "version": "7.8.5"
+  },
+  "vector_sha256": "28575090e39101ce453f330ac240e9a221fdc58b38f5dddbde993edbcdedd546",
+  "vector_count": 61,
+  "meaning": "Expected npm semver.satisfies results; unsupported workspace grammar rejects. Synthetic versions are not Pi release evidence. Offline oracle uses exact retained public package archive."
+}

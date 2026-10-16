@@ -1,0 +1,310 @@
+{
+  "schema_version": 1,
+  "vectors": [
+    {
+      "version": "2.1.3-alpha",
+      "range": ">=2.1.3-alpha 2.1",
+      "accepts": true
+    },
+    {
+      "version": "2.1.3-alpha",
+      "range": ">=2.1.3-alpha 2.1.x",
+      "accepts": true
+    },
+    {
+      "version": "2.1.3-alpha",
+      "range": ">=2.1.3-alpha 2.X",
+      "accepts": true
+    },
+    {
+      "version": "2.1.3-alpha",
+      "range": ">=2.1.3-alpha >=2.1",
+      "accepts": true
+    },
+    {
+      "version": "2.1.3-alpha",
+      "range": ">=2.1.3-alpha <=2.1",
+      "accepts": true
+    },
+    {
+      "version": "2.1.3-alpha",
+      "range": ">=2.1.3-alpha >2.0",
+      "accepts": true
+    },
+    {
+      "version": "2.1.3-alpha",
+      "range": ">=2.1.3-alpha <2.2",
+      "accepts": true
+    },
+    {
+      "version": "2.1.3-alpha",
+      "range": ">=2.1.3-alpha ^2.1",
+      "accepts": true
+    },
+    {
+      "version": "2.1.3-alpha",
+      "range": ">=2.1.3-alpha ~2.1",
+      "accepts": true
+    },
+    {
+      "version": "2.1.3-alpha",
+      "range": ">=2.1.3-alpha ^2.1.0",
+      "accepts": true
+    },
+    {
+      "version": "2.1.3-alpha",
+      "range": ">=2.1.3-alpha ~2.1.0",
+      "accepts": true
+    },
+    {
+      "version": "2.1.3-alpha",
+      "range": ">=2.1.3-alpha *",
+      "accepts": true
+    },
+    {
+      "version": "2.1.3-alpha",
+      "range": ">=2.1.3-alpha ^*",
+      "accepts": true
+    },
+    {
+      "version": "2.1.3-alpha",
+      "range": ">=2.1.3-alpha ~*",
+      "accepts": true
+    },
+    {
+      "version": "2.1.3-alpha",
+      "range": "2.1 || >=2.1.3-alpha 2.1",
+      "accepts": true
+    },
+    {
+      "version": "2.1.3-alpha",
+      "range": "2.1",
+      "accepts": false
+    },
+    {
+      "version": "2.1.3-alpha",
+      "range": ">=2.1.3-alpha >2.1",
+      "accepts": false
+    },
+    {
+      "version": "2.1.3-alpha",
+      "range": ">=2.1.3-alpha <2.1",
+      "accepts": false
+    },
+    {
+      "version": "2.1.3-alpha",
+      "range": ">=2.1.3-beta 2.1",
+      "accepts": false
+    },
+    {
+      "version": "2.1.3-alpha",
+      "range": ">=2.1.3-alpha 2.2 || 3.x",
+      "accepts": false
+    },
+    {
+      "version": "2.1.3-alpha",
+      "range": ">=2.1.3-alpha 2.1 || workspace:*",
+      "accepts": false
+    },
+    {
+      "version": "2.2.0-alpha",
+      "range": ">=2.2.0-alpha 2.1",
+      "accepts": false
+    },
+    {
+      "version": "3.0.0-alpha",
+      "range": ">=3.0.0-alpha ^2",
+      "accepts": false
+    },
+    {
+      "version": "0.1.3-alpha",
+      "range": ">=0.1.3-alpha ^0.1",
+      "accepts": true
+    },
+    {
+      "version": "0.0.3-alpha",
+      "range": ">=0.0.3-alpha ^0.0",
+      "accepts": true
+    },
+    {
+      "version": "0.0.3-alpha",
+      "range": ">=0.0.3-alpha ^0.0.2",
+      "accepts": false
+    },
+    {
+      "version": "2.1.0-alpha",
+      "range": ">=2.1.0-alpha >=2.1",
+      "accepts": false
+    },
+    {
+      "version": "2.1.3-alpha",
+      "range": ">=2.1.3-alpha <=2.X",
+      "accepts": true
+    },
+    {
+      "version": "2.1.3-alpha",
+      "range": ">=2.1.3-alpha <2.1.x",
+      "accepts": false
+    },
+    {
+      "version": "2.1.3-alpha",
+      "range": ">=2.1.3-alpha >=*",
+      "accepts": true
+    },
+    {
+      "version": "2.1.3-alpha",
+      "range": ">=2.1.3-alpha >*",
+      "accepts": false
+    },
+    {
+      "version": "0.1.0-alpha",
+      "range": ">=0.1.0-alpha ^0.0",
+      "accepts": false
+    },
+    {
+      "version": "1.0.0-alpha",
+      "range": ">=1.0.0-alpha ^0",
+      "accepts": false
+    },
+    {
+      "version": "2.2.0-alpha",
+      "range": ">=2.2.0-alpha ~2.1",
+      "accepts": false
+    },
+    {
+      "version": "2.1.3-alpha",
+      "range": ">=2.1.3-alpha ~2",
+      "accepts": true
+    },
+    {
+      "version": "0.0.0-alpha",
+      "range": ">=0.0.0-alpha *",
+      "accepts": true
+    },
+    {
+      "version": "22.19.0",
+      "range": "<=22",
+      "accepts": true
+    },
+    {
+      "version": "22.99.99",
+      "range": "<=22",
+      "accepts": true
+    },
+    {
+      "version": "23.0.0",
+      "range": "<=22",
+      "accepts": false
+    },
+    {
+      "version": "22.19.9",
+      "range": "<=22.19",
+      "accepts": true
+    },
+    {
+      "version": "22.20.0",
+      "range": "<=22.19",
+      "accepts": false
+    },
+    {
+      "version": "22.19.1",
+      "range": "<=22.19.0",
+      "accepts": false
+    },
+    {
+      "version": "22.19.0",
+      "range": "<=22.19.0",
+      "accepts": true
+    },
+    {
+      "version": "21.99.99",
+      "range": "<22",
+      "accepts": true
+    },
+    {
+      "version": "22.0.0",
+      "range": "<22",
+      "accepts": false
+    },
+    {
+      "version": "22.19.0",
+      "range": ">22",
+      "accepts": false
+    },
+    {
+      "version": "23.0.0",
+      "range": ">22",
+      "accepts": true
+    },
+    {
+      "version": "22.20.0",
+      "range": ">22.19",
+      "accepts": true
+    },
+    {
+      "version": "22.19.9",
+      "range": ">22.19",
+      "accepts": false
+    },
+    {
+      "version": "2.1.3-alpha.2",
+      "range": ">=2.1.3-alpha.1 <2.1.3",
+      "accepts": true
+    },
+    {
+      "version": "2.1.3-alpha.10",
+      "range": ">=2.1.3-alpha.2 <2.1.3",
+      "accepts": true
+    },
+    {
+      "version": "2.1.3-alpha.2",
+      "range": ">=2.1.3-alpha.10 <2.1.3",
+      "accepts": false
+    },
+    {
+      "version": "2.1.3-beta",
+      "range": ">=2.1.3-alpha <2.1.3",
+      "accepts": true
+    },
+    {
+      "version": "2.1.3+build",
+      "range": "2.1.3",
+      "accepts": true
+    },
+    {
+      "version": "2.1.3-alpha",
+      "range": "2.1.3-alpha - 2.1.3",
+      "accepts": true
+    },
+    {
+      "version": "0.0.9",
+      "range": "^0.0",
+      "accepts": true
+    },
+    {
+      "version": "0.1.0",
+      "range": "^0.0",
+      "accepts": false
+    },
+    {
+      "version": "0.1.0",
+      "range": "^0",
+      "accepts": true
+    },
+    {
+      "version": "1.0.0",
+      "range": "^0",
+      "accepts": false
+    },
+    {
+      "version": "22.19.0",
+      "range": "18 || 20 || >=22",
+      "accepts": true
+    },
+    {
+      "version": "22.19.0",
+      "range": "^20.17.0 || >=22.9.0",
+      "accepts": true
+    }
+  ]
+}

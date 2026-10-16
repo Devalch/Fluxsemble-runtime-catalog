@@ -2,6 +2,12 @@
 
 This runbook describes the reviewed commands. It does **not** claim that the transport fixture, a production draft, or a production release exists.
 
+## Qualification before signing
+
+For current installer-lock releases, export the exact immutable final-profile request through `catalog-wizard`. The consumer maintainer runs its current fixed offline installer/probe and SDK owners, reusing a verified unchanged consumer build where its source, binaries and behavioral contracts still match. Import the canonical five-field `build-binding-v1.json` and complete `qualification-v1.json` using `catalog-wizard resume --qualification HANDOFF`. The producer independently replays the candidate and binds exact subject, build, contract manifest, source and public trust identity. No consumer source/runtime dependency is introduced.
+
+The Pi 1.2.0 development reference is separate from release eligibility. Missing, failing, skipped, stale or mixed evidence blocks finalization. Controlled offline receipts do not assert native/provider clearance. A prepared unsigned bundle grants no signing, publication or installation authority; the production owner still performs the separate steps below. Previous exact-v2 ceremony receipts remain historical.
+
 ## Non-negotiable stops
 
 Automation and agents stop before:

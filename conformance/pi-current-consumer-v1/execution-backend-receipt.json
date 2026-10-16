@@ -1,0 +1,130 @@
+{
+  "artifact_id": "pi-execution-backend",
+  "baseSha256": "f7892e3b06d84821f67bc98b78b75631c97c5bfb479d5c33199824ff0a26e473",
+  "bootstrapSchemaSha256": "74de38ad9860acc83b9b303ca744fb2e6a787f69746e13e5c9b36f7df8e72fcc",
+  "builderSha256": "3d4f7cf66c9a00bede90161d64ff1e8f9e7fa1f845a6ea81c03b748179b5a8a8",
+  "compilerSha256": "153e46b4657620f2baef1b4a70b4b4f275772faa5b0fb9e415697e87ebcb7fea",
+  "compilerVersion": "gcc (GCC) 16.2.1 20260819 (Red Hat 16.2.1-2)\nCopyright (C) 2026 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.",
+  "configSha256": "c2549e552fd95c06bbd1f14840304ee2114f5dbcd2c9e83ed511bb1c6c89f20a",
+  "contractVersion": 2,
+  "elfRequirements": {
+    "interpreter": "/lib64/ld-linux-x86-64.so.2",
+    "needed": [
+      "libc.so.6",
+      "libcap.so.2"
+    ],
+    "versions": [
+      "GLIBC_2.14",
+      "GLIBC_2.2.5",
+      "GLIBC_2.3",
+      "GLIBC_2.33",
+      "GLIBC_2.34",
+      "GLIBC_2.38",
+      "GLIBC_2.4",
+      "GLIBC_2.7",
+      "GLIBC_2.9"
+    ]
+  },
+  "environment": {
+    "LANG": "C",
+    "LC_ALL": "C",
+    "PATH": "/usr/bin:/bin",
+    "SOURCE_DATE_EPOCH": "1776932425",
+    "TZ": "UTC"
+  },
+  "fixtureSha256": {
+    "fluxsemble-execution-finalize.c": "8962f54ff8c23f62a747074342304cf42026c84476085453fbf24b2925f5dac2",
+    "fluxsemble-execution-finalize.h": "92b46e61835e8a270997629f35d23e8b02a7e1508e00e5a2ab170bc513363afe",
+    "fluxsemble-execution-grammar.c": "d519dbf7aa9df7e96af6b43b3e372deb765fe371dbd9cd9604e2486b24f2ee73",
+    "fluxsemble-execution-grammar.h": "fa791e5ba0145dc5aeb774d6b3d865e4819b7d94d0a122028c1e15d265238c71",
+    "fluxsemble-native-finalize.c": "c29c8cd371ad536c1028c0c36dc3c99cf64ec5049ea886a1f950ca3e9529f2c5",
+    "fluxsemble-native-finalize.h": "6a53e684a8df96b2fe1ac57c97cc4b2f7c9c18afbf85a94fb48a980487514d9c"
+  },
+  "generatedHeaderSha256": "c6708e6bde2024a68bc6d297de3d5d7698988c62858e4a0fc12576fb228bed63",
+  "inputs": [
+    {
+      "relative_path": "crates/orchestration/src/linux/pidfd/native_auth/bootstrap_schema.rs",
+      "sha256": "74de38ad9860acc83b9b303ca744fb2e6a787f69746e13e5c9b36f7df8e72fcc",
+      "size": 695
+    },
+    {
+      "relative_path": "resources/runtime-artifacts/sources/bubblewrap/source.tar.xz",
+      "sha256": "f7892e3b06d84821f67bc98b78b75631c97c5bfb479d5c33199824ff0a26e473",
+      "size": 118904
+    },
+    {
+      "relative_path": "scripts/build-native-auth-backend.py",
+      "sha256": "8672511d57827e2471b8a247e6f53638260c4b75b7c145422c44c121a8bc3f3f",
+      "size": 34374
+    },
+    {
+      "relative_path": "scripts/build-pi-execution-backend.py",
+      "sha256": "3d4f7cf66c9a00bede90161d64ff1e8f9e7fa1f845a6ea81c03b748179b5a8a8",
+      "size": 13804
+    },
+    {
+      "relative_path": "scripts/fixtures/pi-execution-backend-v1/fluxsemble-execution-finalize.c",
+      "sha256": "8962f54ff8c23f62a747074342304cf42026c84476085453fbf24b2925f5dac2",
+      "size": 12775
+    },
+    {
+      "relative_path": "scripts/fixtures/pi-execution-backend-v1/fluxsemble-execution-finalize.h",
+      "sha256": "92b46e61835e8a270997629f35d23e8b02a7e1508e00e5a2ab170bc513363afe",
+      "size": 832
+    },
+    {
+      "relative_path": "scripts/fixtures/pi-execution-backend-v1/fluxsemble-execution-grammar.c",
+      "sha256": "d519dbf7aa9df7e96af6b43b3e372deb765fe371dbd9cd9604e2486b24f2ee73",
+      "size": 10476
+    },
+    {
+      "relative_path": "scripts/fixtures/pi-execution-backend-v1/fluxsemble-execution-grammar.h",
+      "sha256": "fa791e5ba0145dc5aeb774d6b3d865e4819b7d94d0a122028c1e15d265238c71",
+      "size": 588
+    },
+    {
+      "relative_path": "scripts/fixtures/pi-execution-backend-v1/fluxsemble-native-finalize.c",
+      "sha256": "c29c8cd371ad536c1028c0c36dc3c99cf64ec5049ea886a1f950ca3e9529f2c5",
+      "size": 34321
+    },
+    {
+      "relative_path": "scripts/fixtures/pi-execution-backend-v1/fluxsemble-native-finalize.h",
+      "sha256": "6a53e684a8df96b2fe1ac57c97cc4b2f7c9c18afbf85a94fb48a980487514d9c",
+      "size": 1338
+    }
+  ],
+  "inspectorSha256": "20f4971b177980026114be33ed5ce3814aeeac3c12ba8a329b9c2ef3b42cf20f",
+  "localToolchainEvidence": "trusted-host-build-not-exhaustive",
+  "mechanismBuilderSha256": "8672511d57827e2471b8a247e6f53638260c4b75b7c145422c44c121a8bc3f3f",
+  "nativeFeasibility": "not-run",
+  "patchSha256": "6b3049a9a8639ef03f7536e3a7825dd0186e38eda3f7442c97d77970e45f88f7",
+  "payloads": [
+    {
+      "relative_path": "payloads/linux-x86_64/pi-execution-backend/bwrap",
+      "sha256": "11495a48fb5b21626bac7de8795d4a7093d30eb0c69252cad5418e3214c1a66d",
+      "size": 123680
+    }
+  ],
+  "processSettlement": "all-build-children-waited",
+  "profile": "pi-execution-backend-v1",
+  "recipeSha256": "51647ab5f495e291e2ebf62dbf00fedaf465bfa4999d4f97197a3cb585f380b2",
+  "schema_version": 1,
+  "sourceSha256": "05e2c1779bb4ee8c2f6f33cd0477b843e62cadd66c9e33efbdd5d1646a3fc925",
+  "source_archive": {
+    "relative_path": "sources/pi-execution-backend/source.tar.xz",
+    "sha256": "05e2c1779bb4ee8c2f6f33cd0477b843e62cadd66c9e33efbdd5d1646a3fc925",
+    "size": 127992
+  },
+  "status": "built-unqualified",
+  "target": "linux_x86_64",
+  "translationUnits": [
+    "bubblewrap.c",
+    "fluxsemble-execution-finalize.c",
+    "fluxsemble-native-finalize.c",
+    "fluxsemble-execution-grammar.c",
+    "bind-mount.c",
+    "network.c",
+    "utils.c"
+  ],
+  "version": "0.11.2+fluxsemble.pi-execution.3"
+}

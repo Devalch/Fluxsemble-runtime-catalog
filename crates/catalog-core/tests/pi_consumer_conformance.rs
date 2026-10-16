@@ -115,3 +115,54 @@ fn same_consumer_verifies_independent_transferred_a_and_b_qualification_bindings
         sha(supported)
     );
 }
+
+#[test]
+fn current_consumer_material_preserves_exact_backends_and_production_public_trust() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../conformance/pi-current-consumer-v1");
+    let manifest: Value =
+        serde_json::from_slice(&std::fs::read(root.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(
+        manifest["evidence_kind"],
+        "immutable-public-consumer-material-not-qualification"
+    );
+    assert_eq!(
+        manifest["artifact_set_sha256"],
+        "16d38d760f2053b512fc4dab396fd73458beb19e339e8aaa29182da2d658ebdb"
+    );
+    assert_eq!(manifest["files"].as_array().unwrap().len(), 6);
+    for row in manifest["files"].as_array().unwrap() {
+        let name = row["path"].as_str().unwrap();
+        assert!(!name.contains('/') && !name.contains(".."));
+        let bytes = std::fs::read(root.join(name)).unwrap();
+        assert_eq!(bytes.len().to_string(), row["size_bytes"].as_str().unwrap());
+        assert_eq!(sha(&bytes), row["sha256"].as_str().unwrap());
+    }
+    let read = |name| -> Value {
+        serde_json::from_slice(&std::fs::read(root.join(name)).unwrap()).unwrap()
+    };
+    let anchor = read("production-trust-anchor.json");
+    let key = catalog_core::production_keyring()
+        .verification_identity(anchor["key_id"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(
+        key.public_key_base64url(),
+        anchor["public_key_base64url"].as_str().unwrap()
+    );
+    assert_eq!(
+        sha(key.public_key_bytes()),
+        "d1a64e2d55c8e5d82fc22ef440d039396c7cca1cf6ac4e369e58ff4c91ae143a"
+    );
+    assert_eq!(
+        sha(&std::fs::read(root.join("runtime-manifest.json")).unwrap()),
+        "072c4b53f369dac914084574c1f2f1b2ddbebcde2c0bd801bcf021c8325b229d"
+    );
+    assert_eq!(
+        read("native-backend-receipt.json")["artifactSha256"],
+        "7baf3c8abb730f40656eac7a998fbecb98fcbd686bbacf8864d22830ea2b020e"
+    );
+    assert_eq!(
+        read("execution-backend-receipt.json")["payloads"][0]["sha256"],
+        "11495a48fb5b21626bac7de8795d4a7093d30eb0c69252cad5418e3214c1a66d"
+    );
+}

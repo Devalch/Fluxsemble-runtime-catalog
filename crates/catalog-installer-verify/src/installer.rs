@@ -885,26 +885,24 @@ fn npm_range_matches(range: &str, version: &str) -> Result<bool, AcquireError> {
         if terms.is_empty() {
             return Err(AcquireError::Graph);
         }
-        let normalized = if terms.len() == 3 && terms[1] == "-" {
-            let low = terms[0];
-            let high = terms[2];
-            if high.split('.').count() != 3 {
-                return Err(AcquireError::Graph);
-            }
-            format!(">={low},<={high}")
+        let mut comparators = Vec::new();
+        if terms.len() == 3 && terms[1] == "-" {
+            comparators.extend(npm_comparators(&format!(">={}", terms[0]))?);
+            comparators.extend(npm_comparators(&format!("<={}", terms[2]))?);
         } else {
-            let mut comparators = Vec::new();
-            let mut terms = terms.iter();
+            let mut terms = terms.into_iter();
             while let Some(term) = terms.next() {
-                if matches!(*term, ">" | ">=" | "<" | "<=" | "=" | "~" | "^") {
-                    let version = terms.next().ok_or(AcquireError::Graph)?;
-                    comparators.push(format!("{term}{version}"));
-                } else if term.starts_with(|c: char| c.is_ascii_digit()) {
-                    comparators.push(format!("={term}"));
+                let term = if matches!(term, ">" | ">=" | "<" | "<=" | "=" | "~" | "^") {
+                    format!("{term}{}", terms.next().ok_or(AcquireError::Graph)?)
                 } else {
-                    comparators.push((*term).to_owned());
-                }
+                    term.to_owned()
+                };
+                comparators.extend(npm_comparators(&term)?);
             }
+        }
+        let normalized = if comparators.is_empty() {
+            "*".to_owned()
+        } else {
             comparators.join(",")
         };
         let req = semver::VersionReq::parse(&normalized).map_err(|_| AcquireError::Graph)?;
@@ -913,9 +911,112 @@ fn npm_range_matches(range: &str, version: &str) -> Result<bool, AcquireError> {
     Ok(matched)
 }
 
+// Expand npm's partial/x/caret/tilde intervals before semver's prerelease
+// admission rule sees the whole comparator set. Rust's partial equality and
+// caret defaults are different from npm, especially with explicit prereleases.
+fn npm_comparators(term: &str) -> Result<Vec<String>, AcquireError> {
+    use semver::Op;
+    let normalized = if term.starts_with(|c: char| c.is_ascii_digit()) {
+        format!("={term}")
+    } else {
+        term.to_owned()
+    };
+    let wildcard = normalized.trim_start_matches(['>', '<', '=', '^', '~']);
+    if matches!(wildcard, "*" | "x" | "X") {
+        return Ok(
+            if normalized.starts_with('>') && !normalized.starts_with(">=")
+                || normalized.starts_with('<') && !normalized.starts_with("<=")
+            {
+                vec!["<0.0.0-0".to_owned()]
+            } else {
+                Vec::new()
+            },
+        );
+    }
+    let c = semver::Comparator::parse(&normalized).map_err(|_| AcquireError::Graph)?;
+    let low = format!(
+        "{}.{}.{}{}",
+        c.major,
+        c.minor.unwrap_or(0),
+        c.patch.unwrap_or(0),
+        if c.pre.is_empty() {
+            String::new()
+        } else {
+            format!("-{}", c.pre)
+        }
+    );
+    let upper = |position: usize| -> Result<String, AcquireError> {
+        let mut parts = [c.major, c.minor.unwrap_or(0), c.patch.unwrap_or(0)];
+        parts[position] = parts[position].checked_add(1).ok_or(AcquireError::Graph)?;
+        for value in parts.iter_mut().skip(position + 1) {
+            *value = 0;
+        }
+        Ok(format!("{}.{}.{}", parts[0], parts[1], parts[2]))
+    };
+    let partial = if c.minor.is_none() {
+        Some(0)
+    } else if c.patch.is_none() {
+        Some(1)
+    } else {
+        None
+    };
+    Ok(match c.op {
+        Op::Caret => {
+            let position = if c.major != 0 || c.minor.is_none() {
+                0
+            } else if c.minor != Some(0) || c.patch.is_none() {
+                1
+            } else {
+                2
+            };
+            vec![format!(">={low}"), format!("<{}-0", upper(position)?)]
+        }
+        Op::Tilde => vec![
+            format!(">={low}"),
+            format!("<{}-0", upper(if c.minor.is_none() { 0 } else { 1 })?),
+        ],
+        Op::Exact | Op::Wildcard if partial.is_some() => vec![
+            format!(">={low}"),
+            format!("<{}-0", upper(partial.unwrap())?),
+        ],
+        Op::Greater if partial.is_some() => vec![format!(">={}", upper(partial.unwrap())?)],
+        Op::LessEq if partial.is_some() => vec![format!("<{}-0", upper(partial.unwrap())?)],
+        Op::Less if partial.is_some() => vec![format!("<{low}-0")],
+        Op::GreaterEq => vec![format!(">={low}")],
+        Op::Greater => vec![format!(">{low}")],
+        Op::Less => vec![format!("<{low}")],
+        Op::LessEq => vec![format!("<={low}")],
+        Op::Exact => vec![format!("={low}")],
+        _ => return Err(AcquireError::Graph),
+    })
+}
+
 #[cfg(test)]
 mod range_tests {
     use super::*;
+    #[test]
+    fn immutable_npm_range_vectors_match_the_public_oracle() {
+        let bytes = include_bytes!("../../../conformance/npm-range-v1/vectors.json");
+        assert_eq!(
+            sha256(bytes),
+            "28575090e39101ce453f330ac240e9a221fdc58b38f5dddbde993edbcdedd546"
+        );
+        let data: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+        let vectors = data["vectors"].as_array().unwrap();
+        assert_eq!(vectors.len(), 61);
+        for vector in vectors {
+            assert_eq!(
+                npm_range_matches(
+                    vector["range"].as_str().unwrap(),
+                    vector["version"].as_str().unwrap()
+                )
+                .unwrap_or(false),
+                vector["accepts"].as_bool().unwrap(),
+                "{vector}"
+            );
+        }
+    }
+
     #[test]
     fn npm_bare_versions_and_partial_versions_are_not_caret_ranges() {
         assert!(!npm_range_matches("22.0.0", "22.19.0").unwrap());

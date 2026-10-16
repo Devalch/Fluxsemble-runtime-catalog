@@ -1,0 +1,129 @@
+{
+  "schema_version": 1,
+  "artifact_id": "pi-execution",
+  "version": "0.1.0",
+  "target": "any",
+  "toolchain": {
+    "node": "v22.23.1",
+    "archive": "GNU tar ustar mtime=0 uid=0 gid=0 mode=0444; xz -9 threads=1 crc64"
+  },
+  "inputs": [
+    {
+      "relative_path": "LICENSE",
+      "size": 1080,
+      "sha256": "af21d256e3f8a5f0a655bc2e677bec85509cb9939208739c2d9fee06cf8bc69c"
+    },
+    {
+      "relative_path": "integrations/pi-execution/src/bootstrap.mjs",
+      "size": 2986,
+      "sha256": "3c3f3b094ce9eaa006fa209e74db953f4d1fb3bf73fbc40e0d0f5bac2027920b"
+    },
+    {
+      "relative_path": "integrations/pi-execution/src/entry.mjs",
+      "size": 2711,
+      "sha256": "e765dcb645cb33f289fe8a3f5a9f003c442fb20ce5d93c60b01d0385eafe1263"
+    },
+    {
+      "relative_path": "integrations/pi-execution/src/events.mjs",
+      "size": 7568,
+      "sha256": "1e948004ce3af5287d16e8a4286b47e88f5ba3e8cf91dfd556acba3e84d78e7a"
+    },
+    {
+      "relative_path": "integrations/pi-execution/src/generated/bounds.mjs",
+      "size": 3013,
+      "sha256": "4274989a1b843abcaea33e99c09d2ccdb493f2b81347e724cd3cda7ea50b570a"
+    },
+    {
+      "relative_path": "integrations/pi-execution/src/generated/wire-contract.json",
+      "size": 24495,
+      "sha256": "1e54130e8c77947bcf7b7d7e35e9704d3a32e3dd9f04669c6fbd12eb938bdbff"
+    },
+    {
+      "relative_path": "integrations/pi-execution/src/resource-loader.mjs",
+      "size": 1217,
+      "sha256": "381e5bdd4b63d4f42c9ac9b53cfe2d2a7f811c80b4f20ebc2b9f5a090aea6396"
+    },
+    {
+      "relative_path": "integrations/pi-execution/src/session.mjs",
+      "size": 12881,
+      "sha256": "3bd0ee089f3ef62e91004ccfd4cf04a6709a127a821a687b5d72759153a3aea7"
+    },
+    {
+      "relative_path": "integrations/pi-execution/src/tool-proxy.mjs",
+      "size": 4526,
+      "sha256": "38c4dbb543b29ab8b5b58f2a6387b758aa6b4b62e7a09d4b6dc1d327cbbc9358"
+    },
+    {
+      "relative_path": "integrations/pi-execution/src/wire.mjs",
+      "size": 18383,
+      "sha256": "bb9bc1d35868a2e9c45bad4d1823a73476db81bd92fdd2b2b2319f74a70f9aa4"
+    },
+    {
+      "relative_path": "scripts/build-pi-execution.mjs",
+      "size": 300,
+      "sha256": "2dcad045ab069ec9cc696cbfa23894592c712db9e3baf82edd08d392cf9c52bb"
+    },
+    {
+      "relative_path": "scripts/lib/build-pi-package.mjs",
+      "size": 15163,
+      "sha256": "73d47736007dc1648912a26bccff35eabe4b44754d9c5460035654f38bfece81"
+    },
+    {
+      "relative_path": "scripts/publish-pi-execution.py",
+      "size": 32992,
+      "sha256": "a0b267e0b09d174a9f867b1b52b1af296b85aee9ddef85202587366bcb9e5c4f"
+    }
+  ],
+  "payloads": [
+    {
+      "relative_path": "payloads/any/pi-execution/bootstrap.mjs",
+      "size": 2986,
+      "sha256": "3c3f3b094ce9eaa006fa209e74db953f4d1fb3bf73fbc40e0d0f5bac2027920b"
+    },
+    {
+      "relative_path": "payloads/any/pi-execution/entry.mjs",
+      "size": 2711,
+      "sha256": "e765dcb645cb33f289fe8a3f5a9f003c442fb20ce5d93c60b01d0385eafe1263"
+    },
+    {
+      "relative_path": "payloads/any/pi-execution/events.mjs",
+      "size": 7568,
+      "sha256": "1e948004ce3af5287d16e8a4286b47e88f5ba3e8cf91dfd556acba3e84d78e7a"
+    },
+    {
+      "relative_path": "payloads/any/pi-execution/generated/bounds.mjs",
+      "size": 3013,
+      "sha256": "4274989a1b843abcaea33e99c09d2ccdb493f2b81347e724cd3cda7ea50b570a"
+    },
+    {
+      "relative_path": "payloads/any/pi-execution/generated/wire-contract.json",
+      "size": 24495,
+      "sha256": "1e54130e8c77947bcf7b7d7e35e9704d3a32e3dd9f04669c6fbd12eb938bdbff"
+    },
+    {
+      "relative_path": "payloads/any/pi-execution/resource-loader.mjs",
+      "size": 1217,
+      "sha256": "381e5bdd4b63d4f42c9ac9b53cfe2d2a7f811c80b4f20ebc2b9f5a090aea6396"
+    },
+    {
+      "relative_path": "payloads/any/pi-execution/session.mjs",
+      "size": 12881,
+      "sha256": "3bd0ee089f3ef62e91004ccfd4cf04a6709a127a821a687b5d72759153a3aea7"
+    },
+    {
+      "relative_path": "payloads/any/pi-execution/tool-proxy.mjs",
+      "size": 4526,
+      "sha256": "38c4dbb543b29ab8b5b58f2a6387b758aa6b4b62e7a09d4b6dc1d327cbbc9358"
+    },
+    {
+      "relative_path": "payloads/any/pi-execution/wire.mjs",
+      "size": 18383,
+      "sha256": "bb9bc1d35868a2e9c45bad4d1823a73476db81bd92fdd2b2b2319f74a70f9aa4"
+    }
+  ],
+  "source_archive": {
+    "relative_path": "sources/pi-execution/source.tar.xz",
+    "size": 28500,
+    "sha256": "cea897c094882f188dac7af86f5d8018d9ee4136eebae9fb4949a667db853edc"
+  }
+}

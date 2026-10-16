@@ -2789,7 +2789,9 @@ def support_separation_errors(
 MAX_GIT_LISTING_BYTES = 8 * 1024 * 1024
 MAX_GIT_RECORD_BYTES = 16 * 1024
 MAX_TRACKED_ENTRIES = 4096
-MAX_TRACKED_BLOB_BYTES = 8 * 1024 * 1024
+# The retained public Node archive is 30,479,988 bytes. Keep every indexed
+# blob in the streamed support-separation scan, within the same total budget.
+MAX_TRACKED_BLOB_BYTES = 32 * 1024 * 1024
 MAX_TOTAL_TRACKED_BLOB_BYTES = 64 * 1024 * 1024
 EXPECTED_INDEX_MODES = frozenset((b"100644", b"100755"))
 HEX_BYTES = frozenset(b"0123456789abcdef")
@@ -2982,6 +2984,27 @@ def index_authority_regression(reader):
         errors.append("parameterized support predicate accepted the staged identity")
     return errors
 
+
+# Exercise both resource limits against actual indexed Git objects. A larger
+# per-object budget must not turn either limit into an exemption.
+with tempfile.TemporaryDirectory(prefix="catalog-boundary-budget-") as temporary:
+    repository = Path(temporary)
+    subprocess.run(["git", "init", "--quiet", temporary], check=True)
+    def put_blob(data):
+        return subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=repository,
+            input=data, check=True, stdout=subprocess.PIPE).stdout.strip()
+    small = put_blob(b"bounded scan regression")
+    oversized = put_blob(b"x" * (MAX_TRACKED_BLOB_BYTES + 1))
+    for object_id, total, message in [
+        (oversized, 0, "indexed blob exceeds byte bound"),
+        (small, MAX_TOTAL_TRACKED_BLOB_BYTES, "indexed blobs exceed aggregate byte bound"),
+    ]:
+        try:
+            indexed_blob_identity(repository, object_id, total)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(message)
 
 regression_errors = index_authority_regression(tracked_regular_identities)
 if regression_errors:
