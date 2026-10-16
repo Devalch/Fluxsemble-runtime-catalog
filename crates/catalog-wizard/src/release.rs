@@ -3162,6 +3162,10 @@ fn genuine_offline_qualification_handoff_prepares_unsigned_candidate() {
     crate::qualification::import_handoff(&state, &handoff, production_keyring().sha256()).unwrap();
     let source_path = build_installer_catalog_source(&state).unwrap();
     let source = catalog_core::CatalogSourceV2::from_json(&fs::read(source_path).unwrap()).unwrap();
+    // Each original acquisition owns a fresh extracted-object cache.
+    let final_cache = output.join("final-cache");
+    fs::create_dir(&final_cache).unwrap();
+    fs::set_permissions(&final_cache, fs::Permissions::from_mode(0o700)).unwrap();
     let verified = catalog_acquire::acquire_installer_release_with_transport(
         catalog_acquire::AcquireInstallerReleaseRequest {
             source: catalog_acquire::AcquireInstallerReleaseSource::Final {
@@ -3171,7 +3175,7 @@ fn genuine_offline_qualification_handoff_prepares_unsigned_candidate() {
                 source_tree_sha256: identity.1.clone(),
             },
             package_inputs: inputs,
-            cache_root: cache,
+            cache_root: final_cache,
             output: output.join("unsigned-candidate"),
             cancellation: catalog_acquire::AcquisitionCancellation::new(),
         },
