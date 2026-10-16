@@ -1,0 +1,18 @@
+[
+  { "path": "", "field": "command", "value": "/bin/sh" },
+  { "path": "/providers/0", "field": "args", "value": ["--unsafe"] },
+  { "path": "/providers/0", "field": "environment", "value": { "TOKEN": "secret" } },
+  { "path": "/providers/0/releases/0", "field": "cwd", "value": "/tmp" },
+  { "path": "/providers/0/releases/0", "field": "destination", "value": "/opt/pi" },
+  { "path": "/providers/0/releases/0", "field": "script", "value": "curl example" },
+  { "path": "/providers/0/releases/0", "field": "hook", "value": "postinstall" },
+  { "path": "/providers/0/releases/0", "field": "provider_code", "value": "fn install() {}" },
+  { "path": "/providers/0/releases/0", "field": "trust_key", "value": "attacker-key" },
+  { "path": "/providers/0/releases/0", "field": "sandbox_policy", "value": { "network": true } },
+  { "path": "/providers/0/releases/0", "field": "executable_recipe", "value": { "program": "npm" } },
+  { "path": "/providers/0/releases/0/provider_extension/metadata", "field": "bridge_hash", "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+  { "path": "/providers/0/releases/0/provider_extension/metadata", "field": "helper_hash", "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+  { "path": "/providers/0/releases/0/provider_extension/metadata", "field": "executable_arguments", "value": ["ci"] },
+  { "path": "/providers/0/releases/0/provider_extension/metadata", "field": "installer_behavior", "value": "npm_ci" },
+  { "path": "/providers/0/releases/0/provider_extension/metadata", "field": "pi_dependency", "value": { "name": "@earendil-works/pi-coding-agent", "version": "0.83.0" } }
+]

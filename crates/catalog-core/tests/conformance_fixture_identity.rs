@@ -17,13 +17,11 @@ const OLD_PRODUCER_PUBLIC_KEY: [u8; 32] = [
     0x1b, 0xae, 0x44, 0xc0, 0xef, 0x69, 0x17, 0x62, 0x8e, 0xd6, 0xaf, 0xe1, 0x6a, 0xae, 0x44, 0xa9,
 ];
 
-const INITIAL_ENVELOPE: &[u8] =
-    include_bytes!("../../../conformance/catalog-v1/initial-exact-candidate-envelope.json");
 const VALID_ENVELOPE: &[u8] = include_bytes!("../../../conformance/catalog-v1/valid-envelope.json");
 
 #[test]
 fn conformance_envelopes_use_the_shared_flux_fixture_identity() {
-    for envelope in [INITIAL_ENVELOPE, VALID_ENVELOPE] {
+    for envelope in [VALID_ENVELOPE] {
         verify_fixture_signed_catalog(envelope).expect("producer fixture verifier");
         verify_with_pinned_identity(envelope, FIXTURE_KEY_ID, &FLUX_FIXTURE_PUBLIC_KEY)
             .expect("independent Flux-pinned verifier");

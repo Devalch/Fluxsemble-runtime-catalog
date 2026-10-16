@@ -421,5 +421,27 @@ class ResourceBoundTests(unittest.TestCase):
             )
 
 
+class InstallerPublicInputEvidence(unittest.TestCase):
+    def test_current_admitted_input_generation_and_identity_refusal(self):
+        root = SCRIPT.parents[1] / 'conformance/pi-installer-release-v1'
+        admission = root / 'input-admission-v1.json'
+        identity = (63555, '20b4402e9bedbb2c92caa2b04f4ee7552740c0c2ac2eb8c331c8e3f72f87db07')
+        result = GENERATOR.derive_installer_evidence(admission, *identity, root / 'public-inputs')
+        self.assertEqual(result['intent']['schema_version'], 2)
+        self.assertEqual(result['package_inputs']['schema_version'], 2)
+        self.assertEqual(len(result['package_inputs']['locked_packages']), len(result['intent']['profile']['locked_packages']))
+        self.assertEqual(result['evidence']['evidence_kind'], 'immutable-public-inputs-not-qualification')
+        self.assertTrue(result['node_checksums'].endswith(b'\n'))
+        self.assertFalse(result['node_checksums'].endswith(b'\n\n'))
+        self.assertTrue(all(b'  ' in line for line in result['node_checksums'].splitlines()))
+        for key, name in [('intent', 'initial-release-intent-v2.json'),
+                          ('package_inputs', 'package-input-manifest-v2.json'),
+                          ('evidence', 'evidence-manifest-v2.json')]:
+            self.assertEqual(GENERATOR.canonical(result[key]), (root / 'generated' / name).read_bytes())
+        self.assertEqual(result['node_checksums'], (root / 'generated/derived-node-checksums.txt').read_bytes())
+        with self.assertRaises(ValueError):
+            GENERATOR.derive_installer_evidence(admission, identity[0], '0' * 64, root / 'public-inputs')
+
+
 if __name__ == "__main__":
     unittest.main()

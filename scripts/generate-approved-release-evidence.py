@@ -13,6 +13,7 @@ import stat
 import tarfile
 import tempfile
 import zlib
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable
 
@@ -651,6 +652,48 @@ def _validate_yielded_member(
     return padded_end
 
 
+@contextmanager
+def _validated_archive_members(archive_bytes, archive_label, maximum_expanded_bytes,
+                               maximum_member_bytes, maximum_members):
+    """The sole bounded tar owner, shared by exact extraction and observation."""
+    if (not 0 < len(archive_bytes) <= MAX_ARCHIVE_INPUT_BYTES
+            or not 0 < maximum_expanded_bytes <= MAX_ARCHIVE_EXPANDED_BYTES
+            or not 0 < maximum_member_bytes <= MAX_ARCHIVE_MEMBER_BYTES
+            or not 0 < maximum_members <= MAX_ARCHIVE_MEMBERS):
+        raise ValueError('archive bounds')
+    expanded, expanded_size = _decompress_archive_to_temporary(
+        archive_bytes, archive_label, maximum_expanded_bytes
+    )
+    with expanded:
+        _validate_raw_tar_placement(
+            expanded,
+            expanded_size,
+            maximum_expanded_bytes,
+            maximum_member_bytes,
+            maximum_members,
+            archive_label,
+        )
+        expanded.seek(0)
+        with tarfile.open(fileobj=expanded, mode="r:") as opened:
+            members = []
+            member_count = 0
+            previous_padded_end = 0
+            for member in opened:
+                member_count += 1
+                if member_count > maximum_members:
+                    raise ValueError(f"archive member bound exceeded: {archive_label}")
+                previous_padded_end = _validate_yielded_member(
+                    member,
+                    previous_padded_end,
+                    expanded_size,
+                    maximum_expanded_bytes,
+                    maximum_member_bytes,
+                    archive_label,
+                )
+                members.append(member)
+            yield opened, members
+
+
 def require_regular_member(
     archive_bytes: bytes,
     archive_label: str,
@@ -675,53 +718,24 @@ def require_regular_member(
         or not 0 < maximum_members <= MAX_ARCHIVE_MEMBERS
     ):
         raise ValueError(f"authenticated archive mismatch: {archive_label}")
-    expanded, expanded_size = _decompress_archive_to_temporary(
-        archive_bytes, archive_label, maximum_expanded_bytes
-    )
-    with expanded:
-        _validate_raw_tar_placement(
-            expanded,
-            expanded_size,
-            maximum_expanded_bytes,
-            maximum_member_bytes,
-            maximum_members,
-            archive_label,
-        )
-        expanded.seek(0)
-        with tarfile.open(fileobj=expanded, mode="r:") as opened:
-            matched = None
-            member_count = 0
-            previous_padded_end = 0
-            for member in opened:
-                member_count += 1
-                if member_count > maximum_members:
-                    raise ValueError(f"archive member bound exceeded: {archive_label}")
-                previous_padded_end = _validate_yielded_member(
-                    member,
-                    previous_padded_end,
-                    expanded_size,
-                    maximum_expanded_bytes,
-                    maximum_member_bytes,
-                    archive_label,
-                )
-                if member.name == member_name:
-                    if matched is not None:
-                        raise ValueError(f"required archive member is not unique: {member_name}")
-                    matched = member
-            if matched is None:
-                raise ValueError(f"required archive member is not unique: {member_name}")
-            if (
-                not matched.isfile()
-                or matched.issym()
-                or matched.islnk()
-                or matched.size != expected_member_size
-            ):
-                raise ValueError(f"required archive member is not regular: {member_name}")
-            extracted = opened.extractfile(matched)
-            if extracted is None:
-                raise ValueError(f"required archive member cannot be read: {member_name}")
-            data = extracted.read(expected_member_size)
-            probe = extracted.read(1)
+    with _validated_archive_members(archive_bytes, archive_label, maximum_expanded_bytes,
+                                    maximum_member_bytes, maximum_members) as (opened, members):
+        matches = [member for member in members if member.name == member_name]
+        if len(matches) != 1:
+            raise ValueError(f"required archive member is not unique: {member_name}")
+        matched = matches[0]
+        if (
+            not matched.isfile()
+            or matched.issym()
+            or matched.islnk()
+            or matched.size != expected_member_size
+        ):
+            raise ValueError(f"required archive member is not regular: {member_name}")
+        extracted = opened.extractfile(matched)
+        if extracted is None:
+            raise ValueError(f"required archive member cannot be read: {member_name}")
+        data = extracted.read(expected_member_size)
+        probe = extracted.read(1)
     if (
         len(data) != expected_member_size
         or probe
@@ -1005,6 +1019,189 @@ def derive_intent(package_input: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _current_fields(value, names, label):
+    if not isinstance(value, dict) or set(value) != set(names):
+        raise ValueError(f'{label}: unknown or missing fields')
+
+
+def _current_descriptor(record):
+    return {key: record[key] for key in ('url', 'size_bytes', 'sha256')}
+
+
+def _current_archive_declaration(raw, label, expected_name, expected_version):
+    with _validated_archive_members(raw, label, MAX_ARCHIVE_EXPANDED_BYTES,
+                                    MAX_ARCHIVE_MEMBER_BYTES, MAX_ARCHIVE_MEMBERS) as (archive, members):
+        declarations = [member for member in members
+                        if len(member.name.split('/')) == 2 and member.name.endswith('/package.json')]
+        if len(declarations) != 1:
+            raise ValueError('package declaration not unique')
+        member = declarations[0]
+        if not member.isfile() or member.size <= 0 or member.size > MAX_SMALL_INPUT_BYTES:
+            raise ValueError('package declaration type/bound')
+        stream = archive.extractfile(member)
+        if stream is None:
+            raise ValueError('package declaration unreadable')
+        data = stream.read(member.size + 1)
+        if len(data) != member.size:
+            raise ValueError('package declaration length')
+        count = len(members)
+    declaration = parse_unique_object(data, label)
+    if declaration.get('name') != expected_name or declaration.get('version') != expected_version:
+        raise ValueError('package declaration identity')
+    return declaration, data, count
+
+
+def _current_pruning(declaration, locked):
+    reasons = []
+    for source, value in [('declaration', declaration), ('lock', locked)]:
+        for key, target in [('cpu', 'x64'), ('libc', 'glibc'), ('os', 'linux')]:
+            if key not in value:
+                continue
+            values = value[key] if isinstance(value[key], list) else [value[key]]
+            if not values or not all(isinstance(item, str) and item for item in values):
+                raise ValueError('platform selector shape')
+            positives = [item for item in values if not item.startswith('!')]
+            if '!' + target in values or (positives and target not in positives):
+                reasons.append(source + '.' + key)
+    return sorted(reasons)
+
+
+def derive_installer_evidence(admission_path, admission_size, admission_sha256, input_root):
+    """Inert current records from explicitly admitted public DATA, never qualification.
+
+    The independent Rust integration rederives and verifies the full graph through
+    catalog-installer-verify. No source code or executable is imported from Fluxsemble.
+    """
+    admission_raw = read_authenticated_absolute(admission_path, expected_size=admission_size,
+        expected_sha256=admission_sha256, maximum_size=MAX_SMALL_INPUT_BYTES)
+    admission = parse_unique_object(admission_raw, 'public input admission')
+    _current_fields(admission, ['schema_version', 'evidence_kind', 'origin_corpus_sha256',
+                               'source_profile', 'request', 'files'], 'public input admission')
+    if admission['schema_version'] != 1 or admission['evidence_kind'] != 'immutable-public-input-transfer-not-qualification':
+        raise ValueError('public input admission kind')
+    rows = admission['files']
+    if not isinstance(rows, list) or not 1 <= len(rows) <= 1024:
+        raise ValueError('public input inventory bound')
+    sources, total = {}, 0
+    with AuthenticatedInputRoot.open(input_root) as root:
+        for row in rows:
+            _current_fields(row, ['path', 'url', 'size_bytes', 'sha256', 'role', 'origin'], 'public input record')
+            size = int(row['size_bytes'])
+            if str(size) != row['size_bytes'] or not 0 < size <= MAX_ARCHIVE_INPUT_BYTES:
+                raise ValueError('public input size')
+            total += size
+            if total > 2 * 1024 * 1024 * 1024 or row['url'] in sources:
+                raise ValueError('public input total or duplicate URL')
+            raw = root.read_file(row['path'], expected_size=size, expected_sha256=row['sha256'],
+                                 maximum_size=MAX_ARCHIVE_INPUT_BYTES)
+            sources[row['url']] = (row, raw)
+    profile_row, profile_raw = sources['urn:fluxsemble:retained-release-profile']
+    if {key: profile_row[key] for key in ('path','size_bytes','sha256')} != admission['source_profile']:
+        raise ValueError('source profile binding')
+    profile = parse_unique_object(profile_raw, 'source release profile')
+    if profile.get('schema_version') != 1 or not isinstance(profile.get('locked_packages'), list) or not 0 < len(profile['locked_packages']) <= 512:
+        raise ValueError('source release profile bound')
+    manifest_row, manifest_raw = sources[profile['installer_manifest']['url']]
+    lock_row, lock_raw = sources[profile['installer_lock']['url']]
+    for role, row in [('installer_manifest',manifest_row),('installer_lock',lock_row)]:
+        if _current_descriptor(row) != profile[role]:
+            raise ValueError('installer source descriptor mismatch')
+    manifest = parse_unique_object(manifest_raw, 'installer manifest')
+    lock = parse_unique_object(lock_raw, 'installer lock')
+    if set(lock.get('packages', {})) != {''} | {p['locator'] for p in profile['locked_packages']}:
+        raise ValueError('exact locked graph mismatch')
+    observed, auxiliary = [], {}
+    import base64
+    from urllib.parse import quote
+    for package in profile['locked_packages']:
+        row, raw = sources[package['resolved_url']]
+        if row['sha256'] != package['archive_sha256'] or 'sha512-' + base64.b64encode(hashlib.sha512(raw).digest()).decode() != package['registry_integrity']:
+            raise ValueError('package hash/integrity mismatch')
+        declaration, declaration_raw, members = _current_archive_declaration(raw,row['url'],package['name'],package['version'])
+        record = lock['packages'][package['locator']]
+        if 'integrity' not in record:
+            url = 'https://registry.npmjs.org/' + quote(package['name'],safe='') + '/' + package['version']
+            metadata_row, metadata_raw = sources[url]
+            metadata = parse_unique_object(metadata_raw, 'exact package metadata')
+            if metadata.get('name') != package['name'] or metadata.get('version') != package['version'] or metadata.get('dist',{}).get('tarball') != package['resolved_url'] or metadata['dist'].get('integrity') != package['registry_integrity']:
+                raise ValueError('metadata consensus binding')
+            auxiliary[url] = _current_descriptor(metadata_row)
+        observed.append({**{key:package[key] for key in ('locator','name','version','resolved_url','registry_integrity','archive_sha256')},
+            'archive_size':len(raw),'declaration_size':len(declaration_raw),'declaration_sha256':sha256(declaration_raw),
+            'archive_member_count':members,'pruned_reasons':_current_pruning(declaration,record)})
+        if package['locator'] == profile['pi_package_locator']:
+            pi_raw = declaration_raw
+            if sha256(pi_raw) != profile['pi_manifest']['sha256'] or declaration.get('bin',{}).get('pi') != profile['cli_entrypoint']:
+                raise ValueError('selected Pi manifest/CLI mismatch')
+    signed_url = 'https://nodejs.org/dist/v' + profile['node_version'] + '/SHASUMS256.txt.asc'
+    _, signed = sources[signed_url]
+    # Retained authenticated cleartext, not a newly observed unsigned transport.
+    prefix, body = signed.split(b'\n\n',1)
+    if not prefix.startswith(b'-----BEGIN PGP SIGNED MESSAGE-----\nHash: '):
+        raise ValueError('signed checksum framing')
+    plaintext, signature = body.split(b'-----BEGIN PGP SIGNATURE-----',1)
+    if not plaintext.endswith(b'\n') or not signature.endswith(b'-----END PGP SIGNATURE-----\n'):
+        raise ValueError('signed checksum framing')
+    # The newline immediately preceding the armor delimiter is framing, not cleartext.
+    plaintext = plaintext[:-1]
+    plaintext = b'\n'.join(line[2:] if line.startswith(b'- ') else line for line in plaintext.split(b'\n'))
+    unsigned_url = signed_url[:-4]
+    auxiliary[unsigned_url] = {'url':unsigned_url,'size_bytes':str(len(plaintext)),'sha256':sha256(plaintext)}
+    request = admission['request']
+    _current_fields(request, ['sequence','generated_at','expires_at','title','notes'], 'fixture intent request')
+    sequence = int(request['sequence'])
+    if sequence <= 0 or str(sequence) != request['sequence']:
+        raise ValueError('sequence encoding')
+    # Public role IDs and final planned support names belong to the producer owner.
+    remap = {profile['node_component_id']:'component:node',profile['pi_component_id']:'component:pi',
+             profile['node_artifact_id']:'artifact:node-linux-x86_64',profile['pi_artifact_id']:'artifact:pi-coding-agent'}
+    for component in profile['components']:
+        component['component_id'] = remap[component['component_id']]
+        for artifact in component['artifacts']:
+            artifact['artifact_id'] = remap[artifact['artifact_id']]
+    for field in ('node_component_id','pi_component_id','node_artifact_id','pi_artifact_id'):
+        profile[field] = remap[profile[field]]
+    prefix = 'https://github.com/Devalch/Fluxsemble-runtime-catalog/releases/download/catalog-v1-sequence-' + str(sequence)
+    for field, role, raw in [('installer_manifest','pi-installer-package',manifest_raw),('installer_lock','pi-installer-lock',lock_raw),('pi_manifest','pi-package',pi_raw)]:
+        profile[field] = {'url':prefix+'/'+role+'-'+sha256(raw)+'.json','size_bytes':str(len(raw)),'sha256':sha256(raw)}
+    profile_bytes = canonical(profile)
+    subject = sha256(b'fluxsemble:pi-release-subject:v1\0'+len(profile_bytes).to_bytes(8,'big')+profile_bytes)
+    intent = {'schema_version':2,**request,'tag':'catalog-v1-sequence-'+str(sequence),'profile':profile}
+    inputs = {'schema_version':2,'release_subject_sha256':subject,'installer_manifest_source':_current_descriptor(manifest_row),
+              'installer_lock_source':_current_descriptor(lock_row),'auxiliary_inputs':[auxiliary[url] for url in sorted(auxiliary)],
+              'locked_packages':observed,'pre_prune_package_count':len(observed)+1,
+              'applicable_package_count':sum(not p['pruned_reasons'] for p in observed)}
+    evidence = {'schema_version':2,'evidence_kind':'immutable-public-inputs-not-qualification',
+                'input_admission':{'size_bytes':str(admission_size),'sha256':admission_sha256},
+                'origin_corpus_sha256':admission['origin_corpus_sha256'], 'release_subject_sha256':subject,
+                'source_profile_sha256':sha256(profile_raw), 'intent_sha256':sha256(canonical(intent)),
+                'package_inputs_sha256':sha256(canonical(inputs)),
+                'derived_inputs':[{'path':'derived-node-checksums.txt',**auxiliary[unsigned_url],
+                                   'derivation':'cleartext of retained authenticated signed checksum file','source_sha256':sha256(signed)}]}
+    return {'intent':intent,'package_inputs':inputs,'evidence':evidence,'node_checksums':plaintext}
+
+
+def current_main(arguments):
+    parser = argparse.ArgumentParser(description='Generate inert installer-lock evidence from explicitly admitted C-local public DATA')
+    parser.add_argument('--input-admission',type=Path,required=True)
+    parser.add_argument('--admission-size',type=int,required=True)
+    parser.add_argument('--admission-sha256',required=True)
+    parser.add_argument('--input-root',type=Path,required=True)
+    parser.add_argument('--output',type=Path,required=True)
+    args = parser.parse_args(arguments)
+    result = derive_installer_evidence(args.input_admission,args.admission_size,args.admission_sha256,args.input_root)
+    args.output.mkdir(mode=0o700)
+    for name, data in [('initial-release-intent-v2.json',canonical(result['intent'])),
+                       ('package-input-manifest-v2.json',canonical(result['package_inputs'])),
+                       ('evidence-manifest-v2.json',canonical(result['evidence'])),
+                       ('derived-node-checksums.txt',result['node_checksums'])]:
+        with (args.output/name).open('xb') as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+    print('generated immutable installer input evidence; no qualification or signing')
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--matrix", type=Path, required=True)
@@ -1182,4 +1379,9 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    if sys.argv[1:2] == ["--historical"]:
+        del sys.argv[1]
+        main()
+    else:
+        current_main(sys.argv[1:])

@@ -220,10 +220,106 @@ def construct_candidate(root: pathlib.Path) -> bytes:
     return candidate
 
 
+def installer_input_projection(root: pathlib.Path, admission_size: int, admission_sha256: str) -> bytes:
+    """Independent inert intent projection; never constructs a qualification or signed release."""
+    def exact(path: pathlib.Path, size: int, digest: str) -> bytes:
+        if not 0 < size <= 64 * 1024 * 1024 or len(digest) != 64 or any(c not in '0123456789abcdef' for c in digest):
+            raise OracleError('input identity bounds')
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            before = os.fstat(fd)
+            if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size != size or stat.S_IMODE(before.st_mode) not in (0o600, 0o644):
+                raise OracleError('input metadata')
+            data = bytearray()
+            while len(data) <= size:
+                chunk = os.read(fd, min(1024 * 1024, size + 1 - len(data)))
+                if not chunk:
+                    break
+                data.extend(chunk)
+            after = os.fstat(fd)
+            named = path.lstat()
+            if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) or (named.st_dev, named.st_ino) != (after.st_dev, after.st_ino):
+                raise OracleError('input changed')
+            if len(data) != size or sha256(data) != digest:
+                raise OracleError('input digest')
+            return bytes(data)
+        finally:
+            os.close(fd)
+    def retained_json(data: bytes, label: str) -> Any:
+        # These explicitly admitted public DATA documents carry one terminal newline.
+        return load_json(data[:-1] if data.endswith(b'\n') else data, label)
+    root = root.absolute()
+    for directory in (root, root / 'public-inputs', root / 'public-inputs/objects'):
+        metadata = directory.lstat()
+        if not stat.S_ISDIR(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) not in (0o700, 0o755):
+            raise OracleError('input directory')
+    admission = retained_json(exact(root / 'input-admission-v1.json', admission_size, admission_sha256), 'admission')
+    if set(admission) != {'schema_version','evidence_kind','origin_corpus_sha256','request','source_profile','files'} or admission['schema_version'] != 1 or admission['evidence_kind'] != 'immutable-public-input-transfer-not-qualification':
+        raise OracleError('admission schema')
+    rows = admission['files']
+    if not isinstance(rows, list) or not 0 < len(rows) <= 1024:
+        raise OracleError('admission count')
+    objects = {}
+    total = 0
+    for row in rows:
+        if set(row) != {'path','url','role','origin','size_bytes','sha256'} or row['path'] != 'objects/' + row['sha256'] or row['url'] in objects:
+            raise OracleError('admission record')
+        size = int(row['size_bytes'])
+        if str(size) != row['size_bytes']:
+            raise OracleError('input size encoding')
+        total += size
+        if total > 2 * 1024 * 1024 * 1024:
+            raise OracleError('aggregate input bounds')
+        objects[row['url']] = (row, exact(root / 'public-inputs' / row['path'], size, row['sha256']))
+    selected = admission['source_profile']
+    if set(selected) != {'path','size_bytes','sha256'} or selected['path'] != 'objects/' + selected['sha256']:
+        raise OracleError('profile descriptor')
+    profile = retained_json(exact(root / 'public-inputs' / selected['path'], int(selected['size_bytes']), selected['sha256']), 'profile')
+    request = admission['request']
+    if set(request) != {'sequence','generated_at','expires_at','title','notes'} or str(int(request['sequence'])) != request['sequence'] or int(request['sequence']) <= 0:
+        raise OracleError('intent request')
+    # This independent projection implements only documented public role/sequence mapping.
+    roles = {profile['node_component_id']: 'component:node', profile['pi_component_id']: 'component:pi', profile['node_artifact_id']: 'artifact:node-linux-x86_64', profile['pi_artifact_id']: 'artifact:pi-coding-agent'}
+    for component in profile['components']:
+        component['component_id'] = roles[component['component_id']]
+        for artifact in component['artifacts']:
+            artifact['artifact_id'] = roles[artifact['artifact_id']]
+    for field in ('node_component_id','pi_component_id','node_artifact_id','pi_artifact_id'):
+        profile[field] = roles[profile[field]]
+    prefix = 'https://github.com/Devalch/Fluxsemble-runtime-catalog/releases/download/catalog-v1-sequence-' + request['sequence']
+    for field, role in [('installer_manifest','pi-installer-package'),('installer_lock','pi-installer-lock'),('pi_manifest','pi-package')]:
+        descriptor = profile[field]
+        if field != 'pi_manifest':
+            row, data = objects[descriptor['url']]
+            if row['sha256'] != descriptor['sha256'] or row['size_bytes'] != descriptor['size_bytes']:
+                raise OracleError('profile source binding')
+        descriptor['url'] = prefix + '/' + role + '-' + descriptor['sha256'] + '.json'
+    projected = {'schema_version': 2, **request, 'tag': 'catalog-v1-sequence-' + request['sequence'], 'profile': profile}
+    profile_bytes = canonical(profile)
+    subject = sha256(b'fluxsemble:pi-release-subject:v1\0' + len(profile_bytes).to_bytes(8, 'big') + profile_bytes)
+    return canonical({'evidence_kind': 'independent-input-projection-not-qualification', 'input_admission_sha256': admission_sha256, 'intent': projected, 'release_subject_sha256': subject})
+
+
 def main(arguments: list[str]) -> int:
-    if len(arguments) != 2:
-        print("usage: authentic-candidate-oracle.py INPUT_ROOT OUTPUT", file=sys.stderr)
+    if arguments and arguments[0] == '--installer-inputs':
+        if len(arguments) != 5:
+            print('usage: authentic-candidate-oracle.py --installer-inputs ROOT ADMISSION_SIZE ADMISSION_SHA256 OUTPUT', file=sys.stderr)
+            return 2
+        try:
+            result = installer_input_projection(pathlib.Path(arguments[1]), int(arguments[2]), arguments[3])
+            with pathlib.Path(arguments[4]).open('xb') as output:
+                output.write(result)
+                output.flush()
+                os.fsync(output.fileno())
+            print('independent inert installer projection; no qualification or signing')
+            return 0
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            print(f'installer input oracle failed: {error}', file=sys.stderr)
+            return 1
+    if len(arguments) != 3 or arguments[0] != '--historical':
+        print('usage: authentic-candidate-oracle.py --historical INPUT_ROOT OUTPUT; historical replay requires original revision/inputs', file=sys.stderr)
         return 2
+    arguments = arguments[1:]
     try:
         root = pathlib.Path(arguments[0])
         output = pathlib.Path(arguments[1])

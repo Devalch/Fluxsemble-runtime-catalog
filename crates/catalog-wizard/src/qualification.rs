@@ -1141,12 +1141,10 @@ mod tests {
             digest,
         )
         .unwrap();
-        let intent_bytes = fs::read(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../catalogs/intents/catalog-v1-sequence-1-intent.json"),
-        )
-        .unwrap();
-        let intent = InitialPiReleaseIntentV1::from_json(&intent_bytes).unwrap();
+        let intent = crate::intent::tests::synthetic_legacy_release()
+            .unwrap()
+            .intent;
+        let intent_bytes = serde_jcs::to_vec(&intent).unwrap();
         let build =
             FluxsembleBuildBindingV1::from_json(&serde_jcs::to_vec(&build_value()).unwrap())
                 .unwrap();

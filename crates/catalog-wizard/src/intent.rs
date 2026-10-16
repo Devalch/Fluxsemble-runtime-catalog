@@ -460,7 +460,7 @@ fn sha256(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{
         fs,
         os::unix::fs::{PermissionsExt, symlink},
@@ -475,7 +475,6 @@ mod tests {
     #[test]
     fn generator_writes_canonical_reopened_inputs_with_second_resolution_timestamps() {
         let root = temporary_directory();
-        let fixture_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let request = GenerateReleaseInputsRequest {
             repository_root: root.clone(),
             sequence: 1,
@@ -489,25 +488,8 @@ mod tests {
                 .unwrap(),
             validity_window: Duration::days(31),
         };
-        let generated = generate_release_inputs_with(request, |_| {
-            let intent = InitialPiReleaseIntentV1::from_json(
-                &fs::read(fixture_root.join("catalogs/intents/catalog-v1-sequence-1-intent.json"))
-                    .unwrap(),
-            )
-            .unwrap();
-            let package_inputs = PackageInputManifestV1::from_json(
-                &fs::read(
-                    fixture_root.join("catalogs/inputs/pi-0.83.0-linux-x86_64-packages-v1.json"),
-                )
-                .unwrap(),
-            )
-            .unwrap();
-            Ok(DiscoveredPiRelease {
-                intent,
-                package_inputs,
-            })
-        })
-        .unwrap();
+        let generated =
+            generate_release_inputs_with(request, |_| synthetic_legacy_release()).unwrap();
 
         assert_eq!(
             fs::read(&generated.intent_path).unwrap(),
@@ -536,7 +518,7 @@ mod tests {
                     generated_at: Utc.with_ymd_and_hms(2026, 8, 26, 0, 0, 0).unwrap(),
                     validity_window: Duration::days(31),
                 },
-                |_| fixture_release(&fixture_root),
+                |_| synthetic_legacy_release(),
             )
             .is_err()
         );
@@ -549,12 +531,9 @@ mod tests {
         let work_root = root.join(".release-work");
         fs::create_dir(&work_root).unwrap();
         fs::set_permissions(&work_root, fs::Permissions::from_mode(0o777)).unwrap();
-        let fixture_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
 
         assert_eq!(
-            generate_release_inputs_with(generator_request(&root), |_| fixture_release(
-                &fixture_root
-            )),
+            generate_release_inputs_with(generator_request(&root), |_| synthetic_legacy_release()),
             Err(WizardError::Io)
         );
         assert!(!work_root.join("sequence-1").exists());
@@ -589,19 +568,45 @@ mod tests {
         }
     }
 
-    fn fixture_release(
-        fixture_root: &Path,
-    ) -> Result<DiscoveredPiRelease, catalog_acquire::AcquireError> {
-        let intent = InitialPiReleaseIntentV1::from_json(
-            &fs::read(fixture_root.join("catalogs/intents/catalog-v1-sequence-1-intent.json"))
-                .unwrap(),
-        )
+    // Compact synthetic dormant V1 records, derived from the existing parser vector.
+    pub(crate) fn synthetic_legacy_release()
+    -> Result<DiscoveredPiRelease, catalog_acquire::AcquireError> {
+        use serde_json::{Value, json};
+        let payload: Value = serde_json::from_slice(include_bytes!(
+            "../../../conformance/catalog-v1/valid-payload.json"
+        ))
         .unwrap();
-        let package_inputs = PackageInputManifestV1::from_json(
-            &fs::read(fixture_root.join("catalogs/inputs/pi-0.83.0-linux-x86_64-packages-v1.json"))
-                .unwrap(),
-        )
-        .unwrap();
+        let release = &payload["providers"][0]["releases"][0];
+        let metadata = &release["provider_extension"]["metadata"];
+        let artifact = &release["components"][1]["artifacts"][0];
+        let intent = InitialPiReleaseIntentV1::from_json(&serde_jcs::to_vec(&json!({
+            "sequence":"1", "tag":"catalog-v1-sequence-1", "generated_at":"2026-08-26T00:00:00Z",
+            "expires_at":"2026-09-26T00:00:00Z", "fluxsemble_requirement":"=0.1.0",
+            "release":{"provider":"builtin:pi", "allowed_origins":payload["providers"][0]["allowed_origins"], "release":release}
+        })).unwrap()).unwrap();
+        let packages: Vec<Value> = metadata["shipped_shrinkwrap"]["locked_packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|package| {
+                let mut observed = package.clone();
+                let map = observed.as_object_mut().unwrap();
+                map.insert("archive_size".into(), json!(1));
+                map.insert("archive_member_count".into(), json!(1));
+                map.insert("declaration_sha256".into(), json!("d".repeat(64)));
+                map.insert("applicability".into(), json!({"kind":"applicable"}));
+                observed
+            })
+            .collect();
+        let number = |value: &Value| value.as_str().unwrap().parse::<u64>().unwrap();
+        let package_inputs = PackageInputManifestV1::from_json(&serde_jcs::to_vec(&json!({
+            "schema_version":1,"target_os":"linux","target_cpu":"x64","target_libc":"glibc",
+            "root":{"name":metadata["approved_package"]["name"],"version":metadata["approved_package"]["version"],
+                "archive_size":number(&artifact["size_bytes"]),"archive_sha256":artifact["sha256"],
+                "manifest_size":number(&metadata["root_package_manifest"]["size_bytes"]),"manifest_sha256":metadata["root_package_manifest"]["sha256"],
+                "shrinkwrap_size":number(&metadata["shipped_shrinkwrap"]["artifact"]["size_bytes"]),"shrinkwrap_sha256":metadata["shipped_shrinkwrap"]["artifact"]["sha256"],"archive_member_count":1},
+            "pre_prune_package_count":packages.len()+1,"applicable_package_count":packages.len(),"locked_packages":packages
+        })).unwrap())?;
         Ok(DiscoveredPiRelease {
             intent,
             package_inputs,

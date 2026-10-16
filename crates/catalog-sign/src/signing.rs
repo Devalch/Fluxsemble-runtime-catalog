@@ -47,13 +47,14 @@ const APPROVED_PACKAGE_INPUT_DOMAIN: &[u8] =
 #[cfg(test)]
 const APPROVED_RELEASE_SEMANTIC_DOMAIN: &[u8] =
     b"fluxsemble:runtime-catalog-approved-release-semantics:v1\0";
-// These digests are regression oracles independently rederived from committed public fixtures.
+// Test-only dormant V1 regression oracles from the existing synthetic fixture builder.
+// Current genuine installer inputs are verified independently by catalog-installer-verify.
 #[cfg(test)]
 const APPROVED_PACKAGE_INPUT_DOMAIN_SHA256: &str =
-    "04ff8560de163983621e86598c8eb6b80fabb32cfced020602c14ed45818f9ef";
+    "21a0be9199c5293c9745300836f5b6a1dfdedefbde70ac7c51e2c38a17823016";
 #[cfg(test)]
 const APPROVED_RELEASE_SEMANTIC_SHA256: &str =
-    "46116101d1ffa3b1184d14347f62478fbc3a2d609afc3ba0bf6b2505265e8441";
+    "3be8adf64dd6b687097fae3181b30d44065524f7d34badfc7e47371f3a9ee7bb";
 const ROOT_NAME: &str = "@earendil-works/pi-coding-agent";
 #[cfg(test)]
 const ROOT_VERSION: &str = "0.83.0";
@@ -61,30 +62,30 @@ const ROOT_VERSION: &str = "0.83.0";
 const ROOT_ARTIFACT_URL: &str =
     "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/pi-coding-agent-0.83.0.tgz";
 #[cfg(test)]
-const ROOT_ARTIFACT_SIZE: u64 = 4_992_066;
+const ROOT_ARTIFACT_SIZE: u64 = 15;
 #[cfg(test)]
 const ROOT_ARTIFACT_SHA256: &str =
-    "7097fe4b38762dda7ec78001e7b90430c849fbaf717325bfe8109744e32255e6";
+    "187dfd4af26fcc966f91b2f2bcd00c76804754f91a52295eac882357c36fc801";
 #[cfg(test)]
-const ROOT_REGISTRY_INTEGRITY: &str = "sha512-uYhF+FsZxogoSX/AxBcUdiY+ZklubwaXyAoEGA2eQwsHcyEAhUYIKh/WLXe/a8+k8eTCmxb+ZN2Zo9mzQtzbWw==";
+const ROOT_REGISTRY_INTEGRITY: &str = "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
 #[cfg(test)]
-const ROOT_MANIFEST_SIZE: u64 = 3_560;
+const ROOT_MANIFEST_SIZE: u64 = 18;
 #[cfg(test)]
 const ROOT_MANIFEST_SHA256: &str =
-    "e02deae1cec07035807436c1864c88342e2f7d49050d03b858a3719f0c7aedbf";
+    "c04ab18e6ea42f6580a0a9f8da5d560d5e5a5ee13c45d27263e242befa64671d";
 #[cfg(test)]
-const SHRINKWRAP_SIZE: u64 = 61_540;
+const SHRINKWRAP_SIZE: u64 = 21;
 #[cfg(test)]
-const SHRINKWRAP_SHA256: &str = "9a17a6b9ba0a57b37773644f7945b1bf0bc10aa8923b87233fee6f75af1e1772";
+const SHRINKWRAP_SHA256: &str = "2086223f909ecaf4b063cfc7e8187ab73e8e8a24ec7029d54e0403dee55a3265";
 #[cfg(test)]
 const NODE_VERSION: &str = "22.19.0";
 #[cfg(test)]
 const NODE_ARTIFACT_URL: &str = "https://nodejs.org/dist/v22.19.0/node-v22.19.0-linux-x64.tar.xz";
 #[cfg(test)]
-const NODE_ARTIFACT_SIZE: u64 = 30_479_988;
+const NODE_ARTIFACT_SIZE: u64 = 12;
 #[cfg(test)]
 const NODE_ARTIFACT_SHA256: &str =
-    "c0649af18e6a24f6fe5535a3e86b341dd49a8e71117c8b68bde973ef834f16f2";
+    "748dd86815268291e465669e48b589d8e59a00256408375fed97d268e377fc61";
 #[cfg(test)]
 const LOCKED_COUNT: usize = 139;
 #[cfg(test)]
@@ -1414,10 +1415,7 @@ fn require_approved_production_tuple(intent: &InitialPiReleaseIntentV1) -> Resul
             "/release/release/components/0/artifacts/0/url",
             NODE_ARTIFACT_URL,
         ),
-        (
-            "/release/release/components/0/artifacts/0/size_bytes",
-            "30479988",
-        ),
+        ("/release/release/components/0/artifacts/0/size_bytes", "12"),
         (
             "/release/release/components/0/artifacts/0/sha256",
             NODE_ARTIFACT_SHA256,
@@ -1432,10 +1430,7 @@ fn require_approved_production_tuple(intent: &InitialPiReleaseIntentV1) -> Resul
             "/release/release/components/1/artifacts/0/url",
             ROOT_ARTIFACT_URL,
         ),
-        (
-            "/release/release/components/1/artifacts/0/size_bytes",
-            "4992066",
-        ),
+        ("/release/release/components/1/artifacts/0/size_bytes", "15"),
         (
             "/release/release/components/1/artifacts/0/sha256",
             ROOT_ARTIFACT_SHA256,
@@ -1471,7 +1466,7 @@ fn require_approved_production_tuple(intent: &InitialPiReleaseIntentV1) -> Resul
         ),
         (
             "/release/release/provider_extension/metadata/root_package_manifest/size_bytes",
-            "3560",
+            "18",
         ),
         (
             "/release/release/provider_extension/metadata/root_package_manifest/sha256",
@@ -1491,7 +1486,7 @@ fn require_approved_production_tuple(intent: &InitialPiReleaseIntentV1) -> Resul
         ),
         (
             "/release/release/provider_extension/metadata/shipped_shrinkwrap/artifact/size_bytes",
-            "61540",
+            "21",
         ),
         (
             "/release/release/provider_extension/metadata/shipped_shrinkwrap/artifact/sha256",
@@ -3350,6 +3345,13 @@ mod tests {
     const SRI: &str = "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
     const MAX_AUTHENTIC_CORPUS_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
 
+    // Dormant V1 parser/security cases use the existing synthetic builder. These
+    // records carry no authenticated package, qualification or signing evidence.
+    static SYNTHETIC_INTENT: std::sync::LazyLock<Vec<u8>> =
+        std::sync::LazyLock::new(|| serde_jcs::to_vec(&intent_fixture().0).unwrap());
+    static SYNTHETIC_PACKAGE_INPUTS: std::sync::LazyLock<Vec<u8>> =
+        std::sync::LazyLock::new(|| intent_fixture().1);
+
     #[test]
     fn signing_directory_link_count_accepts_portable_and_conventional_values_only() {
         for conventional in [2, 3, 4, 6] {
@@ -3375,26 +3377,24 @@ mod tests {
     }
 
     #[test]
-    fn committed_approved_evidence_derives_compiled_admission_digests() {
-        let package_inputs_bytes =
-            include_bytes!("../tests/fixtures/approved-release/package-input-manifest-v1.json");
+    fn synthetic_legacy_evidence_derives_test_only_admission_digests() {
+        let package_inputs_bytes = SYNTHETIC_PACKAGE_INPUTS.as_slice();
         let package_inputs = parse_package_inputs(package_inputs_bytes).unwrap();
         assert_eq!(
             serde_jcs::to_vec(&package_inputs).unwrap(),
             package_inputs_bytes
         );
-        assert_eq!(package_inputs_bytes.len(), 78_346);
+        assert_eq!(package_inputs_bytes.len(), 76_984);
         assert_eq!(
             sha256(package_inputs_bytes),
-            "d511e45be4fc28ec20c62c2450b61ab61e61fbbd12024a1e95698ab0b702a02d"
+            "835b499c2e570442459fe30bb12c8ceef19e95c72dfb8a92a60ad941e9c2e50c"
         );
         assert_eq!(
             approved_package_input_digest(package_inputs_bytes),
             APPROVED_PACKAGE_INPUT_DOMAIN_SHA256
         );
 
-        let intent_bytes =
-            include_bytes!("../tests/fixtures/approved-release/initial-release-intent-v1.json");
+        let intent_bytes = SYNTHETIC_INTENT.as_slice();
         let intent = InitialPiReleaseIntentV1::from_json(intent_bytes).unwrap();
         assert_eq!(serde_jcs::to_vec(&intent).unwrap(), intent_bytes);
         assert_eq!(
@@ -3410,59 +3410,38 @@ mod tests {
     }
 
     #[test]
-    fn approved_evidence_manifest_is_canonical_and_binds_local_fixture_files() {
-        let evidence_bytes =
-            include_bytes!("../tests/fixtures/approved-release/evidence-manifest-v1.json");
+    fn current_input_evidence_is_canonical_and_binds_local_inert_records() {
+        let evidence_bytes = include_bytes!(
+            "../../../conformance/pi-installer-release-v1/generated/evidence-manifest-v2.json"
+        );
         let evidence: Value = serde_json::from_slice(evidence_bytes).unwrap();
         assert_eq!(serde_jcs::to_vec(&evidence).unwrap(), evidence_bytes);
         assert_eq!(
-            evidence.pointer("/source/initial_runtime_matrix/sha256"),
-            Some(&json!(
-                "6f389eb3b8b040acda99e63b8dfb0be710dc666182438b7b1c5881e430076d53"
-            ))
+            evidence["evidence_kind"],
+            "immutable-public-inputs-not-qualification"
         );
-        assert_eq!(
-            evidence.pointer("/source/approval_report/sha256"),
-            Some(&json!(
-                "c4864c7bdccaf5ee9fa2e607ecf46a1657c8026fa6af0f492e021cf4724c4996"
-            ))
-        );
-        assert_eq!(
-            evidence.pointer("/immutable_release_semantic/excluded_freshness_fields"),
-            Some(&json!(["sequence", "tag", "generated_at", "expires_at"]))
-        );
-        assert_eq!(
-            evidence.pointer(
-                "/task_6_initial_release_approval/representative_fixture_freshness/compiled_production_authority"
-            ),
-            Some(&json!(false))
-        );
-
-        let expected = [
+        let expected: [(&str, &[u8]); 2] = [
             (
-                "initial-release-intent-v1.json",
-                include_bytes!("../tests/fixtures/approved-release/initial-release-intent-v1.json")
-                    .as_slice(),
+                "intent_sha256",
+                include_bytes!(
+                    "../../../conformance/pi-installer-release-v1/generated/initial-release-intent-v2.json"
+                ),
             ),
             (
-                "package-input-manifest-v1.json",
-                include_bytes!("../tests/fixtures/approved-release/package-input-manifest-v1.json")
-                    .as_slice(),
+                "package_inputs_sha256",
+                include_bytes!(
+                    "../../../conformance/pi-installer-release-v1/generated/package-input-manifest-v2.json"
+                ),
             ),
         ];
-        let entries = evidence["fixture_files"].as_array().unwrap();
-        assert_eq!(entries.len(), expected.len());
-        for (entry, (name, bytes)) in entries.iter().zip(expected) {
-            assert_eq!(entry["path"], name);
-            assert_eq!(entry["size"], bytes.len() as u64);
-            assert_eq!(entry["sha256"], sha256(bytes));
+        for (name, bytes) in expected {
+            assert_eq!(evidence[name], sha256(bytes));
         }
     }
 
     #[test]
     fn strict_approved_fixtures_reject_duplicates_and_mutation() {
-        let package_inputs_bytes =
-            include_bytes!("../tests/fixtures/approved-release/package-input-manifest-v1.json");
+        let package_inputs_bytes = SYNTHETIC_PACKAGE_INPUTS.as_slice();
         let duplicate_package = String::from_utf8(package_inputs_bytes.to_vec())
             .unwrap()
             .replacen(
@@ -3472,8 +3451,7 @@ mod tests {
             );
         assert!(parse_package_inputs(duplicate_package.as_bytes()).is_err());
 
-        let intent_bytes =
-            include_bytes!("../tests/fixtures/approved-release/initial-release-intent-v1.json");
+        let intent_bytes = SYNTHETIC_INTENT.as_slice();
         let duplicate_intent = String::from_utf8(intent_bytes.to_vec()).unwrap().replacen(
             "\"fluxsemble_requirement\":\"=0.1.0\",",
             "\"fluxsemble_requirement\":\"=0.1.0\",\"fluxsemble_requirement\":\"=0.1.0\",",
@@ -3504,10 +3482,8 @@ mod tests {
 
     #[test]
     fn complete_immutable_release_projection_rejects_every_leaf_and_structural_mutation() {
-        let package_inputs =
-            include_bytes!("../tests/fixtures/approved-release/package-input-manifest-v1.json");
-        let baseline_bytes =
-            include_bytes!("../tests/fixtures/approved-release/initial-release-intent-v1.json");
+        let package_inputs = SYNTHETIC_PACKAGE_INPUTS.as_slice();
+        let baseline_bytes = SYNTHETIC_INTENT.as_slice();
         let baseline: Value = serde_json::from_slice(baseline_bytes).unwrap();
         let mut pointers = Vec::new();
         collect_leaf_pointers(
@@ -3610,10 +3586,7 @@ mod tests {
     fn immutable_semantic_excludes_only_representative_freshness() {
         let approved = approved_evidence_intent();
         let baseline = approved_release_semantic_digest(&approved).unwrap();
-        let mut value: Value = serde_json::from_slice(include_bytes!(
-            "../tests/fixtures/approved-release/initial-release-intent-v1.json"
-        ))
-        .unwrap();
+        let mut value: Value = serde_json::from_slice(SYNTHETIC_INTENT.as_slice()).unwrap();
         value["generated_at"] = json!("2026-08-27T00:00:00Z");
         value["expires_at"] = json!("2026-09-27T00:00:00Z");
         let freshness =
@@ -3624,7 +3597,7 @@ mod tests {
         );
         require_release_admission(
             &freshness,
-            include_bytes!("../tests/fixtures/approved-release/package-input-manifest-v1.json"),
+            SYNTHETIC_PACKAGE_INPUTS.as_slice(),
             ReleaseAdmissionPolicy::Production,
         )
         .unwrap();
@@ -3636,7 +3609,7 @@ mod tests {
         assert_eq!(
             require_release_admission(
                 &retagged,
-                include_bytes!("../tests/fixtures/approved-release/package-input-manifest-v1.json"),
+                SYNTHETIC_PACKAGE_INPUTS.as_slice(),
                 ReleaseAdmissionPolicy::Production,
             ),
             Err(SignError::CandidateRejected),
@@ -3679,7 +3652,7 @@ mod tests {
             ),
             (
                 "/release/release/provider_extension/metadata/registry_integrity",
-                json!(SRI),
+                json!(SRI.replacen("sha512-A", "sha512-B", 1)),
             ),
             (
                 "/release/release/provider_extension/metadata/root_package_manifest/url",
@@ -3720,10 +3693,7 @@ mod tests {
     }
 
     fn approved_evidence_intent() -> InitialPiReleaseIntentV1 {
-        InitialPiReleaseIntentV1::from_json(include_bytes!(
-            "../tests/fixtures/approved-release/initial-release-intent-v1.json"
-        ))
-        .unwrap()
+        InitialPiReleaseIntentV1::from_json(SYNTHETIC_INTENT.as_slice()).unwrap()
     }
 
     fn collect_leaf_pointers(value: &Value, pointer: &str, output: &mut Vec<String>) {
@@ -4755,7 +4725,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "set CATALOG_AUTHENTIC_PUBLIC_CORPUS to an authenticated public Pi 0.83.0 corpus"]
+    #[ignore = "historical ceremony: restore original revision and explicitly authenticated original corpus/records"]
     fn environment_supplied_public_corpus_exercises_public_production_assembly_and_finalization() {
         let corpus = std::env::var_os("CATALOG_AUTHENTIC_PUBLIC_CORPUS")
             .map(PathBuf::from)
@@ -5434,13 +5404,29 @@ mod tests {
             let corpus = AuthenticatedCorpus::open(corpus_path)
                 .expect("authenticated corpus root must satisfy the retained capability policy");
             let root = TempDirectory::new();
-            let intent_bytes =
-                include_bytes!("../tests/fixtures/approved-release/initial-release-intent-v1.json");
-            let intent_value: Value = serde_json::from_slice(intent_bytes).unwrap();
-            let intent = InitialPiReleaseIntentV1::from_json(intent_bytes).unwrap();
-            let package_inputs =
-                include_bytes!("../tests/fixtures/approved-release/package-input-manifest-v1.json")
-                    .to_vec();
+            // Historical opt-in only. Original records must be separately restored;
+            // current tests never retain or load the obsolete authentic snapshots.
+            let records_path = PathBuf::from(
+                std::env::var_os("CATALOG_HISTORICAL_RECORDS")
+                    .expect("historical record directory required"),
+            );
+            let records = AuthenticatedCorpus::open(&records_path).unwrap();
+            let intent_bytes = records
+                .read_object(
+                    "initial-release-intent-v1.json",
+                    55798,
+                    "9d9d6023b95f1908edd51f7d08c04c85dc64e35a8c08866e45a2b2bdcfedd047",
+                )
+                .unwrap();
+            let intent_value: Value = serde_json::from_slice(&intent_bytes).unwrap();
+            let intent = InitialPiReleaseIntentV1::from_json(&intent_bytes).unwrap();
+            let package_inputs = records
+                .read_object(
+                    "package-input-manifest-v1.json",
+                    78346,
+                    "d511e45be4fc28ec20c62c2450b61ab61e61fbbd12024a1e95698ab0b702a02d",
+                )
+                .unwrap();
             let package_manifest = parse_package_inputs(&package_inputs).unwrap();
             let release = intent.release().catalog_release();
             let metadata = match release.provider_extension() {
@@ -5977,6 +5963,7 @@ mod tests {
             "https://github.com/Devalch/Fluxsemble-runtime-catalog/releases/download/catalog-v1-sequence-1/{shrinkwrap_name}"
         );
         let metadata = &mut release["provider_extension"]["metadata"];
+        metadata["registry_integrity"] = json!(SRI);
         metadata["root_package_manifest"] = json!({
             "url": manifest_url,
             "size_bytes": manifest_bytes.len().to_string(),

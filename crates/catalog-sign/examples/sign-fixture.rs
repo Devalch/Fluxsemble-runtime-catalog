@@ -45,21 +45,13 @@ fn run() -> Result<(), ()> {
         return Err(());
     }
 
-    for (payload_name, envelope_name) in [
-        (
-            "initial-exact-candidate-payload.json",
-            "initial-exact-candidate-envelope.json",
-        ),
-        ("valid-payload.json", "valid-envelope.json"),
-    ] {
+    for (payload_name, envelope_name) in [("valid-payload.json", "valid-envelope.json")] {
         let payload = read_declared(root, payload_name)?;
         let envelope = catalog_sign::generate_fixture_envelope(&payload).map_err(|_| ())?;
         write_declared(root, envelope_name, &envelope)?;
     }
 
     let mut entries = [
-        "initial-exact-candidate-envelope.json",
-        "initial-exact-candidate-payload.json",
         "rejected-fields.json",
         "valid-envelope.json",
         "valid-payload.json",
@@ -100,11 +92,7 @@ fn read_declared(root: &Path, name: &str) -> Result<Vec<u8>, ()> {
 }
 
 fn write_declared(root: &Path, name: &str, bytes: &[u8]) -> Result<(), ()> {
-    if !matches!(
-        name,
-        "initial-exact-candidate-envelope.json" | "valid-envelope.json" | "manifest-v1.json"
-    ) || bytes.is_empty()
-    {
+    if !matches!(name, "valid-envelope.json" | "manifest-v1.json") || bytes.is_empty() {
         return Err(());
     }
     let path = root.join(name);

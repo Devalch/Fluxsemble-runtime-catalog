@@ -7,7 +7,7 @@ import subprocess
 import sys
 
 metadata = json.loads(subprocess.check_output([
-    "cargo", "metadata", "--no-deps", "--format-version", "1"
+    "cargo", "metadata", "--offline", "--locked", "--no-deps", "--format-version", "1"
 ], text=True))
 
 expected_names = [
@@ -1544,12 +1544,12 @@ import subprocess
 import sys
 
 subprocess.run(
-    ["cargo", "build", "--locked", "-p", "catalog-publish", "--bin", "catalog-publish"],
+    ["cargo", "build", "--offline", "--locked", "-p", "catalog-publish", "--bin", "catalog-publish"],
     check=True,
     stdout=subprocess.DEVNULL,
 )
 import json
-metadata = json.loads(subprocess.check_output(["cargo", "metadata", "--no-deps", "--format-version", "1"], text=True))
+metadata = json.loads(subprocess.check_output(["cargo", "metadata", "--offline", "--locked", "--no-deps", "--format-version", "1"], text=True))
 production_path = Path(metadata["target_directory"]) / "debug" / "catalog-publish"
 production_binary = production_path.read_bytes()
 fixture_public_key = bytes([
@@ -2749,10 +2749,10 @@ import tempfile
 
 paths = {
     "ignore": Path(".gitignore"),
-    "intent": Path("catalogs/intents/catalog-v1-sequence-1-intent.json"),
-    "inputs": Path("catalogs/inputs/pi-0.83.0-linux-x86_64-packages-v1.json"),
-    "payload": Path("conformance/catalog-v1/initial-exact-candidate-payload.json"),
-    "envelope": Path("conformance/catalog-v1/initial-exact-candidate-envelope.json"),
+    "intent": Path("conformance/pi-installer-release-v1/generated/initial-release-intent-v2.json"),
+    "inputs": Path("conformance/pi-installer-release-v1/generated/package-input-manifest-v2.json"),
+    "payload": Path("conformance/catalog-v1/valid-payload.json"),
+    "envelope": Path("conformance/catalog-v1/valid-envelope.json"),
     "manifest": Path("conformance/catalog-v1/manifest-v1.json"),
     "docs": Path("docs/first-release.md"),
     "acquire": Path("crates/catalog-acquire/src/lib.rs"),
@@ -3049,8 +3049,8 @@ EXPECTED_PARITY_CASES = (
         "case": "canonical-decimal",
         "category": "canonical",
         "pointer": "/sequence",
-        "before": "1",
-        "after": "01",
+        "before": "42",
+        "after": "042",
     },
     {
         "case": "provider-id",
@@ -3084,7 +3084,7 @@ EXPECTED_PARITY_CASES = (
         "case": "artifact-size",
         "category": "artifact",
         "pointer": "/providers/0/releases/0/components/0/artifacts/0/size_bytes",
-        "before": "30479988",
+        "before": "31457280",
         "after": "0",
     },
     {
@@ -3132,7 +3132,7 @@ def task11_errors(source, names, regular_identities):
     for name in ("intent", "inputs", "payload", "envelope", "manifest"):
         try:
             value = unique(source[name])
-            if canonical(value) != source[name]:
+            if name != "payload" and canonical(value) != source[name]:
                 errors.append(f"{name} is not strict canonical JSON")
         except Exception:
             errors.append(f"{name} JSON rejected")
@@ -3143,53 +3143,36 @@ def task11_errors(source, names, regular_identities):
     payload = source.get("_payload_value")
     envelope = source.get("_envelope_value")
     manifest = source.get("_manifest_value")
-    if not isinstance(intent, dict) or set(intent) != {"sequence", "tag", "generated_at", "expires_at", "fluxsemble_requirement", "release"}:
-        errors.append("intent authority fields changed")
-    elif (intent["sequence"], intent["tag"], intent["generated_at"], intent["expires_at"], intent["fluxsemble_requirement"]) != (
-        "1", "catalog-v1-sequence-1", "2026-08-26T00:00:00Z", "2026-09-26T00:00:00Z", "=0.1.0"
-    ):
-        errors.append("initial sequence/freshness/requirement changed")
-    elif intent["release"].get("provider") != "builtin:pi" or intent["release"].get("allowed_origins") != ["https://github.com", "https://nodejs.org", "https://registry.npmjs.org"]:
-        errors.append("initial provider/origins changed")
-    else:
-        release = intent["release"].get("release", {})
-        if release.get("version") != "0.83.0" or release.get("target") != "linux_x86_64":
-            errors.append("initial Pi target changed")
-        components = release.get("components", [])
-        if [item.get("component_id") for item in components] != ["component:node", "component:pi"] or [item.get("version") for item in components] != ["22.19.0", "0.83.0"]:
-            errors.append("initial component tuple changed")
-        extension = release.get("provider_extension", {}).get("metadata", {})
-        locked = extension.get("shipped_shrinkwrap", {}).get("locked_packages", [])
-        if len(locked) != 139 or [item.get("locator") for item in locked] != sorted(item.get("locator") for item in locked):
-            errors.append("intent locked closure count/order changed")
-    if not isinstance(inputs, dict) or len(inputs.get("locked_packages", [])) != 139:
-        errors.append("package-input count changed")
-    else:
-        locked = inputs["locked_packages"]
-        if [item.get("locator") for item in locked] != sorted(item.get("locator") for item in locked):
-            errors.append("package-input order changed")
-        if any(not item.get("resolved_url", "").startswith("https://registry.npmjs.org/") for item in locked):
-            errors.append("package-input origin changed")
-        if inputs.get("pre_prune_package_count") != 131 or inputs.get("applicable_package_count") != 130:
-            errors.append("package applicability counts changed")
-    if len(source["inputs"]) != 78346 or digest(source["inputs"]) != "d511e45be4fc28ec20c62c2450b61ab61e61fbbd12024a1e95698ab0b702a02d":
-        errors.append("package-input digest changed")
-    if len(source["intent"]) != 55798 or digest(source["intent"]) != "9d9d6023b95f1908edd51f7d08c04c85dc64e35a8c08866e45a2b2bdcfedd047":
-        errors.append("intent digest changed")
-    if isinstance(intent, dict):
-        projected = {"schema_version": 1, "sequence": intent.get("sequence"), "generated_at": intent.get("generated_at"), "expires_at": intent.get("expires_at"), "compatibility_ranges": [intent.get("fluxsemble_requirement")], "providers": [{"provider_id": intent.get("release", {}).get("provider"), "allowed_origins": intent.get("release", {}).get("allowed_origins"), "releases": [intent.get("release", {}).get("release")]}]}
-        if canonical(projected) != source["payload"]:
-            errors.append("candidate is not the exact intent projection")
-    if len(source["payload"]) != 55797 or digest(source["payload"]) != "7dba62c8b44883cbd7b3615fd9fe3b1a08a3aa2c75c7729704c14804d1cc2a2b":
-        errors.append("candidate frozen digest changed")
-    if not isinstance(envelope, dict) or envelope.get("key_id") != "catalog-test-key-v1" or envelope.get("payload") != payload or len(source["envelope"]) != 55994 or digest(source["envelope"]) != "e5e239bf4b3c10841ffc3105f7788782b3376289be3e17b3ae82cef8081d972f":
-        errors.append("fixture envelope relation changed")
+    if not isinstance(intent, dict) or set(intent) != {'schema_version','sequence','tag','generated_at','expires_at','title','notes','profile'} or intent['schema_version'] != 2:
+        errors.append('inert installer intent schema changed')
+    if len(source['intent']) != 48370 or digest(source['intent']) != 'be49149ef7f570b10d1a94ee9d224aaced3102f83670b27296e2b841a90739dc':
+        errors.append('admitted installer intent identity changed')
+    if len(source['inputs']) != 68465 or digest(source['inputs']) != '60de75f040a2e9c11e6363421e80024a023bd2e851b95263334e5058c0a15f22':
+        errors.append('admitted package input identity changed')
+    if isinstance(intent, dict) and isinstance(inputs, dict):
+        profile = intent.get('profile', {})
+        profile_bytes = canonical(profile)
+        subject = digest(b'fluxsemble:pi-release-subject:v1\0' + len(profile_bytes).to_bytes(8, 'big') + profile_bytes)
+        packages = profile.get('locked_packages', [])
+        observed = inputs.get('locked_packages', [])
+        if inputs.get('schema_version') != 2 or inputs.get('release_subject_sha256') != subject:
+            errors.append('installer subject binding changed')
+        if not 0 < len(packages) <= 512 or len(observed) != len(packages):
+            errors.append('installer graph bounds changed')
+        if [p.get('locator') for p in observed] != sorted(p.get('locator') for p in packages):
+            errors.append('installer observations do not match selected graph')
+        if inputs.get('pre_prune_package_count') != len(packages) + 1 or inputs.get('applicable_package_count') != sum(not p.get('pruned_reasons') for p in observed):
+            errors.append('installer applicability observations changed')
+    if len(source['payload']) != 4224 or digest(source['payload']) != 'f3e1b4e54a283158c9328ef3f5ffd2dbdb9c441fb4720040e2b7743aec14b640':
+        errors.append('synthetic parser vector identity changed')
+    if not isinstance(envelope, dict) or envelope.get('key_id') != 'catalog-test-key-v1' or envelope.get('payload') != payload or len(source['envelope']) != 2750 or digest(source['envelope']) != '716c57e3e361c3f0bcf50ad9eb8c9152eabfa2f0d25fb0dd61430e048616fcc4':
+        errors.append('synthetic fixture envelope relation changed')
     expected_entries = []
-    for name in ["initial-exact-candidate-envelope.json", "initial-exact-candidate-payload.json", "rejected-fields.json", "valid-envelope.json", "valid-payload.json"]:
-        data = Path("conformance/catalog-v1", name).read_bytes() if not name.startswith("initial-") else source["envelope" if "envelope" in name else "payload"]
-        expected_entries.append({"path": name, "sha256": digest(data), "size": len(data)})
-    if not isinstance(manifest, dict) or manifest.get("fixture_key_id") != "catalog-test-key-v1" or manifest.get("entries") != expected_entries:
-        errors.append("conformance manifest relation changed")
+    for name in ['rejected-fields.json','valid-envelope.json','valid-payload.json']:
+        data = source['envelope'] if name == 'valid-envelope.json' else source['payload'] if name == 'valid-payload.json' else Path('conformance/catalog-v1', name).read_bytes()
+        expected_entries.append({'path':name,'sha256':digest(data),'size':len(data)})
+    if not isinstance(manifest, dict) or manifest.get('fixture_key_id') != 'catalog-test-key-v1' or manifest.get('entries') != expected_entries:
+        errors.append('synthetic conformance manifest relation changed')
     acquire = source["acquire"].decode()
     writer = source["writer"].decode()
     vector_test = source["vector_test"].decode()
@@ -3205,7 +3188,7 @@ def task11_errors(source, names, regular_identities):
     for token in ["fn directory_nlink_matches(observed: u64, conventional: u64) -> bool", "observed == 1 || observed == conventional", "!directory_nlink_matches(container_metadata.nlink(), 2)", "!directory_nlink_matches(payload_metadata.nlink(), 2)", "!directory_nlink_matches(metadata.nlink(), 2)", "!directory_nlink_matches(before.nlink(), expected_nlink)"]:
         if token not in writer:
             errors.append(f"portable acquisition directory policy missing: {token}")
-    for token in ["verify_fixture_signed_catalog(ENVELOPE)", "55_797", "7dba62c8b44883cbd7b3615fd9fe3b1a08a3aa2c75c7729704c14804d1cc2a2b"]:
+    for token in ["verify_fixture_signed_catalog(ENVELOPE)", "2553", "a0eab9ad1e9741f8cf8cac9968d8d20cddcbee58e237ed7581202b2268488e5c", "pi_release_subject_sha256(intent.profile())"]:
         if token not in vector_test:
             errors.append(f"fixture/production vector evidence missing: {token}")
     if vector_test.count("assert!(verify_signed_catalog(ENVELOPE).is_err())") != 2:
@@ -3228,7 +3211,7 @@ def task11_errors(source, names, regular_identities):
     for token in [
         "test_every_rejection_is_one_exact_pointer_change_from_the_candidate",
         "test_driver_emits_the_frozen_matrix_with_runtime_supplied_tools",
-        "2cd34eaba1a2e609719a69ddf1a628f7cadba9e76512132750e1559284ba18f8",
+        "69675d8bcb982d503a1de753b6ae2183a9a5555b1822e52f9135ced5690758ed",
     ]:
         if token not in parity_test:
             errors.append(f"single-pointer parity test evidence missing: {token}")
@@ -3334,10 +3317,8 @@ OLD_PUBLIC = bytes.fromhex(
 )
 PEM_PATH = "crates/catalog-sign/tests/fixtures/nonproduction-ed25519-pkcs8.pem"
 EXPECTED_DIGESTS = {
-    "initial_envelope": "e5e239bf4b3c10841ffc3105f7788782b3376289be3e17b3ae82cef8081d972f",
     "valid_envelope": "716c57e3e361c3f0bcf50ad9eb8c9152eabfa2f0d25fb0dd61430e048616fcc4",
-    "manifest": "fc9808c8228ed4cfeddbab96fb0f0327a8e1eb672c82df230ca021f14f840b7a",
-    "initial_payload": "7dba62c8b44883cbd7b3615fd9fe3b1a08a3aa2c75c7729704c14804d1cc2a2b",
+    "manifest": "6ca4966a7857a348687e411b599e2d852d615fd78c2461f677e4eb7990c51032",
     "valid_payload": "f3e1b4e54a283158c9328ef3f5ffd2dbdb9c441fb4720040e2b7743aec14b640",
     "rejected": "dd4d3dfd78312bc02b43d0b7b6766941742ced42c897bd086cf8cf15d4f1bcb4",
     "pem": "b859bbad04b8b7cfb16533d1e3bfb1ae091adefddad8c7272b59380bae231841",
@@ -3352,10 +3333,8 @@ PATHS = {
     "generator": "crates/catalog-sign/examples/sign-fixture.rs",
     "correction_docs": "docs/conformance-v2-correction.md",
     "first_release": "docs/first-release.md",
-    "initial_envelope": "conformance/catalog-v1/initial-exact-candidate-envelope.json",
     "valid_envelope": "conformance/catalog-v1/valid-envelope.json",
     "manifest": "conformance/catalog-v1/manifest-v1.json",
-    "initial_payload": "conformance/catalog-v1/initial-exact-candidate-payload.json",
     "valid_payload": "conformance/catalog-v1/valid-payload.json",
     "rejected": "conformance/catalog-v1/rejected-fields.json",
     "pem": PEM_PATH,
@@ -3374,7 +3353,7 @@ def arrays(source, name):
 def fixture_identity_errors(source, tags, virtual_files=()):
     errors = []
     text = {name: data.decode("utf-8") for name, data in source.items() if name not in {
-        "initial_envelope", "valid_envelope", "manifest", "initial_payload", "valid_payload", "rejected", "pem"
+        "valid_envelope", "manifest", "valid_payload", "rejected", "pem"
     }}
 
     if arrays(text["core"], "FIXTURE_PUBLIC_KEY") != [EXPECTED_PUBLIC]:
@@ -3419,14 +3398,12 @@ def fixture_identity_errors(source, tags, virtual_files=()):
     if any(token not in text["cross_test"] for token in required_cross_tokens):
         errors.append("cross-identity fixture/production rejection evidence changed")
 
-    for name in ("initial_envelope", "valid_envelope", "manifest", "initial_payload", "valid_payload", "rejected", "pem"):
+    for name in ("valid_envelope", "manifest", "valid_payload", "rejected", "pem"):
         if digest(source[name]) != EXPECTED_DIGESTS[name]:
             errors.append(f"exact conformance-v2 artifact changed: {name}")
-    if len(source["initial_envelope"]) != 55_994 or len(source["initial_payload"]) != 55_797:
-        errors.append("initial fixture size changed")
     if len(source["valid_envelope"]) != 2_750 or len(source["valid_payload"]) != 4_224:
         errors.append("valid fixture size changed")
-    if len(source["manifest"]) != 743 or len(source["rejected"]) != 1_676:
+    if len(source["manifest"]) != 468 or len(source["rejected"]) != 1_676:
         errors.append("manifest or rejection fixture size changed")
 
     try:
@@ -3439,8 +3416,6 @@ def fixture_identity_errors(source, tags, virtual_files=()):
         errors.append("conformance manifest is malformed")
         entries = {}
     expected_entries = {
-        "initial-exact-candidate-envelope.json": (55_994, EXPECTED_DIGESTS["initial_envelope"]),
-        "initial-exact-candidate-payload.json": (55_797, EXPECTED_DIGESTS["initial_payload"]),
         "rejected-fields.json": (1_676, EXPECTED_DIGESTS["rejected"]),
         "valid-envelope.json": (2_750, EXPECTED_DIGESTS["valid_envelope"]),
         "valid-payload.json": (4_224, EXPECTED_DIGESTS["valid_payload"]),
@@ -3504,8 +3479,6 @@ def fixture_identity_errors(source, tags, virtual_files=()):
         errors.append("fixture key ID crossed into a non-fixture production source")
 
     generator_tokens = [
-        '"initial-exact-candidate-payload.json"',
-        '"initial-exact-candidate-envelope.json"',
         '("valid-payload.json", "valid-envelope.json")',
         "catalog_sign::generate_fixture_envelope(&payload)",
     ]
@@ -3521,7 +3494,7 @@ def fixture_identity_errors(source, tags, virtual_files=()):
         "630dcd2966c4336691125448bbb25b4ff412a49c732db2c8abc1b8581bd710dd",
         "d6a1ef91ce596e9d58f83dd01a5f90767baab744",
         "no release or publication is claimed",
-        EXPECTED_DIGESTS["initial_payload"],
+        "7dba62c8b44883cbd7b3615fd9fe3b1a08a3aa2c75c7729704c14804d1cc2a2b",
         EXPECTED_DIGESTS["valid_payload"],
         EXPECTED_DIGESTS["rejected"],
         "Production trust",
@@ -3530,7 +3503,7 @@ def fixture_identity_errors(source, tags, virtual_files=()):
         errors.append("conformance-v2 correction record lost required evidence")
     if "has been published" in text["correction_docs"] or "a release and publication are claimed" in text["correction_docs"]:
         errors.append("documentation falsely claims conformance-v2 release publication")
-    if EXPECTED_DIGESTS["initial_envelope"] not in text["first_release"] or EXPECTED_DIGESTS["manifest"] not in text["first_release"]:
+    if "e5e239bf4b3c10841ffc3105f7788782b3376289be3e17b3ae82cef8081d972f" not in text["first_release"] or "fc9808c8228ed4cfeddbab96fb0f0327a8e1eb672c82df230ca021f14f840b7a" not in text["first_release"]:
         errors.append("first-release fixture digests are stale")
 
     if tags.get("catalog-v1-conformance-v1") != "c31d3e747ff5bcc14ed5b82e1f39f37c712591aa":
@@ -3572,7 +3545,7 @@ replace_mutation("publish_support", b"let signing_key = fixture_signing_key();",
 replace_mutation("cross_test", b"assert!(verify_signed_catalog(envelope).is_err());", b"assert!(true);")
 replace_mutation("generator", b"catalog_sign::generate_fixture_envelope(&payload)", b"stale_fixture_envelope(&payload)")
 replace_mutation("correction_docs", b"no release or publication is claimed", b"a release and publication are claimed")
-for name in ("initial_envelope", "valid_envelope", "manifest", "initial_payload", "valid_payload", "rejected", "pem"):
+for name in ("valid_envelope", "manifest", "valid_payload", "rejected", "pem"):
     changed = dict(source)
     changed[name] = source[name][:-1] + bytes([source[name][-1] ^ 1])
     mutations.append(changed)

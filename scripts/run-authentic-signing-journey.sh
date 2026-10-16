@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ "${1:-}" != --historical ]]; then
+  echo "historical signing journey requires --historical and its original revision/inputs" >&2
+  exit 2
+fi
+shift
+
 : "${CATALOG_AUTHENTIC_PUBLIC_CORPUS:?set an absolute authenticated public corpus path}"
 case "$CATALOG_AUTHENTIC_PUBLIC_CORPUS" in
   /*) ;;
@@ -48,9 +54,9 @@ launcher=target/debug/catalog-sign-launcher
 "$launcher" finalize --config "$root/launcher-config-v1.json" \
   --input "$root/export/final-input" --output "$root/finalize-output"
 
-PYTHONDONTWRITEBYTECODE=1 python3 scripts/authentic-candidate-oracle.py \
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/authentic-candidate-oracle.py --historical \
   "$root/export/intent-input" "$root/oracle-intent-candidate.json"
-PYTHONDONTWRITEBYTECODE=1 python3 scripts/authentic-candidate-oracle.py \
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/authentic-candidate-oracle.py --historical \
   "$root/export/final-input" "$root/oracle-final-candidate.json"
 cmp --silent "$root/oracle-intent-candidate.json" "$root/oracle-final-candidate.json" || {
   echo "independent intent/final oracle projections differ" >&2; exit 1

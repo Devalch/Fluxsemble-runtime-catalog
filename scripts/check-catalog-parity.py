@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the bounded, single-pointer old/new catalog parity matrix.
+"""Run the bounded, single-pointer synthetic V1 catalog parser parity matrix.
 
 The old producer and new catalog-core probe are supplied as runtime executable
 paths. The probe interface is `PROBE CANDIDATE`; the old producer interface is
@@ -19,8 +19,8 @@ import subprocess
 import tempfile
 from typing import Any
 
-EXPECTED_CANDIDATE_SIZE = 55_797
-EXPECTED_CANDIDATE_SHA256 = "7dba62c8b44883cbd7b3615fd9fe3b1a08a3aa2c75c7729704c14804d1cc2a2b"
+EXPECTED_CANDIDATE_SIZE = 2_553
+EXPECTED_CANDIDATE_SHA256 = "a0eab9ad1e9741f8cf8cac9968d8d20cddcbee58e237ed7581202b2268488e5c"
 MAX_CANDIDATE_BYTES = 8 * 1024 * 1024
 MAX_TOOL_BYTES = 128 * 1024 * 1024
 MAX_TOOL_OUTPUT_BYTES = 4 * 1024
@@ -41,8 +41,8 @@ CASE_MANIFEST = (
         "case": "canonical-decimal",
         "category": "canonical",
         "pointer": "/sequence",
-        "before": "1",
-        "after": "01",
+        "before": "42",
+        "after": "042",
     },
     {
         "case": "provider-id",
@@ -76,7 +76,7 @@ CASE_MANIFEST = (
         "case": "artifact-size",
         "category": "artifact",
         "pointer": "/providers/0/releases/0/components/0/artifacts/0/size_bytes",
-        "before": "30479988",
+        "before": "31457280",
         "after": "0",
     },
     {
@@ -257,7 +257,7 @@ def old_accepts(tool: Path, case_path: Path) -> bool:
         ]
     )
     if result.returncode == 0:
-        expected = f"valid sequence=1 payload_sha256={EXPECTED_CANDIDATE_SHA256}\n".encode()
+        expected = f"valid sequence=42 payload_sha256={EXPECTED_CANDIDATE_SHA256}\n".encode()
         if result.stdout != expected or result.stderr:
             raise ParityError("old accepted output drift")
         return True
@@ -270,7 +270,7 @@ def new_accepts(tool: Path, case_path: Path) -> bool:
     result = run_tool([os.fspath(tool), os.fspath(case_path)])
     if result.returncode == 0:
         expected = (
-            f"valid sequence=1 payload_sha256={EXPECTED_CANDIDATE_SHA256} "
+            f"valid sequence=42 payload_sha256={EXPECTED_CANDIDATE_SHA256} "
             f"size={EXPECTED_CANDIDATE_SIZE}\n"
         ).encode()
         if result.stdout != expected or result.stderr:

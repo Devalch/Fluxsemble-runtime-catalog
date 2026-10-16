@@ -13,6 +13,19 @@ SPEC.loader.exec_module(oracle)
 
 
 class AuthenticCandidateOracleTests(unittest.TestCase):
+
+    def test_admitted_installer_projection_matches_independent_public_records(self):
+        import json
+        root = SCRIPT.parents[1] / 'conformance/pi-installer-release-v1'
+        expected = (63555, '20b4402e9bedbb2c92caa2b04f4ee7552740c0c2ac2eb8c331c8e3f72f87db07')
+        result = json.loads(oracle.installer_input_projection(root, *expected))
+        self.assertEqual(result['intent'], json.loads((root / 'generated/initial-release-intent-v2.json').read_bytes()))
+        self.assertEqual(result['release_subject_sha256'], json.loads((root / 'generated/package-input-manifest-v2.json').read_bytes())['release_subject_sha256'])
+        self.assertEqual(result['evidence_kind'], 'independent-input-projection-not-qualification')
+        with self.assertRaises(oracle.OracleError):
+            oracle.installer_input_projection(root, expected[0], '0' * 64)
+        self.assertEqual(oracle.main([]), 2)
+
     def intent(self):
         return {
             "expires_at": "2026-09-26T00:00:00Z",
