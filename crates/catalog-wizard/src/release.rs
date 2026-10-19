@@ -1662,7 +1662,7 @@ fn validate_resumed_state(repo: &Path, state: &WizardState) -> Result<(), Wizard
     let expected = repo
         .join(STATE_ROOT)
         .join(format!("sequence-{}", state.sequence));
-    if state.schema_version != 1
+    if !matches!(state.schema_version, 1 | 2)
         || state.sequence == 0
         || state.target != TARGET
         || state.work_dir != expected
@@ -2359,6 +2359,46 @@ mod tests {
         assert!(!work_dir.join("intent.json").exists());
         assert_eq!(resumable_states(&repo).unwrap(), vec![state]);
         fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn resume_accepts_supported_installer_and_legacy_states_only() {
+        let repo = Path::new("/repo");
+        let mut state = WizardState {
+            schema_version: 2,
+            sequence: 4,
+            pi_version: "1.2.0".into(),
+            node_version: "22.19.0".into(),
+            target: TARGET.into(),
+            mode: RunMode::DryRun,
+            phase: ReleasePhase::AwaitingQualification,
+            signing_key_generation: 1,
+            catalog_source_commit: "11".repeat(20),
+            catalog_source_tree_sha256: "22".repeat(32),
+            work_dir: repo.join(".release-work/sequence-4"),
+        };
+        validate_resumed_state(repo, &state).unwrap();
+        state.schema_version = 1;
+        validate_resumed_state(repo, &state).unwrap();
+        for unsupported in [0, 3, u32::MAX] {
+            state.schema_version = unsupported;
+            assert_eq!(
+                validate_resumed_state(repo, &state),
+                Err(WizardError::State)
+            );
+        }
+        state.schema_version = 2;
+        state.work_dir = repo.join(".release-work/sequence-5");
+        assert_eq!(
+            validate_resumed_state(repo, &state),
+            Err(WizardError::State)
+        );
+        state.work_dir = repo.join(".release-work/sequence-4");
+        state.catalog_source_tree_sha256 = "invalid".into();
+        assert_eq!(
+            validate_resumed_state(repo, &state),
+            Err(WizardError::State)
+        );
     }
 
     #[test]
