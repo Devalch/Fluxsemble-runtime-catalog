@@ -92,6 +92,19 @@ Completion writes no-clobber mode-`0400` `latest/draft-receipt-v1.json`. Stop. T
 
 A remote failure reports uncertainty or recovery required and preserves the operation record plus remote tag/draft/assets. Do not delete or replace anything. Review the recorded phase and current remote readback before an exact retry.
 
+## 3a. Recover changed broker pins without replacing the draft
+
+If a reviewed broker repair is needed while a production operation is partial,
+use [broker-recovery.md](broker-recovery.md). `plan-broker-recovery` is offline
+and produces a digest-reviewable public plan. The separately approved
+`recover-broker` command verifies the retained tag/draft/asset IDs and downloaded
+bytes, archives the complete old operation in immutable proof and commits only
+an exact local broker-pin transition. It has no remote mutation authority.
+Recovered `stage-remote` then has no tag/draft creation fallback and preserves
+both original and newly observed asset IDs through retries. Stop for exact
+remaining-upload approval and again for final draft-receipt approval/publication.
+Do not edit records, substitute pins or silently stage into fresh authority.
+
 ## 4. Explicit local approval
 
 The human computes SHA-256 over the exact canonical draft receipt outside the tool, compares it with the reviewed bytes, and explicitly authorizes the local approval transition. There is no interactive prompt and no broker/network input.

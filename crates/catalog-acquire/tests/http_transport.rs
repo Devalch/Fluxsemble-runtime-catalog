@@ -1,3 +1,6 @@
+// Match the production adapter re-export when including http.rs as a standalone test module.
+use catalog_installer_verify as installer_lock;
+
 #[path = "../src/http.rs"]
 mod http;
 

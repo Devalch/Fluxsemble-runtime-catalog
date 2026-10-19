@@ -434,13 +434,17 @@ mod tests {
         fs,
         os::unix::fs::{DirBuilderExt, symlink},
         path::PathBuf,
-        sync::{Mutex, MutexGuard},
+        sync::{
+            Mutex, MutexGuard,
+            atomic::{AtomicU64, Ordering},
+        },
         time::{SystemTime, UNIX_EPOCH},
     };
 
     use super::RetainedInputRoot;
 
     static CWD_LOCK: Mutex<()> = Mutex::new(());
+    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn qualification_is_read_beneath_the_source_directory_not_cwd() {
@@ -556,12 +560,18 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let path = std::env::temp_dir().join(format!(
-                "catalog-source-input-test-{}-{nanos}",
-                std::process::id()
-            ));
-            fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
-            Self { path }
+            loop {
+                let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+                let path = std::env::temp_dir().join(format!(
+                    "catalog-source-input-test-{}-{nanos}-{sequence}",
+                    std::process::id()
+                ));
+                match fs::DirBuilder::new().mode(0o700).create(&path) {
+                    Ok(()) => return Self { path },
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("create private test directory: {error}"),
+                }
+            }
         }
     }
 

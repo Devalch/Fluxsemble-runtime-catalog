@@ -19,6 +19,6 @@ pub use local::{
 };
 pub use workflow::{
     DraftReceiptV1, LatestReceiptV1, PublicationReceiptV1, ReleaseApprovalV1, RemoteReceiptAssetV1,
-    RemoteWorkflowError, RemoteWorkflowOutcome, approve_remote, publish_remote,
-    publish_transport_fixture, stage_remote, verify_latest_remote,
+    RemoteWorkflowError, RemoteWorkflowOutcome, approve_remote, plan_broker_recovery,
+    publish_remote, publish_transport_fixture, recover_broker, stage_remote, verify_latest_remote,
 };

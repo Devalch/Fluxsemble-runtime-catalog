@@ -88,3 +88,32 @@ For upload, the broker first authenticates the owner-private mode-`0400` source 
 Committed fixture keys remain nonproduction test authority only. `catalog-sign-fixture` is a separately named static binary behind the nondefault `fixture-tools` feature. It reads only the committed fixture key identity, emits `catalog-test-key-v1`, verifies through the fixture public identity, and is rejected by production public verification; neither its entry point nor fixture identity is present in the default production signer binary. Its real Bubblewrap journey uses the same retained transfer, domain-separated catalog/release signatures, staging writer, reverse emitter, launcher, mounts, seccomp, recovery, and no-clobber implementation. Boundary mutations fail if fixture authority enters the production main or launcher surface.
 
 The exact approved public assemble/finalize journey is intentionally ignored unless `CATALOG_AUTHENTIC_PUBLIC_CORPUS` names an explicit authenticated public corpus. `scripts/authentic-candidate-oracle.py` independently verifies the complete duplicate-free, bounded public transfer and constructs the catalog-v1 projection directly from its committed release intent without importing or invoking catalog-sign; its frozen expected candidate is 55,797 bytes with SHA-256 `7dba62c8b44883cbd7b3615fd9fe3b1a08a3aa2c75c7729704c14804d1cc2a2b`. `scripts/run-authentic-signing-journey.sh` exports retained transfers through the existing ignored reader, runs both normal production static-signer launcher ceremonies, and requires both real Bubblewrap candidates to equal the independent oracle byte-for-byte and match that digest before proving no-clobber. The producer has no Fluxsemble code, build, test, or runtime dependency. The production private key, SSH directories, remote publication credentials, and repository mutation are outside this boundary and are never used by automated tests.
+
+
+## Explicit partial-draft broker recovery
+
+`plan-broker-recovery` validates the production-signed local authority and new
+broker/config identities without launching an authenticated process. Its public
+canonical plan binds the complete old operation/hash, unchanged local-reference
+hash, exact successor/hash, and ordered retained server IDs/names/sizes/digests.
+Only broker executable/outer-client hashes and the derived operation ID plus
+required-proof marker change; inner credential config, signed/source bindings,
+release ID, phase and recorded verified count are preserved.
+
+`recover-broker` checks the externally approved complete plan digest before any
+broker process. Its remote capability is read/download only; exact tag/draft and
+all retained bytes are revalidated before a no-clobber immutable proof and atomic
+local successor commit. Proof creation and operation temporary/rename/fsync are
+independently recoverable under the retained lock. Missing, malformed, mixed or
+pending proof blocks every ordinary workflow entry point. Retried recovery may
+settle only exact original/successor bytes and cannot overwrite later progress.
+
+Recovered staging has no CreateTag/CreateDraft fallback, retains baseline and
+new suffix IDs, and checkpoints observations before downloads separately from
+verified progress. Canonical draft receipts must match all retained/observed IDs,
+including during release approval and publication. Legacy records serialize
+identically with optional recovery fields omitted. Old executables reject new
+proof/state instead of silently interpreting it as legacy authority.
+
+GitHub API JSON has a separate 8192-node budget. Canonical protocol/config input
+keeps1024; byte/depth/collection/string and duplicate-key bounds are unchanged.

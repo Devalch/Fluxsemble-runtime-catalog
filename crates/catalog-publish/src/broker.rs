@@ -33,6 +33,10 @@ const MAX_ASSET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_PATH_BYTES: usize = 4_096;
 const MAX_JSON_DEPTH: usize = 16;
 const MAX_JSON_NODES: usize = 1_024;
+// GitHub release lists include nested author/uploader metadata that is omitted
+// from our typed projection. Give that external envelope its own finite budget;
+// the 128 KiB response byte cap and all other structural limits still apply.
+const MAX_GITHUB_RESPONSE_JSON_NODES: usize = 8_192;
 const MAX_COLLECTION_MEMBERS: usize = 256;
 const MAX_RELEASE_ASSETS: usize = 128;
 #[cfg(test)]
@@ -926,7 +930,7 @@ fn project_child_response(
 ) -> Result<BrokerResponseV1, BrokerError> {
     match request {
         BrokerRequestV1::CreateTag { tag, .. } | BrokerRequestV1::ReadTag { tag, .. } => {
-            let value = parse_json_value(bytes, MAX_RESPONSE_BYTES as u64, false)?;
+            let value = parse_github_response(bytes)?;
             let root = object(&value)?;
             if string_field(root, "ref")? != format!("refs/tags/{tag}") {
                 return Err(rejected());
@@ -947,11 +951,11 @@ fn project_child_response(
             })
         }
         BrokerRequestV1::CreateDraft { .. } => {
-            let value = parse_json_value(bytes, MAX_RESPONSE_BYTES as u64, false)?;
+            let value = parse_github_response(bytes)?;
             project_draft(&value)
         }
         BrokerRequestV1::ReadDraft { tag, .. } => {
-            let value = parse_json_value(bytes, MAX_RESPONSE_BYTES as u64, false)?;
+            let value = parse_github_response(bytes)?;
             project_read_draft(&value, tag)
         }
         BrokerRequestV1::UploadAsset { name, .. } => {
@@ -965,7 +969,7 @@ fn project_child_response(
             })
         }
         BrokerRequestV1::PublishDraft { release_id, .. } => {
-            let value = parse_json_value(bytes, MAX_RESPONSE_BYTES as u64, false)?;
+            let value = parse_github_response(bytes)?;
             let child = object(&value)?;
             if decimal_json_field(child, "id")? != *release_id || bool_field(child, "draft")? {
                 return Err(rejected());
@@ -2990,16 +2994,31 @@ fn parse_canonical<T>(bytes: &[u8], maximum: u64) -> Result<T, BrokerProtocolErr
 where
     T: for<'de> Deserialize<'de>,
 {
-    let value = parse_json_value(bytes, maximum, true).map_err(|_| BrokerProtocolError)?;
+    let value =
+        parse_json_value(bytes, maximum, true, MAX_JSON_NODES).map_err(|_| BrokerProtocolError)?;
     serde_json::from_value(value).map_err(|_| BrokerProtocolError)
 }
 
-fn parse_json_value(bytes: &[u8], maximum: u64, canonical: bool) -> Result<Value, BrokerError> {
+fn parse_github_response(bytes: &[u8]) -> Result<Value, BrokerError> {
+    parse_json_value(
+        bytes,
+        MAX_RESPONSE_BYTES as u64,
+        false,
+        MAX_GITHUB_RESPONSE_JSON_NODES,
+    )
+}
+
+fn parse_json_value(
+    bytes: &[u8],
+    maximum: u64,
+    canonical: bool,
+    maximum_nodes: usize,
+) -> Result<Value, BrokerError> {
     if bytes.is_empty() || bytes.len() as u64 > maximum {
         return Err(rejected());
     }
     let strict: StrictJson = serde_json::from_slice(bytes).map_err(|_| rejected())?;
-    validate_json_bounds(&strict.0)?;
+    validate_json_bounds(&strict.0, maximum_nodes)?;
     if canonical && serde_jcs::to_vec(&strict.0).map_err(|_| rejected())? != bytes {
         return Err(rejected());
     }
@@ -3099,15 +3118,16 @@ impl<'de> Deserialize<'de> for StrictJson {
     }
 }
 
-fn validate_json_bounds(value: &Value) -> Result<(), BrokerError> {
+fn validate_json_bounds(value: &Value, maximum_nodes: usize) -> Result<(), BrokerError> {
     fn walk(
         value: &Value,
         depth: usize,
         nodes: &mut usize,
         members: &mut usize,
+        maximum_nodes: usize,
     ) -> Result<(), BrokerError> {
         *nodes = nodes.checked_add(1).ok_or_else(rejected)?;
-        if depth > MAX_JSON_DEPTH || *nodes > MAX_JSON_NODES {
+        if depth > MAX_JSON_DEPTH || *nodes > maximum_nodes {
             return Err(rejected());
         }
         match value {
@@ -3117,7 +3137,7 @@ fn validate_json_bounds(value: &Value) -> Result<(), BrokerError> {
                 }
                 *members = members.checked_add(values.len()).ok_or_else(rejected)?;
                 for value in values {
-                    walk(value, depth + 1, nodes, members)?;
+                    walk(value, depth + 1, nodes, members, maximum_nodes)?;
                 }
             }
             Value::Object(values) => {
@@ -3129,18 +3149,18 @@ fn validate_json_bounds(value: &Value) -> Result<(), BrokerError> {
                     if name.len() > 256 {
                         return Err(rejected());
                     }
-                    walk(value, depth + 1, nodes, members)?;
+                    walk(value, depth + 1, nodes, members, maximum_nodes)?;
                 }
             }
             Value::String(value) if value.len() > 32 * 1024 => return Err(rejected()),
             _ => {}
         }
-        if *members > MAX_JSON_NODES {
+        if *members > maximum_nodes {
             return Err(rejected());
         }
         Ok(())
     }
-    walk(value, 0, &mut 0, &mut 0)
+    walk(value, 0, &mut 0, &mut 0, maximum_nodes)
 }
 
 pub(crate) fn run_process() -> Result<(), BrokerError> {
@@ -3188,5 +3208,23 @@ mod directory_nlink_tests {
         assert!(directory_nlink_matches(2, 2));
         assert!(!directory_nlink_matches(0, 2));
         assert!(!directory_nlink_matches(3, 2));
+    }
+}
+
+#[cfg(test)]
+mod json_protocol_budget_tests {
+    use super::parse_canonical;
+    use serde_json::Value;
+
+    #[test]
+    fn canonical_protocol_retains_its_1024_node_budget() {
+        // Root + four arrays + 1,019 scalar values = 1,024 nodes. All
+        // individual collections stay within their independent 256-member cap.
+        let mut value = serde_json::json!([vec![0; 256], vec![0; 256], vec![0; 256], vec![0; 251]]);
+        let at_limit = serde_jcs::to_vec(&value).unwrap();
+        assert!(parse_canonical::<Value>(&at_limit, 128 * 1024).is_ok());
+        value[3].as_array_mut().unwrap().push(0.into());
+        let over_limit = serde_jcs::to_vec(&value).unwrap();
+        assert!(parse_canonical::<Value>(&over_limit, 128 * 1024).is_err());
     }
 }

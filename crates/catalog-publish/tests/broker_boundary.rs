@@ -25,8 +25,8 @@ mod broker;
 mod broker_client;
 
 use broker::{
-    BrokerAssetUploadStatusV1, BrokerPublicationStatusV1, BrokerRequestV1, BrokerResponseV1,
-    BrokerTagObjectTypeV1, BrokerTestCheckpoints, PublisherBrokerConfigV1,
+    BrokerAssetUploadStatusV1, BrokerPublicationStatusV1, BrokerReleaseAssetV1, BrokerRequestV1,
+    BrokerResponseV1, BrokerTagObjectTypeV1, BrokerTestCheckpoints, PublisherBrokerConfigV1,
 };
 use broker_client::{BrokerClient, PublisherBrokerClientConfigV1};
 
@@ -778,6 +778,170 @@ fn read_draft_list_distinguishes_exact_missing_duplicate_and_truncated_state() {
         BrokerResponseV1::Draft { title, notes, .. }
             if title == "Runtime catalog sequence 1" && notes == "Reviewed release notes"
     ));
+}
+
+#[test]
+fn real_broker_projects_five_and_seven_assets_from_metadata_heavy_github_release_lists() {
+    // Full GitHub release/author/asset/uploader shape from a captured five-release
+    // response: 1,051 JSON nodes. Metadata strings are synthetic; no account data
+    // or runtime evidence is needed to reproduce the original 1,024-node failure.
+    let captured = include_bytes!("fixtures/broker-github-releases.json");
+    let request = BrokerRequestV1::ReadDraft {
+        schema_version: 1,
+        repository: REPOSITORY.to_owned(),
+        tag: TAG.to_owned(),
+    }
+    .to_canonical_bytes()
+    .unwrap();
+    let mut expected_assets = vec![
+        BrokerReleaseAssetV1 {
+            asset_id: "8".into(),
+            name: "checksums-sha256.txt".into(),
+            size: 795,
+        },
+        BrokerReleaseAssetV1 {
+            asset_id: "9".into(),
+            name: "installer-lock.json".into(),
+            size: 50_973,
+        },
+        BrokerReleaseAssetV1 {
+            asset_id: "10".into(),
+            name: "installer-package.json".into(),
+            size: 317,
+        },
+        BrokerReleaseAssetV1 {
+            asset_id: "11".into(),
+            name: "package.json".into(),
+            size: 3_767,
+        },
+        BrokerReleaseAssetV1 {
+            asset_id: "12".into(),
+            name: "qualification.json".into(),
+            size: 1_154,
+        },
+    ];
+    let mut four: serde_json::Value = serde_json::from_slice(captured).unwrap();
+    four[0]["assets"].as_array_mut().unwrap().pop();
+    let four = serde_json::to_vec(&four).unwrap();
+    let mut seven: serde_json::Value = serde_json::from_slice(captured).unwrap();
+    for (id, name, size) in [
+        (13, "catalog-v1.json", 50_000),
+        (14, "signed-release-bundle-manifest-v1.json", 1_340),
+    ] {
+        let mut asset = seven[0]["assets"][0].clone();
+        asset["id"] = id.into();
+        asset["name"] = name.into();
+        asset["size"] = size.into();
+        seven[0]["assets"].as_array_mut().unwrap().push(asset);
+    }
+    let seven = serde_json::to_vec(&seven).unwrap();
+    expected_assets.extend([
+        BrokerReleaseAssetV1 {
+            asset_id: "13".into(),
+            name: "catalog-v1.json".into(),
+            size: 50_000,
+        },
+        BrokerReleaseAssetV1 {
+            asset_id: "14".into(),
+            name: "signed-release-bundle-manifest-v1.json".into(),
+            size: 1_340,
+        },
+    ]);
+    for (label, bytes, asset_count) in [
+        ("four", four.as_slice(), 4),
+        ("five", captured.as_slice(), 5),
+        ("seven", seven.as_slice(), 7),
+    ] {
+        let fixture = Fixture::new(label, FakeBehavior::Success, bytes);
+        let output = run_binary(&fixture.config, &request);
+        assert!(output.status.success(), "{label}: {:?}", output.stderr);
+        assert!(output.stderr.is_empty());
+        assert_eq!(
+            BrokerResponseV1::from_canonical_bytes(&output.stdout).unwrap(),
+            BrokerResponseV1::Draft {
+                schema_version: 1,
+                release_id: "7".into(),
+                tag: TAG.into(),
+                target_commitish: COMMIT.into(),
+                title: "Runtime catalog sequence 1".into(),
+                notes: "Reviewed release notes".into(),
+                draft: true,
+                prerelease: false,
+                assets: expected_assets[..asset_count].to_vec(),
+            }
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("synthetic-api-metadata"));
+    }
+}
+
+#[test]
+fn real_broker_keeps_github_json_resource_and_duplicate_member_limits() {
+    let request = BrokerRequestV1::ReadDraft {
+        schema_version: 1,
+        repository: REPOSITORY.to_owned(),
+        tag: TAG.to_owned(),
+    }
+    .to_canonical_bytes()
+    .unwrap();
+    let base: serde_json::Value = serde_json::from_slice(&draft_list_json()).unwrap();
+    let mut cases = Vec::new();
+    // Base response has 16 nodes. Metadata adds one outer array, 32 inner
+    // arrays, and (31 * 256 + 207) scalar nodes: exactly 8,192 in total.
+    let mut rows = vec![vec![0; 256]; 31];
+    rows.push(vec![0; 207]);
+    let mut at_limit = base.clone();
+    at_limit[0]["metadata"] = serde_json::json!(rows);
+    let fixture = Fixture::new(
+        "node-limit",
+        FakeBehavior::Success,
+        &serde_json::to_vec(&at_limit).unwrap(),
+    );
+    let output = run_binary(&fixture.config, &request);
+    assert!(
+        output.status.success(),
+        "rejected legal 8,192-node response"
+    );
+    assert!(matches!(
+        BrokerResponseV1::from_canonical_bytes(&output.stdout).unwrap(),
+        BrokerResponseV1::Draft { assets, .. } if assets.len() == 1
+    ));
+    // Each collection is still legal; one additional scalar exceeds the budget.
+    let mut over_nodes = at_limit;
+    over_nodes[0]["metadata"][31]
+        .as_array_mut()
+        .unwrap()
+        .push(0.into());
+    cases.push(("nodes", serde_json::to_vec(&over_nodes).unwrap()));
+    let mut over_depth = base.clone();
+    let mut nested = serde_json::Value::Null;
+    // Root list and release object occupy depths 0 and 1, so the leaf is
+    // exactly depth 17 (one beyond the unchanged depth-16 cap).
+    for _ in 0..15 {
+        nested = serde_json::json!([nested]);
+    }
+    over_depth[0]["metadata"] = nested;
+    cases.push(("depth", serde_json::to_vec(&over_depth).unwrap()));
+    let mut over_collection = base.clone();
+    over_collection[0]["metadata"] = serde_json::json!(vec![0; 257]);
+    cases.push(("collection", serde_json::to_vec(&over_collection).unwrap()));
+    let mut over_string = base.clone();
+    over_string[0]["metadata"] = "x".repeat(32 * 1024 + 1).into();
+    cases.push(("string", serde_json::to_vec(&over_string).unwrap()));
+    let mut over_bytes = draft_list_json();
+    over_bytes.resize(128 * 1024 + 1, b' ');
+    cases.push(("bytes", over_bytes));
+    let duplicate =
+        String::from_utf8(draft_list_json())
+            .unwrap()
+            .replacen("\"id\":7", "\"id\":7,\"id\":8", 1);
+    cases.push(("duplicate", duplicate.into_bytes()));
+    for (label, bytes) in cases {
+        let fixture = Fixture::new(label, FakeBehavior::Success, &bytes);
+        let output = run_binary(&fixture.config, &request);
+        assert!(!output.status.success(), "accepted {label}");
+        assert!(output.stdout.is_empty(), "leaked {label} child response");
+        assert_eq!(output.stderr, b"github broker failed\n", "{label}");
+    }
 }
 
 #[test]

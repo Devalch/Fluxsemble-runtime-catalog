@@ -32,6 +32,7 @@ const RECOVERY_TEMP: &str = ".recovery-v1.tmp";
 const LATEST_REFERENCE: &str = "catalog-v1.ref";
 const LATEST_TEMP: &str = ".catalog-v1.ref.tmp";
 const REMOTE_OPERATION: &str = "remote-operation-v1.json";
+const BROKER_RECOVERY: &str = "broker-recovery-v1.json";
 const REMOTE_OPERATION_TEMP: &str = ".remote-operation-v1.tmp";
 const REMOTE_WORKFLOW_LOCK: &str = ".remote-workflow-v1.lock";
 const TRANSPORT_OPERATION: &str = "transport-operation-v1.json";
@@ -1015,6 +1016,7 @@ impl StateCapabilities {
             RECOVERY_RECORD.to_owned(),
             RECOVERY_TEMP.to_owned(),
             REMOTE_OPERATION.to_owned(),
+            BROKER_RECOVERY.to_owned(),
             REMOTE_OPERATION_TEMP.to_owned(),
             REMOTE_WORKFLOW_LOCK.to_owned(),
             TRANSPORT_OPERATION.to_owned(),
@@ -1072,6 +1074,7 @@ pub(crate) struct RemoteWorkflowState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RemoteRecordKind {
     Operation,
+    BrokerRecovery,
     DraftReceipt,
     Approval,
     PublicationReceipt,
@@ -1082,6 +1085,7 @@ impl RemoteRecordKind {
     const fn name(self) -> &'static str {
         match self {
             Self::Operation => REMOTE_OPERATION,
+            Self::BrokerRecovery => BROKER_RECOVERY,
             Self::DraftReceipt => DRAFT_RECEIPT,
             Self::Approval => RELEASE_APPROVAL,
             Self::PublicationReceipt => PUBLICATION_RECEIPT,
@@ -1241,6 +1245,26 @@ impl TransportWorkflowLock<'_> {
 }
 
 impl RemoteWorkflowState {
+    pub(crate) fn reference_sha256(&self) -> String {
+        sha256(&self.reference_bytes)
+    }
+
+    pub(crate) fn read_record_locked(
+        &self,
+        lock: &RemoteWorkflowLock<'_>,
+        kind: RemoteRecordKind,
+    ) -> Result<Option<Vec<u8>>, PublishError> {
+        lock.revalidate()?;
+        let bytes = read_optional_state_file(
+            &self.state.latest,
+            kind.name(),
+            MAX_STATE_RECORD_BYTES,
+            false,
+        )?;
+        lock.revalidate()?;
+        Ok(bytes)
+    }
+
     pub(crate) fn local_operation_id(&self) -> &str {
         &self.reference.operation_id
     }
@@ -3832,26 +3856,6 @@ fn encode_hex(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-#[cfg(test)]
-mod persistent_arithmetic_tests {
-    use super::{bounded_add, directory_nlink_matches, rejected};
-
-    #[test]
-    fn persistent_budget_checked_arithmetic_rejects_overflow_and_limit_crossing() {
-        assert_eq!(bounded_add(u64::MAX, 1, u64::MAX), Err(rejected()));
-        assert_eq!(bounded_add(2, 1, 2), Err(rejected()));
-        assert_eq!(bounded_add(1, 1, 2), Ok(2));
-    }
-
-    #[test]
-    fn persistent_directory_link_count_accepts_portable_and_conventional_values_only() {
-        assert!(directory_nlink_matches(1, 4));
-        assert!(directory_nlink_matches(4, 4));
-        assert!(!directory_nlink_matches(0, 4));
-        assert!(!directory_nlink_matches(3, 4));
-    }
-}
-
 fn verify_installer_support(
     payload: &CatalogPayloadV1,
     manifest: &SignedReleaseBundleManifestV1,
@@ -3886,4 +3890,41 @@ fn verify_installer_support(
         }
     }
     Ok(())
+}
+
+/// Read only a canonical owner-reviewed public recovery input, without following path links.
+pub(crate) fn read_recovery_input(path: &Path) -> Result<Vec<u8>, PublishError> {
+    let (parent, name) = open_absolute_parent(path)?;
+    let file = open_regular_at(&parent, &name)?;
+    let metadata = file.metadata().map_err(|_| rejected())?;
+    if !secure_file(&metadata) || metadata.len() == 0 || metadata.len() > MAX_STATE_RECORD_BYTES {
+        return Err(rejected());
+    }
+    let identity = FileIdentity::from_metadata(&metadata);
+    let bytes = read_descriptor(&file, metadata.len())?;
+    let rebound = open_regular_at(&parent, &name)?;
+    if FileIdentity::from_metadata(&rebound.metadata().map_err(|_| rejected())?) != identity {
+        return Err(rejected());
+    }
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod persistent_arithmetic_tests {
+    use super::{bounded_add, directory_nlink_matches, rejected};
+
+    #[test]
+    fn persistent_budget_checked_arithmetic_rejects_overflow_and_limit_crossing() {
+        assert_eq!(bounded_add(u64::MAX, 1, u64::MAX), Err(rejected()));
+        assert_eq!(bounded_add(2, 1, 2), Err(rejected()));
+        assert_eq!(bounded_add(1, 1, 2), Ok(2));
+    }
+
+    #[test]
+    fn persistent_directory_link_count_accepts_portable_and_conventional_values_only() {
+        assert!(directory_nlink_matches(1, 4));
+        assert!(directory_nlink_matches(4, 4));
+        assert!(!directory_nlink_matches(0, 4));
+        assert!(!directory_nlink_matches(3, 4));
+    }
 }

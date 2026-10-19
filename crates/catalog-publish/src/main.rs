@@ -1,13 +1,17 @@
-use std::path::Path;
+use std::{io::Write, path::Path};
 
 use catalog_publish::{FailureOutcome, PublishOutcome};
 
-const MAX_ARGUMENTS: usize = 7;
+const MAX_ARGUMENTS: usize = 9;
 const MAX_ARGUMENT_BYTES: usize = 16 * 1024;
 
 fn main() {
     match run() {
-        Ok(message) => println!("{message}"),
+        Ok(message) => {
+            if !message.is_empty() {
+                println!("{message}");
+            }
+        }
         Err(outcome) => {
             let (message, status) = match outcome {
                 FailureOutcome::Normal => ("catalog publication failed", 2),
@@ -64,6 +68,53 @@ fn run() -> Result<String, FailureOutcome> {
                 PublishOutcome::RecoveryAborted => Ok("recovery aborted".to_owned()),
                 PublishOutcome::Staged => Err(FailureOutcome::Normal),
             }
+        }
+        [
+            command,
+            state_flag,
+            state,
+            config_flag,
+            config,
+            retained_flag,
+            retained,
+        ] if command == "plan-broker-recovery" => {
+            require_flag(state_flag, "--state")?;
+            require_flag(config_flag, "--broker-config")?;
+            require_flag(retained_flag, "--retained-assets")?;
+            let bytes = catalog_publish::plan_broker_recovery(
+                Path::new(state),
+                Path::new(config),
+                Path::new(retained),
+            )
+            .map_err(|e| e.outcome())?;
+            std::io::stdout()
+                .write_all(&bytes)
+                .map_err(|_| FailureOutcome::Normal)?;
+            Ok(String::new())
+        }
+        [
+            command,
+            state_flag,
+            state,
+            config_flag,
+            config,
+            plan_flag,
+            plan,
+            digest_flag,
+            digest,
+        ] if command == "recover-broker" => {
+            require_flag(state_flag, "--state")?;
+            require_flag(config_flag, "--broker-config")?;
+            require_flag(plan_flag, "--plan")?;
+            require_flag(digest_flag, "--plan-sha256")?;
+            catalog_publish::recover_broker(
+                Path::new(state),
+                Path::new(config),
+                Path::new(plan),
+                digest,
+            )
+            .map_err(|e| e.outcome())?;
+            Ok("broker recovery committed; no remote mutation".to_owned())
         }
         [command, state_flag, state, config_flag, config] if command == "stage-remote" => {
             require_flag(state_flag, "--state")?;

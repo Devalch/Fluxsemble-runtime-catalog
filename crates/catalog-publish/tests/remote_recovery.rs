@@ -126,6 +126,9 @@ enum Failure {
 
 #[derive(Default)]
 struct RecoveryBroker {
+    identity: Option<BrokerIdentityDigests>,
+    tag_attempts: usize,
+    draft_attempts: usize,
     tag: Option<RemoteTag>,
     release: Option<RemoteRelease>,
     bytes: BTreeMap<String, Vec<u8>>,
@@ -164,6 +167,9 @@ impl RecoveryBroker {
 
 impl BrokerTransport for RecoveryBroker {
     fn identity_digests(&mut self) -> Result<BrokerIdentityDigests, RemoteBoundaryError> {
+        if let Some(identity) = &self.identity {
+            return Ok(identity.clone());
+        }
         Ok(BrokerIdentityDigests {
             broker_client_config_sha256: CONFIG_SHA256.to_owned(),
             broker_executable_sha256: CONFIG_SHA256.to_owned(),
@@ -177,6 +183,7 @@ impl BrokerTransport for RecoveryBroker {
         tag: &str,
         commit: &str,
     ) -> Result<(), RemoteBoundaryError> {
+        self.tag_attempts += 1;
         let after = self.boundary("create_tag")?;
         if self.tag.is_some() {
             return Err(RemoteBoundaryError);
@@ -225,6 +232,7 @@ impl BrokerTransport for RecoveryBroker {
         notes: &str,
         prerelease: bool,
     ) -> Result<(), RemoteBoundaryError> {
+        self.draft_attempts += 1;
         let after = self.boundary("create_draft")?;
         if self.release.is_some() {
             return Err(RemoteBoundaryError);
@@ -1020,4 +1028,633 @@ fn latest_mismatch_keeps_publication_receipt_and_credential_free_retry_needs_no_
 
 fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+// Break caught: a repaired broker must not require replacing the draft or re-uploading its assets.
+fn repaired_identity() -> BrokerIdentityDigests {
+    BrokerIdentityDigests {
+        broker_client_config_sha256: "bb".repeat(32),
+        broker_executable_sha256: "cc".repeat(32),
+        publisher_broker_config_sha256: CONFIG_SHA256.to_owned(),
+    }
+}
+fn partial_installer(label: &str) -> (TempTree, PathBuf, RecoveryBroker, Vec<u8>) {
+    let temp = TempTree::new(label);
+    let transfer = temp.path("transfer");
+    let state = temp.path("state");
+    support::fixture_installer_transfer(&transfer, 42, None);
+    let verified = local::verify_transferred_fixture_signed_bundle(&transfer).unwrap();
+    local::stage_local(&verified, &state).unwrap();
+    let reference: serde_json::Value =
+        serde_json::from_slice(&fs::read(state.join("latest/catalog-v1.ref")).unwrap()).unwrap();
+    let qualification = reference["operation"]["qualification_reference"]
+        .as_str()
+        .unwrap();
+    let mut broker = RecoveryBroker {
+        fail: Some((format!("download:{qualification}"), Failure::Before)),
+        ..Default::default()
+    };
+    assert!(workflow::stage_remote_fixture_with(&state, &mut broker).is_err());
+    assert_eq!(broker.release.as_ref().unwrap().assets.len(), 5);
+    let prior = fs::read(state.join("latest/remote-operation-v1.json")).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&prior).unwrap()["verified_assets"],
+        4
+    );
+    (temp, state, broker, prior)
+}
+fn retained_observation(broker: &RecoveryBroker) -> Vec<u8> {
+    let release = broker.release.as_ref().unwrap();
+    serde_jcs::to_vec(&serde_json::json!({"release_id":release.release_id,"assets":release.assets.iter().map(|a|serde_json::json!({"asset_id":a.asset_id,"name":a.name,"size":a.size,"sha256":sha256(&broker.bytes[&a.asset_id])})).collect::<Vec<_>>()})).unwrap()
+}
+fn recovery_plan(state: &Path, broker: &RecoveryBroker) -> Vec<u8> {
+    workflow::plan_broker_recovery_fixture(
+        state,
+        repaired_identity(),
+        &retained_observation(broker),
+    )
+    .unwrap()
+}
+#[test]
+fn broker_recovery_preserves_five_existing_assets_and_only_uploads_remaining_two() {
+    let (_temp, state, mut broker, prior) = partial_installer("broker-rebind-five");
+    let original_ref = fs::read(state.join("latest/catalog-v1.ref")).unwrap();
+    let original_assets = broker.release.as_ref().unwrap().assets.clone();
+    let plan = recovery_plan(&state, &broker);
+    assert_eq!(
+        fs::read(state.join("latest/remote-operation-v1.json")).unwrap(),
+        prior
+    );
+    assert!(!state.join("latest/broker-recovery-v1.json").exists());
+    broker.identity = Some(repaired_identity());
+    assert!(
+        workflow::stage_remote_fixture_with(&state, &mut broker).is_err(),
+        "changing pins still requires explicit recovery"
+    );
+    let attempts = (
+        broker.tag_attempts,
+        broker.draft_attempts,
+        broker.upload_mutations.clone(),
+    );
+    workflow::recover_broker_fixture(&state, &plan, &sha256(&plan), &mut broker).unwrap();
+    assert_eq!(
+        (
+            broker.tag_attempts,
+            broker.draft_attempts,
+            broker.upload_mutations.clone()
+        ),
+        attempts,
+        "local recovery has no remote mutations"
+    );
+    let certificate = fs::read(state.join("latest/broker-recovery-v1.json")).unwrap();
+    let proof: serde_json::Value = serde_json::from_slice(&certificate).unwrap();
+    assert_eq!(
+        serde_jcs::to_vec(&proof["body"]["prior_operation"]).unwrap(),
+        prior
+    );
+    assert_eq!(proof["body"]["prior_operation_sha256"], sha256(&prior));
+    assert_eq!(
+        certificate, plan,
+        "exact human-reviewed plan retained as immutable proof"
+    );
+    workflow::stage_remote_fixture_with(&state, &mut broker).unwrap();
+    assert_eq!(
+        broker.tag_attempts, attempts.0,
+        "recovered staging never creates a tag"
+    );
+    assert_eq!(
+        broker.draft_attempts, attempts.1,
+        "recovered staging never creates a draft"
+    );
+    assert_eq!(
+        &broker.release.as_ref().unwrap().assets[..5],
+        &original_assets
+    );
+    assert_eq!(broker.release.as_ref().unwrap().assets.len(), 7);
+    assert_eq!(broker.upload_mutations.len(), 7);
+    assert!(broker.upload_mutations.values().all(|n| *n == 1));
+    assert_eq!(
+        fs::read(state.join("latest/catalog-v1.ref")).unwrap(),
+        original_ref
+    );
+    assert_eq!(
+        fs::read(state.join("latest/broker-recovery-v1.json")).unwrap(),
+        plan
+    );
+    let receipt = fs::read(state.join("latest/draft-receipt-v1.json")).unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&receipt).unwrap();
+    assert_eq!(body["body"]["release_id"], "7");
+    assert_eq!(body["body"]["broker_executable_sha256"], "cc".repeat(32));
+    assert!(body["body"]["draft"].as_bool().unwrap());
+    assert!(!state.join("latest/release-approval-v1.json").exists());
+    workflow::approve_remote_fixture(&state, &sha256(&receipt)).unwrap();
+    let mut latest = BytesLatest(catalog_bytes(&state));
+    workflow::publish_remote_fixture_with(
+        &state,
+        &state.join("latest/release-approval-v1.json"),
+        &mut broker,
+        &mut latest,
+    )
+    .unwrap();
+    assert_eq!(broker.publish_calls, 1);
+}
+#[test]
+fn broker_recovery_digest_and_remote_drift_fail_before_local_or_remote_mutation() {
+    for drift in [
+        "digest",
+        "tag",
+        "release",
+        "missing",
+        "id",
+        "bytes",
+        "extra",
+        "inner_config",
+    ] {
+        let (_temp, state, mut broker, prior) =
+            partial_installer(&format!("broker-rebind-{drift}"));
+        let plan = recovery_plan(&state, &broker);
+        broker.identity = Some(repaired_identity());
+        match drift {
+            "tag" => broker.tag.as_mut().unwrap().commit_sha = "f".repeat(40),
+            "release" => broker.release.as_mut().unwrap().release_id = "8".to_owned(),
+            "missing" => {
+                broker.release.as_mut().unwrap().assets.pop();
+            }
+            "id" => broker.release.as_mut().unwrap().assets[0].asset_id = "999".to_owned(),
+            "bytes" => {
+                let id = broker.release.as_ref().unwrap().assets[0].asset_id.clone();
+                broker.bytes.insert(id, b"wrong".to_vec());
+            }
+            "extra" => {
+                let a = broker.release.as_ref().unwrap().assets[0].clone();
+                broker.release.as_mut().unwrap().assets.push(a);
+            }
+            "inner_config" => {
+                broker
+                    .identity
+                    .as_mut()
+                    .unwrap()
+                    .publisher_broker_config_sha256 = "dd".repeat(32)
+            }
+            _ => {}
+        }
+        let attempts = (
+            broker.tag_attempts,
+            broker.draft_attempts,
+            broker.upload_mutations.clone(),
+        );
+        let digest = if drift == "digest" {
+            "0".repeat(64)
+        } else {
+            sha256(&plan)
+        };
+        assert!(
+            workflow::recover_broker_fixture(&state, &plan, &digest, &mut broker).is_err(),
+            "{drift}"
+        );
+        assert_eq!(
+            fs::read(state.join("latest/remote-operation-v1.json")).unwrap(),
+            prior,
+            "{drift}"
+        );
+        assert!(
+            !state.join("latest/broker-recovery-v1.json").exists(),
+            "{drift}"
+        );
+        assert_eq!(
+            (
+                broker.tag_attempts,
+                broker.draft_attempts,
+                broker.upload_mutations.clone()
+            ),
+            attempts,
+            "{drift}"
+        );
+    }
+}
+#[test]
+fn recovered_staging_rejects_deleted_or_replaced_original_assets_without_fallback_creation() {
+    for drift in ["draft_missing", "asset_missing", "id", "bytes", "tag"] {
+        let (_temp, state, mut broker, _) = partial_installer(&format!("recovered-stage-{drift}"));
+        let plan = recovery_plan(&state, &broker);
+        broker.identity = Some(repaired_identity());
+        workflow::recover_broker_fixture(&state, &plan, &sha256(&plan), &mut broker).unwrap();
+        match drift {
+            "draft_missing" => broker.release = None,
+            "asset_missing" => {
+                broker.release.as_mut().unwrap().assets.pop();
+            }
+            "id" => broker.release.as_mut().unwrap().assets[0].asset_id = "999".to_owned(),
+            "bytes" => {
+                let id = broker.release.as_ref().unwrap().assets[0].asset_id.clone();
+                broker.bytes.insert(id, b"wrong".to_vec());
+            }
+            "tag" => broker.tag = None,
+            _ => {}
+        }
+        let attempts = (
+            broker.tag_attempts,
+            broker.draft_attempts,
+            broker.upload_mutations.clone(),
+        );
+        assert!(
+            workflow::stage_remote_fixture_with(&state, &mut broker).is_err(),
+            "{drift}"
+        );
+        assert_eq!(
+            (
+                broker.tag_attempts,
+                broker.draft_attempts,
+                broker.upload_mutations.clone()
+            ),
+            attempts,
+            "{drift}"
+        );
+        assert!(!state.join("latest/draft-receipt-v1.json").exists());
+    }
+}
+
+#[test]
+fn recovered_suffix_download_failures_preserve_new_ids_and_never_reupload() {
+    for suffix in ["signed-release-bundle-manifest-v1.json", "catalog-v1.json"] {
+        let (_temp, state, mut broker, _) = partial_installer(&format!("suffix-id-{suffix}"));
+        let plan = recovery_plan(&state, &broker);
+        broker.identity = Some(repaired_identity());
+        workflow::recover_broker_fixture(&state, &plan, &sha256(&plan), &mut broker).unwrap();
+        broker.fail = Some((format!("download:{suffix}"), Failure::Before));
+        assert!(workflow::stage_remote_fixture_with(&state, &mut broker).is_err());
+        let original = fs::read(state.join("latest/remote-operation-v1.json")).unwrap();
+        assert!(
+            workflow::recover_broker_fixture(&state, &plan, &sha256(&plan), &mut broker).is_err(),
+            "recovery never rolls back advanced staging"
+        );
+        assert_eq!(
+            fs::read(state.join("latest/remote-operation-v1.json")).unwrap(),
+            original
+        );
+        // Replace only a newly observed suffix ID, retaining its exact bytes/name/size.
+        let index = broker
+            .release
+            .as_ref()
+            .unwrap()
+            .assets
+            .iter()
+            .position(|a| a.name == suffix)
+            .unwrap();
+        let id = broker.release.as_ref().unwrap().assets[index]
+            .asset_id
+            .clone();
+        broker.release.as_mut().unwrap().assets[index].asset_id = "999".to_owned();
+        broker
+            .bytes
+            .insert("999".to_owned(), broker.bytes[&id].clone());
+        let attempts = (
+            broker.tag_attempts,
+            broker.draft_attempts,
+            broker.upload_mutations.clone(),
+        );
+        assert!(
+            workflow::stage_remote_fixture_with(&state, &mut broker).is_err(),
+            "changed newly observed ID must fail: {suffix}"
+        );
+        assert_eq!(
+            (
+                broker.tag_attempts,
+                broker.draft_attempts,
+                broker.upload_mutations.clone()
+            ),
+            attempts
+        );
+        broker.release.as_mut().unwrap().assets[index].asset_id = id;
+        workflow::stage_remote_fixture_with(&state, &mut broker).unwrap();
+        assert!(broker.upload_mutations.values().all(|n| *n == 1));
+        assert_eq!(broker.release.as_ref().unwrap().assets.len(), 7);
+    }
+}
+
+fn broker_from_recovery_plan(state: &Path, plan: &[u8]) -> RecoveryBroker {
+    let p: serde_json::Value = serde_json::from_slice(plan).unwrap();
+    let body = &p["body"]["replacement_operation"]["operation"];
+    let assets = p["body"]["retained"]["assets"].as_array().unwrap();
+    let mut bytes = BTreeMap::new();
+    let remote = assets
+        .iter()
+        .map(|a| {
+            let id = a["asset_id"].as_str().unwrap().to_owned();
+            bytes.insert(
+                id.clone(),
+                fs::read(state.join("objects").join(a["sha256"].as_str().unwrap())).unwrap(),
+            );
+            RemoteReleaseAsset {
+                asset_id: id,
+                name: a["name"].as_str().unwrap().to_owned(),
+                size: a["size"].as_u64().unwrap(),
+            }
+        })
+        .collect();
+    RecoveryBroker {
+        identity: Some(repaired_identity()),
+        tag: Some(RemoteTag {
+            tag: body["tag"].as_str().unwrap().to_owned(),
+            commit_sha: COMMIT.to_owned(),
+            object_type: broker::BrokerTagObjectTypeV1::Commit,
+        }),
+        release: Some(RemoteRelease {
+            release_id: "7".to_owned(),
+            tag: body["tag"].as_str().unwrap().to_owned(),
+            target_commitish: COMMIT.to_owned(),
+            title: body["title"].as_str().unwrap().to_owned(),
+            notes: body["notes"].as_str().unwrap().to_owned(),
+            draft: true,
+            prerelease: false,
+            assets: remote,
+        }),
+        bytes,
+        next_asset: 5,
+        ..Default::default()
+    }
+}
+#[test]
+#[ignore = "launched explicitly as recovery SIGKILL child"]
+fn broker_recovery_sigkill_child() {
+    let state = PathBuf::from(std::env::var("BROKER_RECOVERY_TEST_STATE").unwrap());
+    let checkpoint = std::env::var("BROKER_RECOVERY_TEST_CHECKPOINT").unwrap();
+    let ready = PathBuf::from(std::env::var("BROKER_RECOVERY_TEST_READY").unwrap());
+    let plan = fs::read(state.parent().unwrap().join("reviewed-plan.json")).unwrap();
+    let mut broker = broker_from_recovery_plan(&state, &plan);
+    local::configure_remote_sigkill_checkpoint(
+        (checkpoint != "broker-recovery-v1.json").then_some(checkpoint.as_str()),
+        (checkpoint == "broker-recovery-v1.json").then_some(checkpoint.as_str()),
+        &ready,
+    );
+    workflow::recover_broker_fixture(&state, &plan, &sha256(&plan), &mut broker).unwrap();
+    panic!("recovery checkpoint not reached");
+}
+#[test]
+fn broker_recovery_real_sigkill_checkpoints_settle_only_exact_approved_transition() {
+    for checkpoint in [
+        "broker-recovery-v1.json",
+        "durable-pre-rename",
+        "post-rename-pre-fsync",
+        "final-readback",
+    ] {
+        let (_temp, state, broker, prior) =
+            partial_installer(&format!("broker-recovery-kill-{checkpoint}"));
+        let plan = recovery_plan(&state, &broker);
+        let parent = state.parent().unwrap();
+        fs::write(parent.join("reviewed-plan.json"), &plan).unwrap();
+        let ready = parent.join("recovery-ready");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "broker_recovery_sigkill_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("BROKER_RECOVERY_TEST_STATE", &state)
+            .env("BROKER_RECOVERY_TEST_READY", &ready)
+            .env("BROKER_RECOVERY_TEST_CHECKPOINT", checkpoint)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !ready.exists() {
+            assert!(Instant::now() < deadline, "missed {checkpoint}");
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "early exit {checkpoint}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        child.kill().unwrap();
+        assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGKILL));
+        assert_eq!(
+            fs::read(state.join("latest/broker-recovery-v1.json")).unwrap(),
+            plan
+        );
+        let mut broker = broker_from_recovery_plan(&state, &plan);
+        if matches!(checkpoint, "broker-recovery-v1.json" | "durable-pre-rename") {
+            let before = fs::read(state.join("latest/remote-operation-v1.json")).unwrap();
+            assert_eq!(before, prior);
+            assert!(workflow::stage_remote_fixture_with(&state, &mut broker).is_err());
+            assert!(workflow::approve_remote_fixture(&state, &"0".repeat(64)).is_err());
+            let mut latest = BytesLatest(catalog_bytes(&state));
+            assert!(workflow::verify_latest_fixture_with(&state, &mut latest).is_err());
+            assert!(
+                workflow::publish_remote_fixture_with(
+                    &state,
+                    &state.join("latest/release-approval-v1.json"),
+                    &mut broker,
+                    &mut latest
+                )
+                .is_err()
+            );
+            assert_eq!(broker.tag_attempts, 0);
+            assert_eq!(broker.draft_attempts, 0);
+            assert!(broker.upload_mutations.is_empty());
+        }
+        workflow::recover_broker_fixture(&state, &plan, &sha256(&plan), &mut broker).unwrap();
+        // Exact completed transition is idempotent until staging advances, with no mutation authority.
+        workflow::recover_broker_fixture(&state, &plan, &sha256(&plan), &mut broker).unwrap();
+        assert!(!state.join("latest/.remote-operation-v1.tmp").exists());
+        assert_eq!(
+            fs::read(state.join("latest/broker-recovery-v1.json")).unwrap(),
+            plan
+        );
+        workflow::stage_remote_fixture_with(&state, &mut broker).unwrap();
+        assert_eq!(broker.tag_attempts, 0);
+        assert_eq!(broker.draft_attempts, 0);
+        assert_eq!(broker.upload_mutations.len(), 2);
+        assert!(broker.upload_mutations.values().all(|n| *n == 1));
+    }
+}
+
+#[test]
+fn recovery_rejects_self_consistent_plans_that_change_more_than_broker_pins() {
+    for field in [
+        "source_commit",
+        "source_tree_sha256",
+        "signed_transfer_sha256",
+        "local_operation_id",
+        "publisher_broker_config_sha256",
+        "verified_assets",
+        "release_id",
+        "retained_id_duplicate",
+    ] {
+        let (_temp, state, mut broker, prior) =
+            partial_installer(&format!("plan-boundary-{field}"));
+        let plan = recovery_plan(&state, &broker);
+        let mut p: serde_json::Value = serde_json::from_slice(&plan).unwrap();
+        match field {
+            "verified_assets" => p["body"]["replacement_operation"][field] = serde_json::json!(5),
+            "release_id" => p["body"]["replacement_operation"][field] = serde_json::json!("8"),
+            "retained_id_duplicate" => {
+                p["body"]["retained"]["assets"][1]["asset_id"] =
+                    p["body"]["retained"]["assets"][0]["asset_id"].clone()
+            }
+            _ => {
+                p["body"]["replacement_operation"]["operation"][field] =
+                    serde_json::json!(if field == "source_commit" {
+                        "f".repeat(40)
+                    } else {
+                        "ff".repeat(32)
+                    })
+            }
+        }
+        let mut hash = Sha256::new();
+        hash.update(b"fluxsemble:runtime-catalog-remote-operation:v1\0");
+        hash.update(serde_jcs::to_vec(&p["body"]["replacement_operation"]["operation"]).unwrap());
+        p["body"]["replacement_operation"]["remote_operation_id"] =
+            serde_json::json!(format!("{:x}", hash.finalize()));
+        p["body"]["replacement_operation_sha256"] = serde_json::json!(sha256(
+            &serde_jcs::to_vec(&p["body"]["replacement_operation"]).unwrap()
+        ));
+        let mut hash = Sha256::new();
+        hash.update(b"fluxsemble:runtime-catalog-broker-recovery:v1\0");
+        hash.update(serde_jcs::to_vec(&p["body"]).unwrap());
+        p["recovery_id"] = serde_json::json!(format!("{:x}", hash.finalize()));
+        let bytes = serde_jcs::to_vec(&p).unwrap();
+        broker.identity = Some(repaired_identity());
+        assert!(
+            workflow::recover_broker_fixture(&state, &bytes, &sha256(&bytes), &mut broker).is_err(),
+            "{field}"
+        );
+        assert_eq!(
+            fs::read(state.join("latest/remote-operation-v1.json")).unwrap(),
+            prior
+        );
+        assert!(!state.join("latest/broker-recovery-v1.json").exists());
+    }
+}
+#[test]
+fn malformed_or_mixed_recovery_proofs_block_every_workflow_reader() {
+    for corruption in ["malformed", "prior_hash", "successor_id", "baseline_id"] {
+        let (_temp, state, mut broker, _) =
+            partial_installer(&format!("proof-boundary-{corruption}"));
+        let plan = recovery_plan(&state, &broker);
+        broker.identity = Some(repaired_identity());
+        workflow::recover_broker_fixture(&state, &plan, &sha256(&plan), &mut broker).unwrap();
+        let mut p: serde_json::Value = serde_json::from_slice(&plan).unwrap();
+        match corruption {
+            "prior_hash" => {
+                p["body"]["prior_operation_sha256"] = serde_json::json!("ff".repeat(32))
+            }
+            "successor_id" => {
+                p["body"]["replacement_operation"]["remote_operation_id"] =
+                    serde_json::json!("ff".repeat(32))
+            }
+            "baseline_id" => {
+                p["body"]["retained"]["assets"][0]["asset_id"] = serde_json::json!("999")
+            }
+            _ => {}
+        }
+        let path = state.join("latest/broker-recovery-v1.json");
+        fs::remove_file(&path).unwrap();
+        fs::write(
+            &path,
+            if corruption == "malformed" {
+                b"broken".to_vec()
+            } else {
+                serde_jcs::to_vec(&p).unwrap()
+            },
+        )
+        .unwrap();
+        support::set_mode(&path, 0o400);
+        let before = fs::read(state.join("latest/remote-operation-v1.json")).unwrap();
+        let attempts = (
+            broker.tag_attempts,
+            broker.draft_attempts,
+            broker.upload_mutations.clone(),
+        );
+        assert!(workflow::stage_remote_fixture_with(&state, &mut broker).is_err());
+        assert!(workflow::approve_remote_fixture(&state, &"0".repeat(64)).is_err());
+        let mut latest = BytesLatest(catalog_bytes(&state));
+        assert!(workflow::verify_latest_fixture_with(&state, &mut latest).is_err());
+        assert!(
+            workflow::publish_remote_fixture_with(
+                &state,
+                &state.join("latest/release-approval-v1.json"),
+                &mut broker,
+                &mut latest
+            )
+            .is_err()
+        );
+        assert_eq!(
+            (
+                broker.tag_attempts,
+                broker.draft_attempts,
+                broker.upload_mutations.clone()
+            ),
+            attempts
+        );
+        assert_eq!(
+            fs::read(state.join("latest/remote-operation-v1.json")).unwrap(),
+            before
+        );
+    }
+}
+
+#[test]
+fn recovered_receipt_ids_cannot_diverge_from_immutable_and_observed_asset_ids() {
+    for index in [0, 6] {
+        let (_temp, state, mut broker, _) =
+            partial_installer(&format!("recovered-receipt-id-{index}"));
+        let plan = recovery_plan(&state, &broker);
+        broker.identity = Some(repaired_identity());
+        workflow::recover_broker_fixture(&state, &plan, &sha256(&plan), &mut broker).unwrap();
+        workflow::stage_remote_fixture_with(&state, &mut broker).unwrap();
+        let path = state.join("latest/draft-receipt-v1.json");
+        let mut receipt: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        receipt["body"]["assets"][index]["asset_id"] = serde_json::json!("999");
+        let mut hash = Sha256::new();
+        hash.update(b"fluxsemble:runtime-catalog-draft-receipt:v1\0");
+        hash.update(serde_jcs::to_vec(&receipt["body"]).unwrap());
+        receipt["receipt_id"] = serde_json::json!(format!("{:x}", hash.finalize()));
+        let bytes = serde_jcs::to_vec(&receipt).unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        support::set_mode(&path, 0o400);
+        assert!(
+            workflow::approve_remote_fixture(&state, &sha256(&bytes)).is_err(),
+            "receipt id {index} must remain bound to retained evidence"
+        );
+        assert!(!state.join("latest/release-approval-v1.json").exists());
+    }
+}
+
+#[test]
+fn missing_recovery_certificate_never_restores_legacy_creation_authority() {
+    let (_temp, state, mut broker, _) = partial_installer("missing-recovery-certificate");
+    let plan = recovery_plan(&state, &broker);
+    broker.identity = Some(repaired_identity());
+    workflow::recover_broker_fixture(&state, &plan, &sha256(&plan), &mut broker).unwrap();
+    fs::remove_file(state.join("latest/broker-recovery-v1.json")).unwrap();
+    broker.release = None;
+    let attempts = (
+        broker.tag_attempts,
+        broker.draft_attempts,
+        broker.upload_mutations.clone(),
+    );
+    assert!(workflow::stage_remote_fixture_with(&state, &mut broker).is_err());
+    assert_eq!(
+        (
+            broker.tag_attempts,
+            broker.draft_attempts,
+            broker.upload_mutations.clone()
+        ),
+        attempts,
+        "missing certificate must not enable legacy tag/draft creation attempts"
+    );
+    assert!(workflow::approve_remote_fixture(&state, &"0".repeat(64)).is_err());
+    let mut latest = BytesLatest(catalog_bytes(&state));
+    assert!(workflow::verify_latest_fixture_with(&state, &mut latest).is_err());
+    assert!(
+        workflow::publish_remote_fixture_with(
+            &state,
+            &state.join("latest/release-approval-v1.json"),
+            &mut broker,
+            &mut latest
+        )
+        .is_err()
+    );
 }

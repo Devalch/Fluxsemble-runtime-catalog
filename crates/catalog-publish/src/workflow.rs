@@ -120,6 +120,10 @@ struct RemoteOperationV1 {
     operation: RemoteOperationBodyV1,
     release_id: Option<String>,
     verified_assets: u16,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    observed_remote_assets: Vec<RemoteReceiptAssetV1>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    broker_recovery_required: bool,
     phase: RemoteOperationPhaseV1,
 }
 
@@ -291,18 +295,23 @@ fn stage_remote_inner(
         operation: body,
         release_id: None,
         verified_assets: 0,
+        observed_remote_assets: Vec::new(),
+        broker_recovery_required: false,
         phase: RemoteOperationPhaseV1::Prepared,
     };
     let mut operation = begin_operation(state, initial)?;
 
+    let recovery = broker_recovery::validate_current(state, &lock, &operation.record)?;
     // Create is intentionally attempted on every pre-receipt retry. A failure is resolved only by
     // the immediately following exact readback; tags are never replaced.
     lock.revalidate().map_err(local_error)?;
-    let _create_result = broker.create_tag(
-        REPOSITORY,
-        &operation.record.operation.tag,
-        &operation.record.operation.source_commit,
-    );
+    if recovery.is_none() {
+        let _create_result = broker.create_tag(
+            REPOSITORY,
+            &operation.record.operation.tag,
+            &operation.record.operation.source_commit,
+        );
+    }
     let tag = broker
         .read_tag(REPOSITORY, &operation.record.operation.tag)
         .map_err(|_| mark_uncertain(state, &mut operation))?;
@@ -323,7 +332,22 @@ fn stage_remote_inner(
         RemoteOperationPhaseV1::TagVerified,
     )?;
 
-    let release = ensure_exact_draft(state, &lock, broker, &mut operation, false)?;
+    let release = if let Some(plan) = &recovery {
+        let release = broker
+            .read_draft(REPOSITORY, &operation.record.operation.tag)?
+            .ok_or_else(recovery_required)?;
+        require_release(
+            &release,
+            &operation.record.operation,
+            operation.record.release_id.as_deref(),
+            true,
+            false,
+        )?;
+        broker_recovery::require_preserved(state, &lock, plan, &release)?;
+        release
+    } else {
+        ensure_exact_draft(state, &lock, broker, &mut operation, false)?
+    };
     let release_id = release.release_id.clone();
     let verified_assets = operation.record.verified_assets;
     update_operation(
@@ -334,7 +358,14 @@ fn stage_remote_inner(
         RemoteOperationPhaseV1::DraftBound,
     )?;
 
-    let receipt_assets = verify_and_upload_all(state, &lock, broker, &mut operation, &release_id)?;
+    let receipt_assets = verify_and_upload_all(
+        state,
+        &lock,
+        broker,
+        &mut operation,
+        &release_id,
+        recovery.as_ref(),
+    )?;
     update_operation(
         state,
         &mut operation,
@@ -359,6 +390,9 @@ fn stage_remote_inner(
         .read_draft(REPOSITORY, &operation.record.operation.tag)
         .map_err(|_| mark_uncertain(state, &mut operation))?
         .ok_or_else(|| mark_uncertain(state, &mut operation))?;
+    if let Some(plan) = &recovery {
+        broker_recovery::require_preserved(state, &lock, plan, &final_release)?;
+    }
     require_release(
         &final_release,
         &operation.record.operation,
@@ -1022,6 +1056,15 @@ fn settle_pending_operation(
         .map_err(|_| uncertain())?;
     if let Some(operation) = &main {
         validate_operation_binding(operation, state, expected_body).map_err(|_| uncertain())?;
+        broker_recovery::validate_current(state, lock, operation)?;
+    }
+    if main.is_none()
+        && state
+            .read_record_locked(lock, RemoteRecordKind::BrokerRecovery)
+            .map_err(local_error)?
+            .is_some()
+    {
+        return Err(recovery_required());
     }
     let Some(temporary) = temporary else {
         if let Some(main_bytes) = main_bytes.as_deref() {
@@ -1032,6 +1075,7 @@ fn settle_pending_operation(
         return Ok(());
     };
     validate_operation_binding(&temporary, state, expected_body).map_err(|_| uncertain())?;
+    broker_recovery::validate_current(state, lock, &temporary)?;
 
     let (promote, permitted) = match &main {
         None => (
@@ -1060,7 +1104,8 @@ fn settle_pending_operation(
 }
 
 fn schema_authorized_next(current: &RemoteOperationV1, next: &RemoteOperationV1) -> bool {
-    if current.schema_version != next.schema_version
+    if current.broker_recovery_required != next.broker_recovery_required
+        || current.schema_version != next.schema_version
         || current.remote_operation_id != next.remote_operation_id
         || current.operation != next.operation
         || next.verified_assets < current.verified_assets
@@ -1068,6 +1113,20 @@ fn schema_authorized_next(current: &RemoteOperationV1, next: &RemoteOperationV1)
         || current.release_id.is_some() && current.release_id != next.release_id
     {
         return false;
+    }
+    if !next
+        .observed_remote_assets
+        .starts_with(&current.observed_remote_assets)
+    {
+        return false;
+    }
+    if next.phase == current.phase
+        && next.phase == RemoteOperationPhaseV1::Uploading
+        && next.verified_assets == current.verified_assets
+        && next.observed_remote_assets != current.observed_remote_assets
+        && next.observed_remote_assets.len() == next.verified_assets as usize + 1
+    {
+        return true;
     }
     if next.phase == RemoteOperationPhaseV1::Uncertain {
         return next.release_id == current.release_id
@@ -1309,6 +1368,7 @@ fn verify_and_upload_all(
     broker: &mut dyn BrokerTransport,
     operation: &mut OperationHandle,
     release_id: &str,
+    recovery: Option<&broker_recovery::RecoveryPlan>,
 ) -> Result<Vec<RemoteReceiptAssetV1>, RemoteWorkflowError> {
     let mut receipts = Vec::with_capacity(operation.record.operation.assets.len());
     for index in 0..operation.record.operation.assets.len() {
@@ -1325,6 +1385,9 @@ fn verify_and_upload_all(
             false,
         )?;
         require_asset_prefix(&before.assets, &operation.record.operation.assets)?;
+        if let Some(plan) = recovery {
+            broker_recovery::require_preserved(state, lock, plan, &before)?;
+        }
         let remote_asset = if before.assets.len() > index {
             matching_remote_asset(&before.assets, &expected)?.clone()
         } else {
@@ -1358,6 +1421,9 @@ fn verify_and_upload_all(
             .inspect_err(|_| {
                 let _ = mark_operation_uncertain(state, operation);
             })?;
+            if let Some(plan) = recovery {
+                broker_recovery::require_preserved(state, lock, plan, &after)?;
+            }
             require_single_new_asset(&before.assets, &after.assets, &expected).inspect_err(
                 |_| {
                     let _ = mark_operation_uncertain(state, operation);
@@ -1372,6 +1438,16 @@ fn verify_and_upload_all(
                 })?
                 .clone()
         };
+        if let Some(plan) = recovery {
+            let mut observed = receipts.clone();
+            observed.push(RemoteReceiptAssetV1 {
+                asset_id: remote_asset.asset_id.clone(),
+                name: expected.name.clone(),
+                size: expected.size,
+                sha256: expected.sha256.clone(),
+            });
+            broker_recovery::observe_suffix(state, plan, operation, &observed)?;
+        }
         verify_download(broker, REPOSITORY, &remote_asset, &expected).inspect_err(|_| {
             let _ = mark_operation_uncertain(state, operation);
         })?;
@@ -1596,6 +1672,24 @@ fn validate_operation(operation: &RemoteOperationV1) -> Result<(), RemoteWorkflo
     {
         return Err(recovery_required());
     }
+    let observed = &operation.observed_remote_assets;
+    if (!operation.broker_recovery_required && !observed.is_empty())
+        || observed.len() > operation.verified_assets as usize + 1
+        || observed.len() > operation.operation.assets.len()
+    {
+        return Err(recovery_required());
+    }
+    let mut ids = BTreeSet::new();
+    for (a, expected) in observed.iter().zip(&operation.operation.assets) {
+        if !valid_decimal_id(&a.asset_id)
+            || !ids.insert(&a.asset_id)
+            || a.name != expected.name
+            || a.size != expected.size
+            || a.sha256 != expected.sha256
+        {
+            return Err(recovery_required());
+        }
+    }
     Ok(())
 }
 
@@ -1699,6 +1793,7 @@ fn validate_draft_receipt(
     {
         return Err(recovery_required());
     }
+    broker_recovery::require_receipt_ids(state, &operation, &receipt.body.assets)?;
     Ok(())
 }
 
@@ -1945,3 +2040,12 @@ impl From<RemoteBoundaryError> for RemoteWorkflowError {
         uncertain()
     }
 }
+
+#[path = "broker_recovery.rs"]
+mod broker_recovery;
+#[cfg_attr(test, allow(unused_imports))]
+pub use broker_recovery::{plan_broker_recovery, recover_broker};
+#[cfg(test)]
+#[allow(unused_imports)]
+// Integration targets include this module directly; only recovery targets use these bridges.
+pub(crate) use broker_recovery::{plan_broker_recovery_fixture, recover_broker_fixture};

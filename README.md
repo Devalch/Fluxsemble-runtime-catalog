@@ -15,3 +15,7 @@ catalog-wizard release
 ```
 
 See `docs/guided-release.md`.
+
+For a partial draft blocked by a reviewed broker repair, use the explicit
+[broker recovery workflow](docs/broker-recovery.md); preserve the original state
+and remote asset IDs.
