@@ -599,7 +599,7 @@ impl ReleaseMachine for ProductionRelease<'_> {
             ))?;
         }
         let initial = read_canonical_candidate(&self.state.work_dir.join("unsigned-candidate"))?;
-        let final_bytes = read_canonical_candidate(&final_candidate)?;
+        let final_bytes = read_final_candidate(&final_candidate)?;
         if self.state.schema_version == 2 {
             let source = catalog_core::CatalogSourceV2::from_json(&read_bounded_regular(
                 &source,
@@ -1439,6 +1439,10 @@ fn build_catalog_source(state: &WizardState) -> Result<PathBuf, WizardError> {
     Ok(source_path)
 }
 
+fn read_final_candidate(directory: &Path) -> Result<Vec<u8>, WizardError> {
+    read_canonical_candidate(&directory.join("candidate.json"))
+}
+
 fn read_canonical_candidate(path: &Path) -> Result<Vec<u8>, WizardError> {
     let bytes = read_bounded_regular(path, 8 * 1024 * 1024)?;
     if serde_json::from_slice::<serde_json::Value>(&bytes)
@@ -1914,6 +1918,24 @@ fn encode_sha256(bytes: &[u8; 32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn final_candidate_is_read_from_the_signer_output_directory() {
+        let root =
+            std::env::temp_dir().join(format!("catalog-final-candidate-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let fixture = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../conformance/pi-installer-release-v1/vectors/valid-payload.json"
+        ))
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&fixture).unwrap();
+        let expected = serde_jcs::to_vec(&value).unwrap();
+        std::fs::write(root.join("candidate.json"), &expected).unwrap();
+        let result = read_final_candidate(&root);
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(result.unwrap(), expected);
+    }
 
     struct ReleaseHarness {
         phase: ReleasePhase,
