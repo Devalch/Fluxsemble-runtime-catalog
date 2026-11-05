@@ -96,13 +96,6 @@ impl TrustedExecutable {
             return Err(WizardError::ExternalCommand);
         }
         let sha256 = hash_file(&mut file, metadata.len())?;
-        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
-        if flags < 0
-            // SAFETY: fcntl only updates descriptor flags on this retained descriptor.
-            || unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0
-        {
-            return Err(WizardError::ExternalCommand);
-        }
         Ok(Self {
             file,
             device: metadata.dev(),
@@ -192,6 +185,27 @@ mod tests {
         fs::write(&trusted_binary, b"trusted executable").unwrap();
         fs::set_permissions(&trusted_binary, fs::Permissions::from_mode(0o700)).unwrap();
         TrustedExecutable::open_in(&trusted, "catalog-sign-launcher").unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn retained_executable_closes_its_descriptor_on_exec() {
+        let root = temporary_directory();
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let binary = root.join("catalog-sign-launcher");
+        fs::copy("/bin/true", &binary).unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut executable = TrustedExecutable::open_in(&root, "catalog-sign-launcher").unwrap();
+        let flags = unsafe { libc::fcntl(executable.file.as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
+        assert!(
+            sanitized_command(&executable, &[])
+                .status()
+                .unwrap()
+                .success()
+        );
+        executable.verify_unchanged().unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 
