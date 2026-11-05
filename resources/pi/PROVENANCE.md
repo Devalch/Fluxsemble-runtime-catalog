@@ -1,10 +1,10 @@
 # Public Pi producer policy data
 
-The supported-contracts-v1.json bytes are the independently admitted public
-manifest already present in catalog-acquire's Pi installer fixture. SHA-256:
-`3fb5c10c327b14a8537b1a748961ca034d8685ac71f20132ee5039b12b315747`.
-Its serialization is JCS followed by one LF. The behavioral profile is independent
-of Pi versions, archives, package count, and the tested application's binary hashes.
+The supported-contracts-v1.json bytes are the public consumer contract profile
+from Fluxsemble commit `6759bb6644ac13b8e23e1c0d27c413c8b0a662e7`, SHA-256
+`82d2ab10c550bd2f8ec1a4f5a2513f19332ad3f52729d0f14f1bc7647624d704`.
+Its serialization is JCS followed by one LF. This import does not constitute
+successful qualification or signed-catalog trust.
 
 The explicit consumer requirement in consumer-policy-v1.json is imported from
 the reviewed Fluxsemble input-only receipt at product commit `4d6c362`,

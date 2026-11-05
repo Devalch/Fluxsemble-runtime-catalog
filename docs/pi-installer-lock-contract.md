@@ -46,15 +46,15 @@ authorizes contacting any origin.
 | `lockfile_version` | integer 3 |
 | `pi_rpc` | integer 1 |
 | `pi_session` | integer 1 |
-| `execution_payload` | integer 3 |
-| `tool_wire` | integer 1 |
+| `execution_payload` | integer 3 or 4 |
+| `tool_wire` | integer 1 or 2 |
 | `channel_layout` | integer 2 |
 | `native_auth` | integer 1 |
 | `resource_policy_sha256` | SHA-256 |
 | `tool_policy_sha256` | SHA-256 |
 | `execution_policy_sha256` | SHA-256 |
 
-Unknown numeric contract versions fail structural parsing. Policy digests are
+The accepted execution/tool pairs are `(3, 1)` and `(4, 2)`. Other pairs fail structural parsing. Policy digests are
 required, syntactically validated claims; matching them to supported policy is
 an admission operation, not a parser operation. The behavioral profile ID is
 `builtin-pi-installer-lock-contracts-v1`. The supported policy is independent of
@@ -304,8 +304,8 @@ The tested behavioral profile digest is SHA-256 of JCS of
 `{schema_version: 1, profile_id: "builtin-pi-installer-lock-contracts-v1",
 required_contracts: <typed-contracts>}` followed by exactly one LF. The producer
 reconstructs this serialization and compares its digest to verification-build
-evidence. Its independent known answer is the admitted public manifest SHA-256
-`3fb5c10c327b14a8537b1a748961ca034d8685ac71f20132ee5039b12b315747`.
+evidence. The current public manifest SHA-256 is
+`82d2ab10c550bd2f8ec1a4f5a2513f19332ad3f52729d0f14f1bc7647624d704`.
 Application/daemon hashes bind the recorded tested build to the selected source;
 they do not require installing consumers to have those executable hashes.
 

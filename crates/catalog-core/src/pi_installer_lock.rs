@@ -40,7 +40,17 @@ impl PiRequiredContractsV1 {
                 w.tool_wire,
                 w.channel_layout,
                 w.native_auth,
-            ) == (1, 3, 1, 1, 3, 1, 2, 1),
+            ) == (1, 3, 1, 1, 3, 1, 2, 1)
+                || (
+                    w.installer_policy,
+                    w.lockfile_version,
+                    w.pi_rpc,
+                    w.pi_session,
+                    w.execution_payload,
+                    w.tool_wire,
+                    w.channel_layout,
+                    w.native_auth,
+                ) == (1, 3, 1, 1, 4, 2, 2, 1),
         )?;
         Ok(Self {
             installer_policy: w.installer_policy,

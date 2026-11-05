@@ -435,3 +435,37 @@ fn standalone_required_contracts_reject_duplicates_unknowns_and_size() {
     );
     assert!(catalog_core::PiRequiredContractsV1::from_json(&vec![b' '; 65537]).is_err());
 }
+
+#[test]
+fn standalone_contracts_accept_current_and_legacy_profiles() {
+    let profile: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "fixtures/catalog/pi-installer-v1/valid-wrapper-root.json"
+    ))
+    .unwrap();
+    let mut contracts = profile["required_contracts"].clone();
+    for (execution_payload, tool_wire, accepted) in [
+        (3, 1, true),
+        (4, 2, true),
+        (3, 2, false),
+        (4, 1, false),
+        (5, 2, false),
+    ] {
+        contracts["execution_payload"] = execution_payload.into();
+        contracts["tool_wire"] = tool_wire.into();
+        let bytes = serde_json::to_vec(&contracts).unwrap();
+        assert_eq!(
+            catalog_core::PiRequiredContractsV1::from_json(&bytes).is_ok(),
+            accepted
+        );
+    }
+}
+
+#[test]
+fn current_producer_profile_is_accepted_as_required_contracts() {
+    let profile: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "../../../resources/pi/supported-contracts-v1.json"
+    ))
+    .unwrap();
+    let bytes = serde_json::to_vec(&profile["required_contracts"]).unwrap();
+    assert!(catalog_core::PiRequiredContractsV1::from_json(&bytes).is_ok());
+}

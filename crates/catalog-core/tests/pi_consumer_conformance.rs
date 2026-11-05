@@ -36,7 +36,9 @@ fn data(name: &str) -> Vec<u8> {
 fn same_consumer_verifies_independent_transferred_a_and_b_qualification_bindings() {
     let before = consumer_sha();
     let reference = sha(&data("reference.json"));
-    let supported = include_bytes!("../../../resources/pi/supported-contracts-v1.json");
+    let supported = include_bytes!(
+        "../../catalog-acquire/tests/fixtures/pi-installer/supported-contracts-v1.json"
+    );
     let contracts: Value = serde_json::from_slice(supported).unwrap();
     let manifest: Value = serde_json::from_slice(&data("manifest.json")).unwrap();
     for entry in manifest["entries"].as_array().unwrap() {
@@ -106,7 +108,7 @@ fn same_consumer_verifies_independent_transferred_a_and_b_qualification_bindings
         sha(supported),
         sha(&std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../resources/pi/supported-contracts-v1.json"
+            "/../catalog-acquire/tests/fixtures/pi-installer/supported-contracts-v1.json"
         ))
         .unwrap())
     );
