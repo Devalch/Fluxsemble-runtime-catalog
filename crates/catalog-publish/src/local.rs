@@ -383,7 +383,7 @@ impl VerifiedTransferredSignedBundle {
     fn reverify_all(&self) -> Result<(), PublishError> {
         let root_metadata = self.root.metadata().map_err(|_| rejected())?;
         if !secure_directory(&root_metadata)
-            || root_metadata.nlink() != 3
+            || !directory_nlink_matches(root_metadata.nlink(), 3)
             || FileIdentity::from_metadata(&root_metadata) != self.root_identity
             || enumerate_names(&self.root, TRANSFER_ROOT_ENUMERATION_LIMITS)? != self.root_names
         {
@@ -392,7 +392,7 @@ impl VerifiedTransferredSignedBundle {
         let rebound_bundle = open_directory_at(&self.root, SIGNED_BUNDLE)?;
         let bundle_metadata = rebound_bundle.metadata().map_err(|_| rejected())?;
         if !secure_directory(&bundle_metadata)
-            || bundle_metadata.nlink() != 2
+            || !directory_nlink_matches(bundle_metadata.nlink(), 2)
             || FileIdentity::from_metadata(&bundle_metadata) != self.bundle_identity
             || enumerate_names(&self.bundle, TRANSFER_BUNDLE_ENUMERATION_LIMITS)?
                 != self.bundle_names
@@ -439,7 +439,7 @@ fn verify_transferred_signed_bundle_with(
 ) -> Result<VerifiedTransferredSignedBundle, PublishError> {
     let root = open_absolute_directory(path)?;
     let root_metadata = root.metadata().map_err(|_| rejected())?;
-    if !secure_directory(&root_metadata) || root_metadata.nlink() != 3 {
+    if !secure_directory(&root_metadata) || !directory_nlink_matches(root_metadata.nlink(), 3) {
         return Err(rejected());
     }
     let root_identity = FileIdentity::from_metadata(&root_metadata);
@@ -449,7 +449,7 @@ fn verify_transferred_signed_bundle_with(
     }
     let bundle = open_directory_at(&root, SIGNED_BUNDLE)?;
     let bundle_metadata = bundle.metadata().map_err(|_| rejected())?;
-    if !secure_directory(&bundle_metadata) || bundle_metadata.nlink() != 2 {
+    if !secure_directory(&bundle_metadata) || !directory_nlink_matches(bundle_metadata.nlink(), 2) {
         return Err(rejected());
     }
     let bundle_identity = FileIdentity::from_metadata(&bundle_metadata);
