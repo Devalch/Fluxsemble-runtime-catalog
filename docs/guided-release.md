@@ -12,6 +12,8 @@ The wizard will ask you to choose a Pi version, confirm a Node version, and choo
 catalog-wizard resume
 ```
 
+Before allocating a sequence, the wizard verifies the production signature and sequence of the latest published catalog. If local catalog source records exist, their highest sequence must also match; extra tags or a next-sequence draft still stop the release.
+
 The wizard independently verifies the returned canonical `build-binding-v1.json` and `qualification-v1.json`, exact final subject, all required passing results and unchanged contracts before signing or publishing. A compatible later Pi release needs no consumer rebuild or development-reference refresh. A local unsigned candidate is not a signed, published or installed release. See [the wire contract](pi-installer-lock-contract.md) for the exact public handoff; no consumer source checkout is a producer prerequisite.
 
 First-time setup:

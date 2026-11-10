@@ -1769,21 +1769,29 @@ struct GithubSequenceObservation {
     published: Option<u64>,
     tags: BTreeSet<u64>,
     next_draft_exists: bool,
+    published_verified: bool,
 }
 
 fn reconcile_github_state(
     local: Option<u64>,
     observation: &GithubSequenceObservation,
 ) -> Result<u64, WizardError> {
+    if observation.published.is_some() && !observation.published_verified {
+        return Err(WizardError::Discovery);
+    }
+    if local.is_some() && local != observation.published {
+        return Err(WizardError::Discovery);
+    }
+    let latest = local.or(observation.published);
     let next =
-        compare_sequences(local, observation.published).map_err(|_| WizardError::Discovery)?;
+        compare_sequences(latest, observation.published).map_err(|_| WizardError::Discovery)?;
     if observation
         .published
         .is_some_and(|published| !observation.tags.contains(&published))
         || observation
             .tags
             .iter()
-            .any(|sequence| Some(*sequence) > local)
+            .any(|sequence| Some(*sequence) > latest)
         || observation.next_draft_exists
     {
         return Err(WizardError::Discovery);
@@ -1800,14 +1808,76 @@ fn github_sequence_observation(
     let tags = parse_catalog_tag_sequences(&tags_page.value, tags_page.pagination_link_present)?;
     let published =
         parse_published_sequence(&releases_page.value, releases_page.pagination_link_present)?;
-    let next = compare_sequences(local, published).map_err(|_| WizardError::Discovery)?;
+    if local.is_some() && local != published {
+        return Err(WizardError::Discovery);
+    }
+    if let Some(sequence) = published {
+        let bytes = fetch_published_catalog(sequence)?;
+        verified_published_sequence(&bytes, sequence)?;
+    }
+    let next =
+        compare_sequences(local.or(published), published).map_err(|_| WizardError::Discovery)?;
     let next_draft_exists = catalog_publish::catalog_draft_exists(broker_config, next)
         .map_err(|_| WizardError::Discovery)?;
     Ok(GithubSequenceObservation {
         published,
         tags,
         next_draft_exists,
+        published_verified: published.is_some(),
     })
+}
+
+fn verified_published_sequence(bytes: &[u8], expected: u64) -> Result<u64, WizardError> {
+    let catalog = catalog_core::verify_signed_catalog(bytes).map_err(|_| WizardError::Discovery)?;
+    let sequence = catalog.payload().sequence().get();
+    if sequence != expected {
+        return Err(WizardError::Discovery);
+    }
+    Ok(sequence)
+}
+
+fn fetch_published_catalog(sequence: u64) -> Result<Vec<u8>, WizardError> {
+    let url = format!(
+        "https://github.com/{REPOSITORY}/releases/download/catalog-v1-sequence-{sequence}/catalog-v1.json"
+    );
+    let client = Client::builder()
+        .https_only(true)
+        .use_rustls_tls()
+        .no_proxy()
+        .redirect(Policy::custom(|attempt| {
+            if attempt.previous().len() < 4
+                && attempt.url().scheme() == "https"
+                && matches!(
+                    attempt.url().host_str(),
+                    Some("github.com" | "release-assets.githubusercontent.com")
+                )
+            {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        }))
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(20))
+        .build()
+        .map_err(|_| WizardError::Discovery)?;
+    let response = client
+        .get(url)
+        .header(USER_AGENT, "catalog-wizard/0.1.0")
+        .send()
+        .map_err(|_| WizardError::Discovery)?;
+    if response.status() != StatusCode::OK {
+        return Err(WizardError::Discovery);
+    }
+    let mut bytes = Vec::new();
+    response
+        .take(MAX_GITHUB_RESPONSE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| WizardError::Discovery)?;
+    if bytes.len() as u64 > MAX_GITHUB_RESPONSE_BYTES {
+        return Err(WizardError::Discovery);
+    }
+    Ok(bytes)
 }
 
 struct GithubJsonPage {
@@ -2244,6 +2314,34 @@ mod tests {
     }
 
     #[test]
+    fn published_catalog_sequence_requires_authentic_matching_catalog() {
+        let catalog = include_bytes!("../tests/fixtures/production-catalog-v1.json");
+        assert_eq!(verified_published_sequence(catalog, 6).unwrap(), 6);
+        assert!(verified_published_sequence(catalog, 5).is_err());
+        let mut tampered = catalog.to_vec();
+        let pos = tampered.windows(7).position(|w| w == b"builtin").unwrap();
+        tampered[pos] = b'B';
+        assert!(verified_published_sequence(&tampered, 6).is_err());
+    }
+
+    #[test]
+    fn sequence_reconciliation_accepts_only_verified_published_history() {
+        let mut observation = GithubSequenceObservation {
+            published: Some(6),
+            tags: BTreeSet::from([5, 6]),
+            next_draft_exists: false,
+            published_verified: true,
+        };
+        assert_eq!(reconcile_github_state(None, &observation).unwrap(), 7);
+        assert!(reconcile_github_state(Some(5), &observation).is_err());
+        observation.published_verified = false;
+        assert!(reconcile_github_state(None, &observation).is_err());
+        observation.published_verified = true;
+        observation.tags.insert(7);
+        assert!(reconcile_github_state(None, &observation).is_err());
+    }
+
+    #[test]
     fn github_tag_observation_requests_maximum_page_and_rejects_pagination() {
         assert!(GITHUB_TAGS_URL.ends_with("?per_page=100"));
         let partial = json!([{"ref": "refs/tags/catalog-v1-sequence-4"}]);
@@ -2270,6 +2368,7 @@ mod tests {
                     published: Some(4),
                     tags: std::collections::BTreeSet::from([4, 5]),
                     next_draft_exists: false,
+                    published_verified: true,
                 }
             )
             .is_err()
@@ -2281,6 +2380,7 @@ mod tests {
                     published: Some(4),
                     tags: std::collections::BTreeSet::from([4]),
                     next_draft_exists: true,
+                    published_verified: true,
                 }
             )
             .is_err()
@@ -2292,6 +2392,7 @@ mod tests {
                     published: Some(4),
                     tags: std::collections::BTreeSet::from([4]),
                     next_draft_exists: false,
+                    published_verified: true,
                 }
             )
             .unwrap(),
