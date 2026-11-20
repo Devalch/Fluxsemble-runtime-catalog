@@ -199,7 +199,7 @@ fn real_launcher_authenticates_static_signer_and_transfer_before_isolated_failur
 }
 
 #[test]
-fn launcher_owner_ancestors_accept_only_0700_or_0755() {
+fn launcher_owner_ancestors_accept_non_writable_owner_directories() {
     let root = TempRoot::new();
     let static_source = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/x86_64-unknown-linux-musl/release/catalog-sign")
@@ -209,8 +209,10 @@ fn launcher_owner_ancestors_accept_only_0700_or_0755() {
     for (mode, admitted) in [
         (0o700, true),
         (0o755, true),
-        (0o750, false),
-        (0o751, false),
+        (0o710, true),
+        (0o750, true),
+        (0o751, true),
+        (0o720, false),
         (0o775, false),
     ] {
         let ancestor = root.path.join(format!("owner-ancestor-{mode:o}"));

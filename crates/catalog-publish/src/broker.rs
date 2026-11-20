@@ -2658,7 +2658,7 @@ fn safe_ancestor(metadata: &fs::Metadata) -> bool {
     }
     let mode = metadata.permissions().mode() & 0o7777;
     (metadata.uid() == 0 && matches!(mode, 0o555 | 0o755 | 0o1777))
-        || (metadata.uid() == current_euid() && matches!(mode, 0o700 | 0o755))
+        || (metadata.uid() == current_euid() && mode & 0o7722 == 0o700)
 }
 
 fn secure_config_file(metadata: &fs::Metadata) -> bool {

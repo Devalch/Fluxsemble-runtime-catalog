@@ -1681,7 +1681,7 @@ fn executable_is_supported_elf_only_and_retained_after_final_rebind() {
 }
 
 #[test]
-fn broker_and_client_ancestors_accept_only_owner_0700_or_0755_and_config_accepts_0755() {
+fn broker_and_client_ancestors_accept_non_writable_owner_directories() {
     let accepted = Fixture::new("owner-0755-accepted", FakeBehavior::Success, &tag_json());
     let (client_config, _) = broker_client_fixture(&accepted);
     fs::set_permissions(&accepted.root.0, fs::Permissions::from_mode(0o755)).unwrap();
@@ -1689,7 +1689,19 @@ fn broker_and_client_ancestors_accept_only_owner_0700_or_0755_and_config_accepts
     assert!(execute(&accepted, &read_tag_request()).is_ok());
     assert!(BrokerClient::open(&client_config).is_ok());
 
-    for mode in [0o750, 0o751, 0o711, 0o775] {
+    for mode in [0o710, 0o711, 0o750, 0o751] {
+        let fixture = Fixture::new(
+            &format!("owner-ancestor-{mode:o}-accepted"),
+            FakeBehavior::Success,
+            &tag_json(),
+        );
+        let (client_config, _) = broker_client_fixture(&fixture);
+        fs::set_permissions(&fixture.root.0, fs::Permissions::from_mode(mode)).unwrap();
+        assert!(execute(&fixture, &read_tag_request()).is_ok(), "{mode:o}");
+        assert!(BrokerClient::open(&client_config).is_ok(), "{mode:o}");
+    }
+
+    for mode in [0o720, 0o702, 0o775, 0o1700] {
         let fixture = Fixture::new(
             &format!("owner-ancestor-{mode:o}-rejected"),
             FakeBehavior::Success,
