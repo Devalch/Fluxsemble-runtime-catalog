@@ -303,19 +303,23 @@ fn resume_in_repo(
     qualification_path: Option<&Path>,
     prompter: &mut dyn Prompter,
 ) -> Result<(), WizardError> {
-    let state = select_resumable_state(repo, prompter)?;
+    let mut state = select_resumable_state(repo, prompter)?;
     validate_resumed_state(repo, &state)?;
+    verify_resumed_source_identity(&state, &source_identity(repo)?)?;
+    require_trusted_machine(repo, required_roles(state.mode))?;
+    if state.phase != ReleasePhase::Published {
+        require_clean_head(repo)?;
+    }
+    recover_verified_published_phase(&mut state)?;
     if state.phase == ReleasePhase::Published {
         require_clean_or_exact_pending_evidence(repo, &state)?;
     } else {
         require_clean_head(repo)?;
     }
-    verify_resumed_source_identity(&state, &source_identity(repo)?)?;
-    require_trusted_machine(repo, required_roles(state.mode))?;
     if state.phase != ReleasePhase::Published {
         let local = local_latest_sequence(repo)?;
         let observation = github_sequence_observation(local, &publisher_broker_config()?)?;
-        if reconcile_github_state(local, &observation)? != state.sequence {
+        if reconcile_resumed_github_state(&state, local, &observation)? != state.sequence {
             return Err(WizardError::Discovery);
         }
     }
@@ -329,6 +333,33 @@ fn resume_in_repo(
         prompter,
     );
     drive_release(&mut release)
+}
+
+fn recover_verified_published_phase(state: &mut WizardState) -> Result<(), WizardError> {
+    if state.schema_version != 3
+        || !matches!(
+            state.phase,
+            ReleasePhase::LocalStaged | ReleasePhase::RemoteDraftStaged | ReleasePhase::Approved
+        )
+    {
+        return Ok(());
+    }
+    let root = state.work_dir.join("publish-state/latest");
+    let latest_path = root.join("latest-receipt-v1.json");
+    if !latest_path.exists() {
+        return Ok(());
+    }
+    let draft = read_recoverable_file(&root.join("draft-receipt-v1.json"), 8 * 1024 * 1024)?;
+    let approval = read_recoverable_file(&root.join("release-approval-v1.json"), 8 * 1024 * 1024)?;
+    let publication =
+        read_recoverable_file(&root.join("publication-receipt-v1.json"), 8 * 1024 * 1024)?;
+    let latest = read_recoverable_file(&latest_path, 8 * 1024 * 1024)?;
+    let mut completed = state.clone();
+    completed.phase = ReleasePhase::Published;
+    validate_public_receipts(&completed, &draft, &approval, &publication, &latest)?;
+    completed.save(&state.work_dir.join("wizard-state.json"))?;
+    *state = completed;
+    Ok(())
 }
 
 trait ReleaseMachine {
@@ -1821,6 +1852,43 @@ fn reconcile_github_state(
     Ok(next)
 }
 
+fn reconcile_resumed_github_state(
+    state: &WizardState,
+    local: Option<u64>,
+    observation: &GithubSequenceObservation,
+) -> Result<u64, WizardError> {
+    if state.schema_version != 3
+        || !matches!(
+            state.phase,
+            ReleasePhase::LocalStaged | ReleasePhase::RemoteDraftStaged | ReleasePhase::Approved
+        )
+    {
+        return reconcile_github_state(local, observation);
+    }
+    if observation.published.is_some() && !observation.published_verified
+        || local.is_some() && local != observation.published
+    {
+        return Err(WizardError::Discovery);
+    }
+    let prior = local.or(observation.published);
+    let next =
+        compare_sequences(prior, observation.published).map_err(|_| WizardError::Discovery)?;
+    if next != state.sequence
+        || observation
+            .published
+            .is_some_and(|published| !observation.tags.contains(&published))
+        || observation
+            .tags
+            .iter()
+            .any(|sequence| Some(*sequence) > prior && *sequence != state.sequence)
+    {
+        return Err(WizardError::Discovery);
+    }
+    // The publisher revalidates the exact tag, draft, asset IDs, and immutable local operation
+    // before it creates or resumes anything. Only the candidate's own sequence is allowed here.
+    Ok(next)
+}
+
 fn github_sequence_observation(
     local: Option<u64>,
     broker_config: &Path,
@@ -2374,6 +2442,102 @@ mod tests {
         observation.published_verified = true;
         observation.tags.insert(7);
         assert!(reconcile_github_state(None, &observation).is_err());
+    }
+
+    #[test]
+    fn resumed_staging_accepts_only_its_own_reserved_sequence() {
+        let state = WizardState {
+            schema_version: 3,
+            sequence: 8,
+            pi_version: "1.6.0".into(),
+            node_version: "22.19.0".into(),
+            target: TARGET.into(),
+            mode: RunMode::PublishCapable,
+            phase: ReleasePhase::LocalStaged,
+            signing_key_generation: 1,
+            catalog_source_commit: "1".repeat(40),
+            catalog_source_tree_sha256: "2".repeat(64),
+            work_dir: PathBuf::from("/repo/.release-work/sequence-8"),
+        };
+        let mut observation = GithubSequenceObservation {
+            published: Some(7),
+            tags: BTreeSet::from([7, 8]),
+            next_draft_exists: true,
+            published_verified: true,
+        };
+        assert_eq!(
+            reconcile_resumed_github_state(&state, None, &observation).unwrap(),
+            8
+        );
+        assert!(reconcile_github_state(None, &observation).is_err());
+        observation.tags.insert(9);
+        assert!(reconcile_resumed_github_state(&state, None, &observation).is_err());
+        observation.tags.remove(&9);
+        observation.published_verified = false;
+        assert!(reconcile_resumed_github_state(&state, None, &observation).is_err());
+    }
+
+    #[test]
+    fn resumed_publication_advances_only_with_exact_receipt_chain() {
+        let root = std::env::temp_dir().join(format!(
+            "catalog-wizard-recovered-publish-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let work = root.join("sequence-8");
+        let latest = work.join("publish-state/latest");
+        fs::create_dir_all(&latest).unwrap();
+        fs::set_permissions(&work, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        let mut state = WizardState {
+            schema_version: 3,
+            sequence: 8,
+            pi_version: "1.6.0".into(),
+            node_version: "22.19.0".into(),
+            target: TARGET.into(),
+            mode: RunMode::PublishCapable,
+            phase: ReleasePhase::LocalStaged,
+            signing_key_generation: 1,
+            catalog_source_commit: "1".repeat(40),
+            catalog_source_tree_sha256: "2".repeat(64),
+            work_dir: work.clone(),
+        };
+        let mut published = state.clone();
+        published.phase = ReleasePhase::Published;
+        let (draft, approval, publication, latest_receipt) = public_receipt_fixture(&published);
+        write_public_receipt_fixture(&latest, &draft, &approval, &publication, &latest_receipt);
+        for name in [
+            "draft-receipt-v1.json",
+            "release-approval-v1.json",
+            "publication-receipt-v1.json",
+            "latest-receipt-v1.json",
+        ] {
+            fs::set_permissions(
+                latest.join(name),
+                std::os::unix::fs::PermissionsExt::from_mode(0o400),
+            )
+            .unwrap();
+        }
+        state.save(&work.join("wizard-state.json")).unwrap();
+        let path = latest.join("latest-receipt-v1.json");
+        fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+        fs::write(&path, b"{}").unwrap();
+        assert!(recover_verified_published_phase(&mut state).is_err());
+        assert_eq!(state.phase, ReleasePhase::LocalStaged);
+        fs::write(&path, serde_jcs::to_vec(&latest_receipt).unwrap()).unwrap();
+        fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o400)).unwrap();
+        recover_verified_published_phase(&mut state).unwrap();
+        assert_eq!(state.phase, ReleasePhase::Published);
+        assert_eq!(
+            WizardState::load(&work.join("wizard-state.json"))
+                .unwrap()
+                .unwrap()
+                .phase,
+            ReleasePhase::Published
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
