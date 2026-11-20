@@ -1731,7 +1731,16 @@ fn config_executable_and_directory_identity_hash_mode_and_links_fail_closed() {
     fs::set_permissions(&exec_mode.executable, fs::Permissions::from_mode(0o520)).unwrap();
     assert!(execute(&exec_mode, &read_tag_request()).is_err());
 
-    for mode in [0o750, 0o751, 0o775] {
+    for mode in [0o750, 0o751] {
+        let dir_mode = Fixture::new(
+            &format!("config-dir-{mode:o}"),
+            FakeBehavior::Success,
+            &tag_json(),
+        );
+        fs::set_permissions(&dir_mode.config_dir, fs::Permissions::from_mode(mode)).unwrap();
+        assert!(execute(&dir_mode, &read_tag_request()).is_ok(), "{mode:o}");
+    }
+    for mode in [0o775, 0o702, 0o1755] {
         let dir_mode = Fixture::new(
             &format!("config-dir-{mode:o}"),
             FakeBehavior::Success,

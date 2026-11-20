@@ -2691,7 +2691,7 @@ fn secure_config_directory(metadata: &fs::Metadata) -> bool {
     metadata.is_dir()
         && !metadata.file_type().is_symlink()
         && metadata.uid() == current_euid()
-        && matches!(metadata.permissions().mode() & 0o7777, 0o700 | 0o755)
+        && metadata.permissions().mode() & 0o7722 == 0o700
 }
 
 fn secure_private_directory(metadata: &fs::Metadata) -> bool {
