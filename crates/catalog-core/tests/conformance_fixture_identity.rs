@@ -21,7 +21,8 @@ const VALID_ENVELOPE: &[u8] = include_bytes!("../../../conformance/catalog-v1/va
 
 #[test]
 fn conformance_envelopes_use_the_shared_flux_fixture_identity() {
-    for envelope in [VALID_ENVELOPE] {
+    {
+        let envelope = VALID_ENVELOPE;
         verify_fixture_signed_catalog(envelope).expect("producer fixture verifier");
         verify_with_pinned_identity(envelope, FIXTURE_KEY_ID, &FLUX_FIXTURE_PUBLIC_KEY)
             .expect("independent Flux-pinned verifier");

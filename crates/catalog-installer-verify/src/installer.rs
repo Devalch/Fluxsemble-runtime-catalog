@@ -4,7 +4,7 @@ use std::{
     str::FromStr,
 };
 
-use catalog_core::{PiReleaseProfileV1, PiRequiredContractsV1, pi_release_subject_sha256};
+use catalog_core::{PiReleaseProfileV2, PiRequiredContractsV1, pi_release_subject_v2_sha256};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
@@ -58,12 +58,12 @@ pub struct PiInstallerDiscoveryPolicy {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PiInstallerCandidateV1 {
-    pub profile: PiReleaseProfileV1,
+    pub profile: PiReleaseProfileV2,
     pub inputs: PackageInputManifestV2,
 }
 impl PiInstallerCandidateV1 {
     pub fn release_subject_sha256(&self) -> Result<[u8; 32], AcquireError> {
-        pi_release_subject_sha256(&self.profile).map_err(|_| AcquireError::Graph)
+        pi_release_subject_v2_sha256(&self.profile).map_err(|_| AcquireError::Graph)
     }
 }
 
@@ -222,9 +222,9 @@ impl PackageInputManifestV2 {
     }
     /// Bind inert decoded archive facts and original acquisition descriptors to the release profile.
     /// This does not authorize acquisition, publication, or installation.
-    pub fn validate_for_profile(&self, profile: &PiReleaseProfileV1) -> Result<(), AcquireError> {
+    pub fn validate_for_profile(&self, profile: &PiReleaseProfileV2) -> Result<(), AcquireError> {
         self.validate()?;
-        let subject = pi_release_subject_sha256(profile).map_err(|_| AcquireError::Graph)?;
+        let subject = pi_release_subject_v2_sha256(profile).map_err(|_| AcquireError::Graph)?;
         let expected: String = subject.iter().map(|b| format!("{b:02x}")).collect();
         if expected != self.release_subject_sha256
             || !self
@@ -377,12 +377,9 @@ pub fn derive_installer_release(
     transport: &dyn InstallerInputs,
 ) -> Result<PiInstallerCandidateV1, AcquireError> {
     validate_discovery_request(&request)?;
-    let policy = request
-        .installer_policy
-        .as_ref()
-        .ok_or(AcquireError::Input)?;
-    catalog_core::CompatibilityRange::from_str(&policy.consumer_requirement)
-        .map_err(|_| AcquireError::Input)?;
+    if request.installer_policy.is_some() {
+        return Err(AcquireError::Input);
+    }
     if request.node_version != "22.19.0" {
         return Err(AcquireError::Input);
     }
@@ -570,16 +567,15 @@ pub fn derive_installer_release(
         support_descriptor(&support_prefix, "pi-installer-package", &manifest_bytes);
     let lock_descriptor = support_descriptor(&support_prefix, "pi-installer-lock", &lock_bytes);
     let pi_descriptor = support_descriptor(&support_prefix, "pi-package", &pi_manifest);
-    let profile = PiReleaseProfileV1::from_json(&serde_json::to_vec(&json!({
-        "schema_version":1,"pi_package":{"name":PI,"version":request.pi_version},"node_version":request.node_version,"target":request.target,
-        "consumer_requirement":policy.consumer_requirement,"required_contracts":policy.required_contracts,
+    let profile = PiReleaseProfileV2::from_json(&serde_json::to_vec(&json!({
+        "schema_version":2,"pi_package":{"name":PI,"version":request.pi_version},"node_version":request.node_version,"target":request.target,
         "installer_root":{"name":ROOT,"version":wrapper_version},"pi_package_locator":PI_LOCATOR,"cli_entrypoint":cli,
         "installer_manifest":manifest_descriptor,"installer_lock":lock_descriptor,"pi_manifest":pi_descriptor,
         "components":[{"component_id":"component:node","version":request.node_version,"artifacts":[{"artifact_id":"artifact:node-linux-x86_64","url":node_url,"size_bytes":node_archive.size().to_string(),"sha256":node_sha256,"inventory":[{"path":"bin/node","size_bytes":node.node_size.to_string(),"sha256":node.node_sha256}]}]},
         {"component_id":"component:pi","version":request.pi_version,"artifacts":[{"artifact_id":"artifact:pi-coding-agent","url":pi["resolved_url"],"size_bytes":pi_size.to_string(),"sha256":pi["archive_sha256"],"inventory":[{"path":cli,"size_bytes":cli_size.to_string(),"sha256":cli_sha256}]}]}],
         "pi_component_id":"component:pi","pi_artifact_id":"artifact:pi-coding-agent","node_component_id":"component:node","node_artifact_id":"artifact:node-linux-x86_64","registry_integrity":pi["registry_integrity"],"locked_packages":descriptors
     })).map_err(|_| AcquireError::Graph)?).map_err(|_| AcquireError::Graph)?;
-    let subject = pi_release_subject_sha256(&profile).map_err(|_| AcquireError::Graph)?;
+    let subject = pi_release_subject_v2_sha256(&profile).map_err(|_| AcquireError::Graph)?;
     let applicable_package_count = observed
         .iter()
         .filter(|p| p.pruned_reasons.is_empty())
@@ -1129,10 +1125,7 @@ pub fn verify_installer_release(
             pi_version: intent.profile().pi_package().version().as_str().into(),
             node_version: intent.profile().node_version().as_str().into(),
             target: intent.profile().target().as_str().into(),
-            installer_policy: Some(PiInstallerDiscoveryPolicy {
-                consumer_requirement: intent.profile().consumer_requirement().as_str().into(),
-                required_contracts: intent.profile().required_contracts().clone(),
-            }),
+            installer_policy: None,
         },
         &RetainedInputs {
             intent,

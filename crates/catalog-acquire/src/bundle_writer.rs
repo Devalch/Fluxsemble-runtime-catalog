@@ -13,13 +13,16 @@ use std::{
     path::Path,
 };
 
-use catalog_core::{InputSourceKind, VerifiedInputBundleV1, verified_input_bundle_digest};
+use catalog_core::{
+    InputSourceKind, VerifiedInputBundleV1, VerifiedInputBundleV2, verified_input_bundle_digest,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{AcquireError, VerifiedArchive};
 
 const VERIFIED_INPUT_NAME: &str = "verified-input-bundle-v1.json";
+const VERIFIED_INPUT_V2_NAME: &str = "verified-input-bundle-v2.json";
 const TRANSFER_MANIFEST_NAME: &str = "transfer-manifest-v1.json";
 const MAX_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_ENTRY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
@@ -139,6 +142,24 @@ pub struct VerifiedBundleWriteRequest {
     pub objects: Vec<PublicBundleObject>,
 }
 
+pub struct VerifiedBundleWriteRequestV2 {
+    pub source_kind: InputSourceKind,
+    pub source_sha256: String,
+    pub release_subject_sha256: String,
+    pub source_commit: Option<String>,
+    pub source_tree_sha256: Option<String>,
+    pub records: Vec<BundleRecord>,
+    pub objects: Vec<PublicBundleObject>,
+}
+
+struct VerifiedBundlePreflightV2 {
+    records: Vec<PreparedBundleRecord>,
+    objects: Vec<PublicBundleObject>,
+    bundle_bytes: Vec<u8>,
+    verified: VerifiedInputBundleV2,
+    manifest_bytes: Vec<u8>,
+}
+
 struct PreparedBundleRecord {
     relative_path: String,
     bytes: Vec<u8>,
@@ -189,6 +210,36 @@ pub struct VerifiedTransferredBundle {
     object_count: usize,
     total_bytes: u64,
     verified_input: VerifiedInputBundleV1,
+}
+
+pub struct VerifiedTransferredBundleV2 {
+    _root: fs::File,
+    _manifest: TransferManifestV1,
+    _files: Vec<(TransferEntry, fs::File)>,
+    manifest_bytes: Vec<u8>,
+    verified_input: VerifiedInputBundleV2,
+    total_bytes: u64,
+}
+impl VerifiedTransferredBundleV2 {
+    #[must_use]
+    pub fn verified_input(&self) -> &VerifiedInputBundleV2 {
+        &self.verified_input
+    }
+    #[must_use]
+    pub fn bundle_sha256(&self) -> String {
+        sha256(&self.manifest_bytes)
+    }
+    #[must_use]
+    pub fn object_count(&self) -> usize {
+        self.verified_input.objects().len()
+    }
+    #[must_use]
+    pub fn total_bytes(&self) -> u64 {
+        self.total_bytes
+    }
+    fn root_identity(&self) -> FileIdentity {
+        FileIdentity::from_metadata(&self._root.metadata().expect("retained bundle root"))
+    }
 }
 
 impl VerifiedTransferredBundle {
@@ -682,6 +733,46 @@ pub fn write_verified_bundle(
     write_verified_bundle_with_publication(request, output, || true, || true)
 }
 
+pub fn write_verified_bundle_v2(
+    request: VerifiedBundleWriteRequestV2,
+    output: &Path,
+) -> Result<VerifiedInputBundleV2, AcquireError> {
+    write_verified_bundle_v2_with_publication(request, output, || true, || true)
+}
+
+pub(crate) fn write_verified_bundle_v2_with_publication(
+    request: VerifiedBundleWriteRequestV2,
+    output: &Path,
+    authorize: impl FnOnce() -> bool,
+    claim: impl FnOnce() -> bool,
+) -> Result<VerifiedInputBundleV2, AcquireError> {
+    let preflight = preflight_verified_bundle_v2(request)?;
+    let mut root = OutputRoot::create(output)?;
+    root.create_directory("objects")?;
+    root.create_directory("records")?;
+    for record in preflight.records {
+        root.write_file(&record.relative_path, &record.bytes)?;
+    }
+    for mut object in preflight.objects {
+        let relative = format!("objects/{}", object.sha256);
+        root.copy_file(&relative, &mut object.file, object.size, &object.sha256)?;
+    }
+    root.write_file(VERIFIED_INPUT_V2_NAME, &preflight.bundle_bytes)?;
+    root.write_file(TRANSFER_MANIFEST_NAME, &preflight.manifest_bytes)?;
+    root.sync()?;
+    let reopened = verify_transferred_bundle_v2_root(root.cloned_root()?)?;
+    if reopened.verified_input != preflight.verified || reopened.root_identity() != root.identity()
+    {
+        return Err(AcquireError::Bundle);
+    }
+    root.prepare()?;
+    if !authorize() {
+        return Err(AcquireError::Cancelled);
+    }
+    root.publish(claim)?;
+    Ok(preflight.verified)
+}
+
 pub(crate) fn write_verified_bundle_with_publication(
     request: VerifiedBundleWriteRequest,
     output: &Path,
@@ -879,6 +970,172 @@ fn preflight_verified_bundle(
     })
 }
 
+fn preflight_verified_bundle_v2(
+    mut request: VerifiedBundleWriteRequestV2,
+) -> Result<VerifiedBundlePreflightV2, AcquireError> {
+    if !valid_sha256(&request.source_sha256)
+        || !valid_sha256(&request.release_subject_sha256)
+        || request
+            .source_commit
+            .as_ref()
+            .is_some_and(|v| !valid_commit(v))
+        || request
+            .source_tree_sha256
+            .as_ref()
+            .is_some_and(|v| !valid_sha256(v))
+        || request.source_commit.is_some() != request.source_tree_sha256.is_some()
+        || (request.source_kind == InputSourceKind::CatalogSource)
+            != request.source_commit.is_some()
+        || request.records.len() != 2
+        || !request.records.iter().any(|r| r.role == "package_inputs")
+        || !request.records.iter().any(|r| {
+            r.role
+                == match request.source_kind {
+                    InputSourceKind::ReleaseIntent => "release_intent",
+                    InputSourceKind::CatalogSource => "catalog_source",
+                }
+        })
+    {
+        return Err(AcquireError::Bundle);
+    }
+    let declared_entries = request
+        .records
+        .len()
+        .checked_add(request.objects.len())
+        .and_then(|count| count.checked_add(1))
+        .ok_or(AcquireError::Bundle)?;
+    if request.records.len() > MAX_ENTRIES
+        || request.objects.len() > MAX_ENTRIES
+        || declared_entries > MAX_ENTRIES
+    {
+        return Err(AcquireError::Bundle);
+    }
+
+    let mut entries = Vec::with_capacity(declared_entries);
+    let mut manifest_records = Vec::with_capacity(request.records.len());
+    let mut prepared_records = Vec::with_capacity(request.records.len());
+    let mut role_names = BTreeSet::new();
+    let mut record_paths = BTreeSet::new();
+    let mut total = 0_u64;
+    for record in request.records {
+        let size = record.bytes.len() as u64;
+        if !safe_role(&record.role)
+            || !role_names.insert(record.role.clone())
+            || size == 0
+            || size > MAX_MANIFEST_BYTES
+            || size > MAX_ENTRY_BYTES
+        {
+            return Err(AcquireError::Bundle);
+        }
+        let digest = sha256(&record.bytes);
+        let relative_path = format!("records/{digest}");
+        if !record_paths.insert(relative_path.clone()) {
+            return Err(AcquireError::Bundle);
+        }
+        total = checked_preflight_total(total, size)?;
+        entries.push(entry(&relative_path, size, &digest));
+        manifest_records.push(TransferRecordRef {
+            role: record.role,
+            relative_path: relative_path.clone(),
+            sha256: digest,
+        });
+        prepared_records.push(PreparedBundleRecord {
+            relative_path,
+            bytes: record.bytes,
+        });
+    }
+    manifest_records.sort_by(|left, right| left.role.cmp(&right.role));
+
+    let mut object_records = BTreeMap::<String, (String, u64)>::new();
+    for object in &request.objects {
+        if object.size == 0 || object.size > MAX_ENTRY_BYTES || !valid_sha256(&object.sha256) {
+            return Err(AcquireError::Bundle);
+        }
+        match object_records.get(&object.sha256) {
+            Some((url, size)) if url == &object.source_url && *size == object.size => {}
+            Some(_) => return Err(AcquireError::Bundle),
+            None => {
+                total = checked_preflight_total(total, object.size)?;
+                entries.push(entry(
+                    &format!("objects/{}", object.sha256),
+                    object.size,
+                    &object.sha256,
+                ));
+                object_records.insert(
+                    object.sha256.clone(),
+                    (object.source_url.clone(), object.size),
+                );
+            }
+        }
+    }
+    if object_records.is_empty() {
+        return Err(AcquireError::Bundle);
+    }
+
+    let objects = object_records
+        .iter()
+        .map(|(digest, (url, size))| {
+            serde_json::json!({
+                "relative_path": format!("objects/{digest}"),
+                "source_url": url,
+                "size": size,
+                "sha256": digest,
+            })
+        })
+        .collect::<Vec<_>>();
+    let bundle_value = serde_json::json!({
+        "schema_version": 2,
+        "source_kind": request.source_kind,
+        "source_sha256": request.source_sha256,
+        "release_subject_sha256": request.release_subject_sha256,
+        "objects": objects,
+    });
+    let bundle_bytes = serde_jcs::to_vec(&bundle_value).map_err(|_| AcquireError::Bundle)?;
+    if bundle_bytes.is_empty() || bundle_bytes.len() as u64 > MAX_MANIFEST_BYTES {
+        return Err(AcquireError::Bundle);
+    }
+    checked_preflight_total(total, bundle_bytes.len() as u64)?;
+    let verified =
+        VerifiedInputBundleV2::from_json(&bundle_bytes).map_err(|_| AcquireError::Bundle)?;
+    entries.push(entry(
+        VERIFIED_INPUT_V2_NAME,
+        bundle_bytes.len() as u64,
+        &sha256(&bundle_bytes),
+    ));
+    entries.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+
+    let manifest = TransferManifestV1 {
+        schema_version: 1,
+        kind: "verified_input_v2".to_owned(),
+        source_commit: request.source_commit,
+        source_tree_sha256: request.source_tree_sha256,
+        records: manifest_records,
+        entries,
+    };
+    validate_manifest_for(&manifest, "verified_input_v2", VERIFIED_INPUT_V2_NAME)?;
+    let manifest_bytes = serde_jcs::to_vec(&manifest).map_err(|_| AcquireError::Bundle)?;
+    if manifest_bytes.is_empty() || manifest_bytes.len() as u64 > MAX_MANIFEST_BYTES {
+        return Err(AcquireError::Bundle);
+    }
+
+    let mut prepared_objects = Vec::with_capacity(object_records.len());
+    let mut seen_objects = BTreeSet::new();
+    for mut object in request.objects.drain(..) {
+        verify_object_descriptor(&mut object.file, object.size, &object.sha256)?;
+        if seen_objects.insert(object.sha256.clone()) {
+            prepared_objects.push(object);
+        }
+    }
+
+    Ok(VerifiedBundlePreflightV2 {
+        records: prepared_records,
+        objects: prepared_objects,
+        bundle_bytes,
+        verified,
+        manifest_bytes,
+    })
+}
+
 fn checked_preflight_total(total: u64, size: u64) -> Result<u64, AcquireError> {
     let total = total.checked_add(size).ok_or(AcquireError::Bundle)?;
     if total > MAX_TOTAL_BYTES {
@@ -1039,6 +1296,171 @@ fn verify_transferred_bundle_root(
     })
 }
 
+pub fn verify_transferred_bundle_v2(
+    path: &Path,
+) -> Result<VerifiedTransferredBundleV2, AcquireError> {
+    verify_transferred_bundle_v2_root(open_secure_root(path)?)
+}
+
+fn verify_transferred_bundle_v2_root(
+    root: fs::File,
+) -> Result<VerifiedTransferredBundleV2, AcquireError> {
+    let mut manifest_file = open_component(
+        &root,
+        TRANSFER_MANIFEST_NAME,
+        libc::O_RDONLY | libc::O_CLOEXEC,
+        0,
+    )
+    .map_err(|_| AcquireError::Bundle)?;
+    let manifest_metadata = manifest_file.metadata().map_err(|_| AcquireError::Bundle)?;
+    if !secure_file(&manifest_metadata) || manifest_metadata.len() > MAX_MANIFEST_BYTES {
+        return Err(AcquireError::Bundle);
+    }
+    let manifest_bytes = read_exact_file(
+        manifest_file
+            .try_clone()
+            .map_err(|_| AcquireError::Bundle)?,
+        manifest_metadata.len(),
+        None,
+    )?;
+    let manifest: TransferManifestV1 =
+        serde_json::from_slice(&manifest_bytes).map_err(|_| AcquireError::Bundle)?;
+    if serde_jcs::to_vec(&manifest).map_err(|_| AcquireError::Bundle)? != manifest_bytes {
+        return Err(AcquireError::Bundle);
+    }
+    validate_manifest_for(&manifest, "verified_input_v2", VERIFIED_INPUT_V2_NAME)?;
+    let tree = enumerate_tree(&root)?;
+    let expected = manifest
+        .entries
+        .iter()
+        .map(|entry| entry.relative_path.clone())
+        .chain(std::iter::once(TRANSFER_MANIFEST_NAME.to_owned()))
+        .collect::<BTreeSet<_>>();
+    if tree.entries != expected {
+        return Err(AcquireError::Bundle);
+    }
+
+    let mut files = Vec::with_capacity(manifest.entries.len());
+    let mut total = 0_u64;
+    for entry in &manifest.entries {
+        let (parent, name) = tree.parent_and_name(&root, &entry.relative_path)?;
+        let file = open_component(parent, name, libc::O_RDONLY | libc::O_CLOEXEC, 0)
+            .map_err(|_| AcquireError::Bundle)?;
+        let metadata = file.metadata().map_err(|_| AcquireError::Bundle)?;
+        if !secure_file(&metadata) || metadata.len() != entry.size {
+            return Err(AcquireError::Bundle);
+        }
+        let file = verify_open_file(parent, name, file, entry)?;
+        total = total.checked_add(entry.size).ok_or(AcquireError::Bundle)?;
+        files.push((entry.clone(), file));
+    }
+    let verified_entry = manifest
+        .entries
+        .iter()
+        .find(|entry| entry.relative_path == VERIFIED_INPUT_V2_NAME)
+        .filter(|entry| entry.size <= MAX_MANIFEST_BYTES)
+        .ok_or(AcquireError::Bundle)?;
+    let (_, verified_file) = files
+        .iter_mut()
+        .find(|(entry, _)| entry.relative_path == VERIFIED_INPUT_V2_NAME)
+        .ok_or(AcquireError::Bundle)?;
+    verified_file
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| AcquireError::Bundle)?;
+    let mut verified_bytes = Vec::with_capacity(verified_entry.size as usize);
+    verified_file
+        .read_to_end(&mut verified_bytes)
+        .map_err(|_| AcquireError::Bundle)?;
+    verified_file
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| AcquireError::Bundle)?;
+    let verified_input =
+        VerifiedInputBundleV2::from_json(&verified_bytes).map_err(|_| AcquireError::Bundle)?;
+    if serde_jcs::to_vec(&verified_input).map_err(|_| AcquireError::Bundle)? != verified_bytes {
+        return Err(AcquireError::Bundle);
+    }
+    let roles = manifest
+        .records
+        .iter()
+        .map(|r| r.role.as_str())
+        .collect::<Vec<_>>();
+    let expected = match verified_input.source_kind() {
+        InputSourceKind::ReleaseIntent => vec!["package_inputs", "release_intent"],
+        InputSourceKind::CatalogSource => vec!["catalog_source", "package_inputs"],
+    };
+    if roles != expected
+        || (verified_input.source_kind() == InputSourceKind::CatalogSource)
+            != manifest.source_commit.is_some()
+    {
+        return Err(AcquireError::Bundle);
+    }
+    let manifested_objects = manifest
+        .entries
+        .iter()
+        .filter(|entry| entry.relative_path.starts_with("objects/"))
+        .map(|entry| {
+            (
+                entry.relative_path.as_str(),
+                entry.size,
+                entry.sha256.as_str(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let verified_objects = verified_input
+        .objects()
+        .iter()
+        .map(|object| {
+            (
+                object.relative_path().as_str(),
+                object.size(),
+                object.sha256().as_str(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    if manifested_objects != verified_objects {
+        return Err(AcquireError::Bundle);
+    }
+    for record in &manifest.records {
+        let entry = manifest
+            .entries
+            .iter()
+            .find(|entry| entry.relative_path == record.relative_path)
+            .ok_or(AcquireError::Bundle)?;
+        if entry.sha256 != record.sha256 || !entry.relative_path.starts_with("records/") {
+            return Err(AcquireError::Bundle);
+        }
+    }
+    for (entry, file) in &mut files {
+        let (parent, name) = tree.parent_and_name(&root, &entry.relative_path)?;
+        let retained = file.try_clone().map_err(|_| AcquireError::Bundle)?;
+        *file = verify_open_file(parent, name, retained, entry)?;
+    }
+    let manifest_entry = entry(
+        TRANSFER_MANIFEST_NAME,
+        manifest_metadata.len(),
+        &sha256(&manifest_bytes),
+    );
+    manifest_file = verify_open_file(
+        &root,
+        TRANSFER_MANIFEST_NAME,
+        manifest_file,
+        &manifest_entry,
+    )?;
+    manifest_file
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| AcquireError::Bundle)?;
+    tree.revalidate(&root)?;
+
+    Ok(VerifiedTransferredBundleV2 {
+        _root: root,
+        _manifest: manifest,
+        manifest_bytes,
+        _files: files,
+        verified_input,
+        total_bytes: total,
+    })
+}
+
 pub fn export_transfer_bundle(
     bundle: &Path,
     output: &Path,
@@ -1102,8 +1524,15 @@ fn validate_claims(request: &VerifiedBundleWriteRequest) -> Result<(), AcquireEr
 }
 
 fn validate_manifest(manifest: &TransferManifestV1) -> Result<(), AcquireError> {
+    validate_manifest_for(manifest, "verified_input", VERIFIED_INPUT_NAME)
+}
+fn validate_manifest_for(
+    manifest: &TransferManifestV1,
+    kind: &str,
+    input_name: &str,
+) -> Result<(), AcquireError> {
     if manifest.schema_version != 1
-        || manifest.kind != "verified_input"
+        || manifest.kind != kind
         || manifest.entries.is_empty()
         || manifest.entries.len() > MAX_ENTRIES
         || manifest
@@ -1149,7 +1578,7 @@ fn validate_manifest(manifest: &TransferManifestV1) -> Result<(), AcquireError> 
     if !manifest
         .entries
         .iter()
-        .any(|entry| entry.relative_path == VERIFIED_INPUT_NAME)
+        .any(|entry| entry.relative_path == input_name)
         || manifest.records.is_empty()
         || manifest.records.iter().any(|record| {
             !safe_role(&record.role)

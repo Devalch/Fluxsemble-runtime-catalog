@@ -1,24 +1,23 @@
 //! Original acquisition owner for versioned installer releases.
 use crate::{
     AcquireError, AcquisitionCancellation, BundleRecord, DiscoverPiReleaseRequest,
-    PackageInputManifestV2, PiInstallerDiscoveryPolicy, PublicBundleObject,
-    ReleaseDiscoveryTransport, VerifiedBundleWriteRequest,
+    PackageInputManifestV2, PublicBundleObject, ReleaseDiscoveryTransport,
+    VerifiedBundleWriteRequestV2,
     archive::inspect_npm_archive,
     discover_pi_installer_release_with_transport,
     npm::{HttpReleaseDiscoveryTransport, sha256, verified_bytes},
 };
-use catalog_core::{CatalogSourceV2, InputSourceKind, PiReleaseIntentV2, VerifiedInputBundleV1};
+use catalog_core::{CatalogSourceV2, InputSourceKind, PiReleaseIntentV2, VerifiedInputBundleV2};
 use std::{cell::RefCell, collections::BTreeMap, path::PathBuf};
 
 type ExpectedObjects = BTreeMap<String, (u64, String)>;
 
 pub enum AcquireInstallerReleaseSource {
     Intent {
-        intent: PiReleaseIntentV2,
+        intent: Box<PiReleaseIntentV2>,
     },
     Final {
         source: Box<CatalogSourceV2>,
-        qualification_bytes: Vec<u8>,
         source_commit: String,
         source_tree_sha256: String,
     },
@@ -33,7 +32,7 @@ pub struct AcquireInstallerReleaseRequest {
 
 pub async fn acquire_installer_release(
     request: AcquireInstallerReleaseRequest,
-) -> Result<VerifiedInputBundleV1, AcquireError> {
+) -> Result<VerifiedInputBundleV2, AcquireError> {
     let cancellation = request.cancellation.clone();
     crate::run_publication_blocking(&cancellation, move |control| {
         acquire_with_control(
@@ -51,7 +50,7 @@ pub async fn acquire_installer_release(
 pub fn acquire_installer_release_with_transport(
     request: AcquireInstallerReleaseRequest,
     transport: &dyn ReleaseDiscoveryTransport,
-) -> Result<VerifiedInputBundleV1, AcquireError> {
+) -> Result<VerifiedInputBundleV2, AcquireError> {
     acquire_with_control(request, transport, || true, || true)
 }
 
@@ -60,7 +59,7 @@ fn acquire_with_control(
     transport: &dyn ReleaseDiscoveryTransport,
     authorize: impl FnOnce() -> bool,
     claim: impl FnOnce() -> bool,
-) -> Result<VerifiedInputBundleV1, AcquireError> {
+) -> Result<VerifiedInputBundleV2, AcquireError> {
     let (intent, kind, source_digest, source_claims, mut records) = match request.source {
         AcquireInstallerReleaseSource::Intent { intent } => {
             let digest = catalog_core::pi_release_intent_v2_digest(&intent)
@@ -70,7 +69,7 @@ fn acquire_with_control(
                 bytes: serde_jcs::to_vec(&intent).map_err(|_| AcquireError::Input)?,
             };
             (
-                intent,
+                *intent,
                 InputSourceKind::ReleaseIntent,
                 digest,
                 None,
@@ -79,25 +78,16 @@ fn acquire_with_control(
         }
         AcquireInstallerReleaseSource::Final {
             source,
-            qualification_bytes,
             source_commit,
             source_tree_sha256,
         } => {
-            source
-                .finalize(&qualification_bytes)
-                .map_err(|_| AcquireError::Input)?;
+            source.finalize().map_err(|_| AcquireError::Input)?;
             let digest =
                 catalog_core::catalog_source_v2_digest(&source).map_err(|_| AcquireError::Input)?;
-            let records = vec![
-                BundleRecord {
-                    role: "catalog_source".into(),
-                    bytes: serde_jcs::to_vec(&source).map_err(|_| AcquireError::Input)?,
-                },
-                BundleRecord {
-                    role: "qualification".into(),
-                    bytes: qualification_bytes,
-                },
-            ];
+            let records = vec![BundleRecord {
+                role: "catalog_source".into(),
+                bytes: serde_jcs::to_vec(&source).map_err(|_| AcquireError::Input)?,
+            }];
             (
                 source.intent().clone(),
                 InputSourceKind::CatalogSource,
@@ -168,10 +158,7 @@ fn acquire_with_control(
             target: intent.profile().target().as_str().into(),
             title: intent.title().into(),
             notes: intent.notes().into(),
-            installer_policy: Some(PiInstallerDiscoveryPolicy {
-                consumer_requirement: intent.profile().consumer_requirement().as_str().into(),
-                required_contracts: intent.profile().required_contracts().clone(),
-            }),
+            installer_policy: None,
         },
         &bound,
     )?;
@@ -243,16 +230,16 @@ fn acquire_with_control(
     });
     let (source_commit, source_tree_sha256) =
         source_claims.map_or((None, None), |(c, t)| (Some(c), Some(t)));
-    let subject = catalog_core::pi_release_subject_sha256(intent.profile())
+    let subject = catalog_core::pi_release_subject_v2_sha256(intent.profile())
         .map_err(|_| AcquireError::Graph)?;
     if request.cancellation.is_cancelled() {
         return Err(AcquireError::Cancelled);
     }
-    crate::bundle_writer::write_verified_bundle_with_publication(
-        VerifiedBundleWriteRequest {
+    crate::bundle_writer::write_verified_bundle_v2_with_publication(
+        VerifiedBundleWriteRequestV2 {
             source_kind: kind,
             source_sha256: hex(&source_digest),
-            compatibility_input_sha256: hex(&subject),
+            release_subject_sha256: hex(&subject),
             source_commit,
             source_tree_sha256,
             records,

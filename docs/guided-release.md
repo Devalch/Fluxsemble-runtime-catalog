@@ -1,43 +1,9 @@
 # Guided runtime catalog release
 
-For normal releases, run:
+Run `catalog-wizard release` from a clean, committed checkout. The wizard selects the next sequence after verifying the latest published catalog and checking for conflicting tags and drafts. Choose a Pi version, confirm Node 22.19.0, and select dry-run or publish.
 
-```bash
-catalog-wizard release
-```
+The producer discovers the exact upstream installer inputs, verifies their hashes and dependency graph, and independently replays those checks in the isolated signer. It does not require or assert a consumer build or compatibility qualification. A dry run stops before signing or publication. Consumer compatibility is checked separately by the consumer's owner.
 
-The wizard will ask you to choose a Pi version, confirm a Node version, and choose dry-run or guided publish. It prepares a qualification request and pauses while a Fluxsemble maintainer qualifies the exact final profile against its existing supported behavioral contracts and verified consumer build. When the returned qualification directory is ready, continue with:
+The publish workflow shows the tag, draft and asset steps and verifies the published bytes through GitHub's latest endpoint. See [the V2 producer contract](pi-installer-lock-contract.md) and [release runbook](release-runbook.md) for artifact and release details.
 
-```bash
-catalog-wizard resume
-```
-
-Before allocating a sequence, the wizard verifies the production signature and sequence of the latest published catalog. If local catalog source records exist, their highest sequence must also match; extra tags or a next-sequence draft still stop the release.
-
-The wizard independently verifies the returned canonical `build-binding-v1.json` and `qualification-v1.json`, exact final subject, all required passing results and unchanged contracts before signing or publishing. A compatible later Pi release needs no consumer rebuild or development-reference refresh. A local unsigned candidate is not a signed, published or installed release. See [the wire contract](pi-installer-lock-contract.md) for the exact public handoff; no consumer source checkout is a producer prerequisite.
-
-First-time setup:
-
-```bash
-catalog-wizard trust-machine
-catalog-wizard check
-```
-
-Only when replacing the signing key:
-
-```bash
-catalog-wizard rotate-key
-```
-
-If a release is interrupted:
-
-```bash
-catalog-wizard resume
-```
-
-For help:
-
-```bash
-catalog-wizard -h
-catalog-wizard release --help
-```
+Run `catalog-wizard trust-machine` and `catalog-wizard check` for first-time setup. Use `catalog-wizard resume` after an interruption. A historical schema-2 wizard state that awaited qualification must be preserved and archived before preparing a new producer-only release; it cannot be resumed as a new workflow.

@@ -140,6 +140,7 @@ struct RecoveryBroker {
     draft_mutations: usize,
     upload_mutations: BTreeMap<String, usize>,
     publish_calls: usize,
+    latest_requests: Vec<bool>,
 }
 
 impl RecoveryBroker {
@@ -308,9 +309,11 @@ impl BrokerTransport for RecoveryBroker {
         &mut self,
         _repository: &str,
         release_id: &str,
+        make_latest: bool,
     ) -> Result<(), RemoteBoundaryError> {
         let after = self.boundary("publish_draft")?;
         self.publish_calls += 1;
+        self.latest_requests.push(make_latest);
         let release = self
             .release
             .as_mut()
@@ -425,11 +428,12 @@ impl BrokerTransport for SharedRecoveryBroker {
         &mut self,
         repository: &str,
         release_id: &str,
+        _make_latest: bool,
     ) -> Result<(), RemoteBoundaryError> {
         self.inner
             .lock()
             .unwrap()
-            .publish_draft(repository, release_id)
+            .publish_draft(repository, release_id, _make_latest)
     }
 }
 
@@ -506,6 +510,23 @@ fn stage_approve(state: &Path, broker: &mut RecoveryBroker) -> PathBuf {
     let receipt = fs::read(state.join("latest/draft-receipt-v1.json")).unwrap();
     workflow::approve_remote_fixture(state, &sha256(&receipt)).unwrap();
     state.join("latest/release-approval-v1.json")
+}
+
+#[test]
+fn producer_v2_stages_publishes_and_checks_latest() {
+    let temp = TempTree::new("producer-v2-remote");
+    let transfer = temp.path("transfer");
+    let state = temp.path("state");
+    support::fixture_producer_transfer(&transfer, 42);
+    let verified = local::verify_transferred_fixture_signed_bundle(&transfer).unwrap();
+    local::stage_local(&verified, &state).unwrap();
+    let mut broker = RecoveryBroker::default();
+    let approval = stage_approve(&state, &mut broker);
+    let mut latest = BytesLatest(catalog_bytes(&state));
+    workflow::publish_remote_fixture_with(&state, &approval, &mut broker, &mut latest).unwrap();
+    assert!(!broker.release.as_ref().unwrap().draft);
+    assert_eq!(broker.latest_requests, [true]);
+    assert!(state.join("latest/latest-receipt-v1.json").exists());
 }
 
 #[test]

@@ -4,6 +4,35 @@ use serde_json::json;
 use support::{sha256, transferred_fixture};
 
 #[test]
+fn v2_discovery_does_not_require_consumer_policy() {
+    struct Bytes(std::collections::BTreeMap<String, Vec<u8>>);
+    impl catalog_installer_verify::InstallerInputs for Bytes {
+        fn read(&self, url: &str, maximum: usize) -> Result<Vec<u8>, AcquireError> {
+            self.0
+                .get(url)
+                .filter(|bytes| bytes.len() <= maximum)
+                .cloned()
+                .ok_or(AcquireError::Input)
+        }
+    }
+    let mut request = support::request();
+    request.installer_policy = None;
+    let result = catalog_installer_verify::derive_installer_release(
+        request,
+        &Bytes(support::fixture_bytes(
+            "matching-missing-integrity-supplement",
+            "1.2.0",
+        )),
+    )
+    .unwrap();
+    let value = serde_json::to_value(&result.profile).unwrap();
+    assert_eq!(value["schema_version"], 2);
+    assert!(value.get("consumer_requirement").is_none());
+    assert!(value.get("required_contracts").is_none());
+    result.inputs.validate_for_profile(&result.profile).unwrap();
+}
+
+#[test]
 fn offline_owner_replays_real_archives_and_rejects_invented_observations() {
     let (intent, inputs, objects) = transferred_fixture();
     let read = |url: &str, max: usize| {
@@ -89,10 +118,9 @@ fn repeated_package_identity_shares_one_exact_registry_response() {
 
 #[test]
 fn immutable_public_installer_inputs_match_independent_derivation_and_replay() {
-    use catalog_core::{PiReleaseIntentV2, PiRequiredContractsV1};
+    use catalog_core::PiReleaseIntentV2;
     use catalog_installer_verify::{
-        DiscoverPiReleaseRequest, InstallerInputs, PiInstallerDiscoveryPolicy,
-        derive_installer_release,
+        DiscoverPiReleaseRequest, InstallerInputs, derive_installer_release,
     };
     use std::{collections::BTreeMap, path::Path};
     struct Bytes(BTreeMap<String, Vec<u8>>);
@@ -169,9 +197,17 @@ fn immutable_public_installer_inputs_match_independent_derivation_and_replay() {
         sha256(&inputs_bytes),
         evidence["package_inputs_sha256"].as_str().unwrap()
     );
-    let intent = PiReleaseIntentV2::from_json(&intent_bytes).unwrap();
-    let inputs = PackageInputManifestV2::from_json(&inputs_bytes).unwrap();
-    let value: serde_json::Value = serde_json::from_slice(&intent_bytes).unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&intent_bytes).unwrap();
+    value["profile"]["schema_version"] = json!(2);
+    value["profile"]
+        .as_object_mut()
+        .unwrap()
+        .remove("consumer_requirement");
+    value["profile"]
+        .as_object_mut()
+        .unwrap()
+        .remove("required_contracts");
+    let intent = PiReleaseIntentV2::from_json(&serde_json::to_vec(&value).unwrap()).unwrap();
     let profile = &value["profile"];
     let pi_version = profile["components"]
         .as_array()
@@ -190,21 +226,24 @@ fn immutable_public_installer_inputs_match_independent_derivation_and_replay() {
         pi_version: pi_version.into(),
         node_version: profile["node_version"].as_str().unwrap().into(),
         target: profile["target"].as_str().unwrap().into(),
-        installer_policy: Some(PiInstallerDiscoveryPolicy {
-            consumer_requirement: profile["consumer_requirement"].as_str().unwrap().into(),
-            required_contracts: PiRequiredContractsV1::from_json(
-                &serde_json::to_vec(&profile["required_contracts"]).unwrap(),
-            )
-            .unwrap(),
-        }),
+        installer_policy: None,
     };
     let mut bytes = Bytes(objects);
     let derived = derive_installer_release(request, &bytes).unwrap();
     assert_eq!(serde_json::to_value(&derived.profile).unwrap(), *profile);
+    let mut historical_inputs: serde_json::Value = serde_json::from_slice(&inputs_bytes).unwrap();
+    historical_inputs["release_subject_sha256"] = json!(
+        catalog_core::pi_release_subject_v2_sha256(&derived.profile)
+            .unwrap()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
     assert_eq!(
         serde_json::to_value(&derived.inputs).unwrap(),
-        serde_json::to_value(&inputs).unwrap()
+        historical_inputs
     );
+    let inputs = derived.inputs;
     for (original, planned) in [
         (
             inputs.installer_manifest_source(),

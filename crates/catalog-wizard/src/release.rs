@@ -238,7 +238,7 @@ pub fn run_release(
         return Err(WizardError::State);
     }
     let state = WizardState {
-        schema_version: 2,
+        schema_version: 3,
         sequence,
         pi_version,
         node_version,
@@ -334,6 +334,9 @@ fn resume_in_repo(
 trait ReleaseMachine {
     fn phase(&self) -> ReleasePhase;
     fn mode(&self) -> RunMode;
+    fn producer_only(&self) -> bool {
+        false
+    }
     fn save_phase(&mut self, phase: ReleasePhase) -> Result<(), WizardError>;
     fn generate_inputs(&mut self) -> Result<(), WizardError>;
     fn acquire_intent(&mut self) -> Result<(), WizardError>;
@@ -371,6 +374,11 @@ fn drive_release(release: &mut dyn ReleaseMachine) -> Result<(), WizardError> {
                 release.save_phase(ReleasePhase::CandidateAssembled)?;
             }
             ReleasePhase::CandidateAssembled => {
+                if release.producer_only() {
+                    release.finalize_qualified_candidate()?;
+                    release.save_phase(ReleasePhase::Qualified)?;
+                    continue;
+                }
                 release.export_qualification()?;
                 release.save_phase(ReleasePhase::AwaitingQualification)?;
             }
@@ -470,6 +478,9 @@ impl<'a> ProductionRelease<'a> {
 }
 
 impl ReleaseMachine for ProductionRelease<'_> {
+    fn producer_only(&self) -> bool {
+        self.state.schema_version == 3
+    }
     fn phase(&self) -> ReleasePhase {
         self.state.phase
     }
@@ -492,11 +503,8 @@ impl ReleaseMachine for ProductionRelease<'_> {
             generated_at: DateTime::<Utc>::from(SystemTime::now()),
             validity_window: ChronoDuration::days(31),
         };
-        let generated = if self.state.schema_version == 2 {
-            crate::intent::generate_installer_release_inputs(
-                request,
-                crate::intent::load_pi_discovery_policy()?,
-            )?
+        let generated = if self.state.schema_version == 3 {
+            crate::intent::generate_installer_release_inputs(request)?
         } else {
             generate_release_inputs(request)?
         };
@@ -511,9 +519,15 @@ impl ReleaseMachine for ProductionRelease<'_> {
     fn acquire_intent(&mut self) -> Result<(), WizardError> {
         let output = self.state.work_dir.join("acquired-transfer");
         if output.exists() {
-            catalog_acquire::verify_transferred_bundle(&output)
-                .map(|_| ())
-                .map_err(|_| WizardError::ExternalCommand)
+            if self.state.schema_version == 3 {
+                catalog_acquire::verify_transferred_bundle_v2(&output)
+                    .map(|_| ())
+                    .map_err(|_| WizardError::ExternalCommand)
+            } else {
+                catalog_acquire::verify_transferred_bundle(&output)
+                    .map(|_| ())
+                    .map_err(|_| WizardError::ExternalCommand)
+            }
         } else {
             self.execute(&build_acquire_intent(
                 &self.state.work_dir.join("intent.json"),
@@ -525,8 +539,8 @@ impl ReleaseMachine for ProductionRelease<'_> {
 
     fn assemble_intent(&mut self) -> Result<(), WizardError> {
         let output = self.state.work_dir.join("unsigned-candidate");
-        if self.state.schema_version == 2 {
-            catalog_acquire::verify_transferred_bundle(
+        if self.state.schema_version == 3 {
+            catalog_acquire::verify_transferred_bundle_v2(
                 &self.state.work_dir.join("acquired-transfer"),
             )
             .map_err(|_| WizardError::Qualification)?;
@@ -579,8 +593,13 @@ impl ReleaseMachine for ProductionRelease<'_> {
         let source = build_catalog_source(&self.state)?;
         let transfer = self.state.work_dir.join("final-acquired-transfer");
         if transfer.exists() {
-            catalog_acquire::verify_transferred_bundle(&transfer)
-                .map_err(|_| WizardError::ExternalCommand)?;
+            if self.state.schema_version == 3 {
+                catalog_acquire::verify_transferred_bundle_v2(&transfer)
+                    .map_err(|_| WizardError::ExternalCommand)?;
+            } else {
+                catalog_acquire::verify_transferred_bundle(&transfer)
+                    .map_err(|_| WizardError::ExternalCommand)?;
+            }
         } else {
             self.execute(&build_acquire_source(
                 &source,
@@ -600,26 +619,17 @@ impl ReleaseMachine for ProductionRelease<'_> {
         }
         let initial = read_canonical_candidate(&self.state.work_dir.join("unsigned-candidate"))?;
         let final_bytes = read_final_candidate(&final_candidate)?;
-        if self.state.schema_version == 2 {
+        if self.state.schema_version == 3 {
             let source = catalog_core::CatalogSourceV2::from_json(&read_bounded_regular(
                 &source,
                 8 * 1024 * 1024,
             )?)
             .map_err(|_| WizardError::Qualification)?;
-            let qualification = read_bounded_regular(
-                &self
-                    .state
-                    .work_dir
-                    .join("imported-qualification/qualification-v1.json"),
-                catalog_core::MAX_PI_QUALIFICATION_BYTES as u64,
-            )?;
             if initial
                 != serde_jcs::to_vec(source.intent()).map_err(|_| WizardError::Qualification)?
                 || final_bytes
                     != serde_jcs::to_vec(
-                        &source
-                            .finalize(&qualification)
-                            .map_err(|_| WizardError::Qualification)?,
+                        &source.finalize().map_err(|_| WizardError::Qualification)?,
                     )
                     .map_err(|_| WizardError::Qualification)?
             {
@@ -636,7 +646,7 @@ impl ReleaseMachine for ProductionRelease<'_> {
             Ok(_) => Ok(()),
             Err(error) => {
                 self.prompter.say(
-                    "Signing stopped: the approved qualification or active signing key does not match this release.",
+                    "Signing stopped: producer evidence or the active signing key does not match this release.",
                 )?;
                 Err(error)
             }
@@ -656,7 +666,7 @@ impl ReleaseMachine for ProductionRelease<'_> {
             Ok((config, _)) => config,
             Err(error) => {
                 self.prompter.say(
-                    "Signing stopped: the approved qualification or active signing key does not match this release.",
+                    "Signing stopped: producer evidence or the active signing key does not match this release.",
                 )?;
                 return Err(error);
             }
@@ -771,23 +781,21 @@ fn verified_signing_context(
     state: &WizardState,
     launcher_config: &Path,
 ) -> Result<(PrivateSigningConfig, crate::key_rotation::ActiveSigningKey), WizardError> {
-    let qualification_bytes = read_bounded_regular(
-        &state
-            .work_dir
-            .join("imported-qualification/qualification-v1.json"),
-        8 * 1024 * 1024,
-    )?;
-    if state.schema_version == 2 {
+    if state.schema_version == 3 {
         let path = build_installer_catalog_source(state)?;
         let source = catalog_core::CatalogSourceV2::from_json(&read_bounded_regular(
             &path,
             8 * 1024 * 1024,
         )?)
         .map_err(|_| WizardError::Qualification)?;
-        source
-            .finalize(&qualification_bytes)
-            .map_err(|_| WizardError::Qualification)?;
+        source.finalize().map_err(|_| WizardError::Qualification)?;
     } else {
+        let qualification_bytes = read_bounded_regular(
+            &state
+                .work_dir
+                .join("imported-qualification/qualification-v1.json"),
+            8 * 1024 * 1024,
+        )?;
         let approved = catalog_core::CompatibilityQualificationV1::from_json(&qualification_bytes)
             .map_err(|_| WizardError::Qualification)?;
         verify_consumer_keyring_readiness(&approved, production_keyring().sha256())?;
@@ -1381,7 +1389,7 @@ fn read_recoverable_file(path: &Path, maximum: u64) -> Result<Vec<u8>, WizardErr
 }
 
 fn build_catalog_source(state: &WizardState) -> Result<PathBuf, WizardError> {
-    if state.schema_version == 2 {
+    if state.schema_version == 3 {
         return build_installer_catalog_source(state);
     }
     let intent_bytes = read_bounded_regular(&state.work_dir.join("intent.json"), 8 * 1024 * 1024)?;
@@ -1634,7 +1642,7 @@ fn archive_unfinished_state(repo: &Path, state: &WizardState) -> Result<(), Wiza
     ) {
         return Err(WizardError::State);
     }
-    validate_resumed_state(repo, state)?;
+    validate_state_location(repo, state)?;
     let nonce = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_err(|_| WizardError::State)?
@@ -1663,10 +1671,24 @@ fn verify_resumed_source_identity(
 }
 
 fn validate_resumed_state(repo: &Path, state: &WizardState) -> Result<(), WizardError> {
+    validate_state_location(repo, state)?;
+    if state.schema_version == 2
+        || state.schema_version == 3
+            && matches!(
+                state.phase,
+                ReleasePhase::AwaitingQualification | ReleasePhase::QualificationImported
+            )
+    {
+        return Err(WizardError::State);
+    }
+    Ok(())
+}
+
+fn validate_state_location(repo: &Path, state: &WizardState) -> Result<(), WizardError> {
     let expected = repo
         .join(STATE_ROOT)
         .join(format!("sequence-{}", state.sequence));
-    if !matches!(state.schema_version, 1 | 2)
+    if !matches!(state.schema_version, 1..=3)
         || state.sequence == 0
         || state.target != TARGET
         || state.work_dir != expected
@@ -1828,8 +1850,15 @@ fn github_sequence_observation(
 }
 
 fn verified_published_sequence(bytes: &[u8], expected: u64) -> Result<u64, WizardError> {
-    let catalog = catalog_core::verify_signed_catalog(bytes).map_err(|_| WizardError::Discovery)?;
-    let sequence = catalog.payload().sequence().get();
+    let sequence = if let Ok(catalog) = catalog_core::verify_signed_catalog_v2(bytes) {
+        catalog.sequence()
+    } else {
+        catalog_core::verify_signed_catalog(bytes)
+            .map_err(|_| WizardError::Discovery)?
+            .payload()
+            .sequence()
+            .get()
+    };
     if sequence != expected {
         return Err(WizardError::Discovery);
     }
@@ -2017,6 +2046,7 @@ mod tests {
         parity_verified: bool,
         answers: std::collections::VecDeque<String>,
         required_phrases: Vec<String>,
+        producer_only: bool,
     }
 
     impl ReleaseHarness {
@@ -2031,6 +2061,7 @@ mod tests {
                 parity_verified: false,
                 answers: std::collections::VecDeque::new(),
                 required_phrases: Vec::new(),
+                producer_only: false,
             }
         }
 
@@ -2049,11 +2080,15 @@ mod tests {
                 parity_verified: true,
                 answers: answers.into_iter().map(Into::into).collect(),
                 required_phrases: Vec::new(),
+                producer_only: false,
             }
         }
     }
 
     impl ReleaseMachine for ReleaseHarness {
+        fn producer_only(&self) -> bool {
+            self.producer_only
+        }
         fn phase(&self) -> ReleasePhase {
             self.phase
         }
@@ -2488,13 +2523,13 @@ mod tests {
     fn resume_accepts_supported_installer_and_legacy_states_only() {
         let repo = Path::new("/repo");
         let mut state = WizardState {
-            schema_version: 2,
+            schema_version: 3,
             sequence: 4,
             pi_version: "1.2.0".into(),
             node_version: "22.19.0".into(),
             target: TARGET.into(),
             mode: RunMode::DryRun,
-            phase: ReleasePhase::AwaitingQualification,
+            phase: ReleasePhase::CandidateAssembled,
             signing_key_generation: 1,
             catalog_source_commit: "11".repeat(20),
             catalog_source_tree_sha256: "22".repeat(32),
@@ -2503,14 +2538,14 @@ mod tests {
         validate_resumed_state(repo, &state).unwrap();
         state.schema_version = 1;
         validate_resumed_state(repo, &state).unwrap();
-        for unsupported in [0, 3, u32::MAX] {
+        for unsupported in [0, 2, u32::MAX] {
             state.schema_version = unsupported;
             assert_eq!(
                 validate_resumed_state(repo, &state),
                 Err(WizardError::State)
             );
         }
-        state.schema_version = 2;
+        state.schema_version = 3;
         state.work_dir = repo.join(".release-work/sequence-5");
         assert_eq!(
             validate_resumed_state(repo, &state),
@@ -3053,6 +3088,35 @@ mod tests {
     }
 
     #[test]
+    fn producer_release_replays_inputs_without_consumer_qualification() {
+        let mut harness = ReleaseHarness::dry_run_fixture();
+        harness.producer_only = true;
+        run_release_with_harness(&mut harness).unwrap();
+        assert_eq!(
+            harness.saved_phases,
+            vec![
+                ReleasePhase::InputsDiscovered,
+                ReleasePhase::Acquired,
+                ReleasePhase::CandidateAssembled,
+                ReleasePhase::Qualified
+            ]
+        );
+        assert!(harness.parity_verified);
+        assert!(
+            !harness
+                .executed
+                .iter()
+                .any(|step| step.contains("qualification"))
+        );
+        assert!(
+            !harness
+                .executed
+                .iter()
+                .any(|step| step.contains(" sign ") || step.contains("stage-remote"))
+        );
+    }
+
+    #[test]
     fn dry_run_stops_before_signing_and_remote_mutations() {
         let mut harness = ReleaseHarness::dry_run_fixture();
         run_release_with_harness(&mut harness).unwrap();
@@ -3112,35 +3176,11 @@ fn build_installer_catalog_source(state: &WizardState) -> Result<PathBuf, Wizard
     {
         return Err(WizardError::Qualification);
     }
-    let build_bytes = read_bounded_regular(
-        &state
-            .work_dir
-            .join("imported-qualification/build-binding-v1.json"),
-        64 * 1024,
-    )?;
-    let build = catalog_core::FluxsembleBuildBindingV1::from_json(&build_bytes)
+    let source_bytes = serde_jcs::to_vec(&json!({"schema_version": 2, "intent": intent}))
         .map_err(|_| WizardError::Qualification)?;
-    let qualification = read_bounded_regular(
-        &state
-            .work_dir
-            .join("imported-qualification/qualification-v1.json"),
-        catalog_core::MAX_PI_QUALIFICATION_BYTES as u64,
-    )?;
-    let digest = format!("{:x}", Sha256::digest(&qualification));
-    let relative = format!("qualifications/pi-release-{digest}.json");
-    let source_bytes = serde_jcs::to_vec(&json!({
-        "schema_version": 2,
-        "intent": intent,
-        "build": build,
-        "qualification": {"relative_path": relative, "sha256": digest},
-    }))
-    .map_err(|_| WizardError::Qualification)?;
     let source = catalog_core::CatalogSourceV2::from_json(&source_bytes)
         .map_err(|_| WizardError::Qualification)?;
-    source
-        .finalize(&qualification)
-        .map_err(|_| WizardError::Qualification)?;
-    write_exact_or_verify(&state.work_dir.join(&relative), &qualification)?;
+    source.finalize().map_err(|_| WizardError::Qualification)?;
     let path = state.work_dir.join(format!(
         "catalog-v1-sequence-{}-source.json",
         state.sequence
@@ -3172,11 +3212,11 @@ fn select_installer_node(
     Ok(SUPPORTED.into())
 }
 
-// Explicit public-data integration, never part of ordinary synthetic qualification.
+// Explicit offline public-data integration against the retained admitted corpus.
 #[cfg(test)]
 #[test]
-#[ignore = "requires exact genuine public handoff and a new owner-controlled output root"]
-fn genuine_offline_qualification_handoff_prepares_unsigned_candidate() {
+#[ignore = "requires an explicit new owner-controlled output root"]
+fn genuine_offline_producer_prepares_unsigned_candidate() {
     use catalog_acquire::{AcquireError, ReleaseDiscoveryTransport};
     use std::collections::BTreeMap;
     struct RetainedPublicData(BTreeMap<String, Vec<u8>>);
@@ -3189,15 +3229,10 @@ fn genuine_offline_qualification_handoff_prepares_unsigned_candidate() {
                 .ok_or(AcquireError::Input)
         }
     }
-    let handoff = PathBuf::from(
-        std::env::var_os("CATALOG_GENUINE_QUALIFICATION_HANDOFF")
-            .expect("explicit public handoff required"),
-    );
     let output = PathBuf::from(
-        std::env::var_os("CATALOG_GENUINE_QUALIFICATION_OUTPUT")
-            .expect("explicit new output required"),
+        std::env::var_os("CATALOG_GENUINE_PRODUCER_OUTPUT").expect("explicit new output required"),
     );
-    assert!(handoff.is_absolute() && output.is_absolute());
+    assert!(output.is_absolute());
     assert!(!output.exists(), "never replace prior output");
     assert_eq!(
         output.parent().unwrap().canonicalize().unwrap(),
@@ -3271,12 +3306,30 @@ fn genuine_offline_qualification_handoff_prepares_unsigned_candidate() {
         format!("{:x}", Sha256::digest(&inputs_bytes)),
         evidence["package_inputs_sha256"].as_str().unwrap()
     );
+    let mut intent_value: serde_json::Value = serde_json::from_slice(&intent_bytes).unwrap();
+    intent_value["profile"]["schema_version"] = json!(2);
+    intent_value["profile"]
+        .as_object_mut()
+        .unwrap()
+        .remove("consumer_requirement");
+    intent_value["profile"]
+        .as_object_mut()
+        .unwrap()
+        .remove("required_contracts");
+    let intent_bytes = serde_jcs::to_vec(&intent_value).unwrap();
     let intent = catalog_core::PiReleaseIntentV2::from_json(&intent_bytes).unwrap();
-    let inputs = catalog_acquire::PackageInputManifestV2::from_json(&inputs_bytes).unwrap();
-    let qualification_bytes = fs::read(handoff.join("qualification-v1.json")).unwrap();
-    let qualification =
-        catalog_core::PiReleaseQualificationV1::from_json(&qualification_bytes).unwrap();
-    catalog_core::verify_pi_release_qualification(intent.profile(), &qualification).unwrap();
+    let mut inputs_value: serde_json::Value = serde_json::from_slice(&inputs_bytes).unwrap();
+    inputs_value["release_subject_sha256"] = json!(
+        catalog_core::pi_release_subject_v2_sha256(intent.profile())
+            .unwrap()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    );
+    let inputs = catalog_acquire::PackageInputManifestV2::from_json(
+        &serde_jcs::to_vec(&inputs_value).unwrap(),
+    )
+    .unwrap();
     fs::create_dir(&output).unwrap();
     fs::set_permissions(&output, fs::Permissions::from_mode(0o700)).unwrap();
     let cache = output.join("cache");
@@ -3286,7 +3339,7 @@ fn genuine_offline_qualification_handoff_prepares_unsigned_candidate() {
     catalog_acquire::acquire_installer_release_with_transport(
         catalog_acquire::AcquireInstallerReleaseRequest {
             source: catalog_acquire::AcquireInstallerReleaseSource::Intent {
-                intent: intent.clone(),
+                intent: Box::new(intent.clone()),
             },
             package_inputs: inputs.clone(),
             cache_root: cache.clone(),
@@ -3297,32 +3350,19 @@ fn genuine_offline_qualification_handoff_prepares_unsigned_candidate() {
     )
     .unwrap();
     let state = WizardState {
-        schema_version: 2,
+        schema_version: 3,
         sequence: intent.sequence(),
         pi_version: intent.profile().pi_package().version().as_str().into(),
         node_version: intent.profile().node_version().as_str().into(),
         target: intent.profile().target().as_str().into(),
         mode: RunMode::DryRun,
-        phase: ReleasePhase::AwaitingQualification,
+        phase: ReleasePhase::CandidateAssembled,
         signing_key_generation: 2,
         catalog_source_commit: identity.0.clone(),
         catalog_source_tree_sha256: identity.1.clone(),
         work_dir: output.clone(),
     };
     fs::write(output.join("intent.json"), &intent_bytes).unwrap();
-    crate::qualification::export_request(
-        &state,
-        &output.join("candidate"),
-        &output.join("qualification-request"),
-    )
-    .unwrap();
-    crate::qualification::verify_existing_request(
-        &state,
-        &output.join("candidate"),
-        &output.join("qualification-request"),
-    )
-    .unwrap();
-    crate::qualification::import_handoff(&state, &handoff, production_keyring().sha256()).unwrap();
     let source_path = build_installer_catalog_source(&state).unwrap();
     let source = catalog_core::CatalogSourceV2::from_json(&fs::read(source_path).unwrap()).unwrap();
     // Each original acquisition owns a fresh extracted-object cache.
@@ -3333,7 +3373,6 @@ fn genuine_offline_qualification_handoff_prepares_unsigned_candidate() {
         catalog_acquire::AcquireInstallerReleaseRequest {
             source: catalog_acquire::AcquireInstallerReleaseSource::Final {
                 source: Box::new(source),
-                qualification_bytes,
                 source_commit: identity.0.clone(),
                 source_tree_sha256: identity.1.clone(),
             },
@@ -3348,6 +3387,6 @@ fn genuine_offline_qualification_handoff_prepares_unsigned_candidate() {
     assert_eq!(source_identity(&repo).unwrap(), identity);
     assert!(verified.objects().len() > 100);
     let retained =
-        catalog_acquire::verify_transferred_bundle(&output.join("unsigned-candidate")).unwrap();
+        catalog_acquire::verify_transferred_bundle_v2(&output.join("unsigned-candidate")).unwrap();
     println!("unsigned genuine candidate {}", retained.bundle_sha256());
 }

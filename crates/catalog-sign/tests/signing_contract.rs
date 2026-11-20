@@ -20,7 +20,7 @@ fn missing_or_unverified_inputs_fail_without_key_or_output_side_effects() {
 #[test]
 fn installer_finalization_rejects_fabricated_observations_without_offline_verification() {
     use catalog_acquire::{
-        BundleRecord, PublicBundleObject, VerifiedBundleWriteRequest, write_verified_bundle,
+        BundleRecord, PublicBundleObject, VerifiedBundleWriteRequestV2, write_verified_bundle_v2,
     };
     use catalog_core::{CatalogSourceV2, InputSourceKind};
     use serde_json::{Value, json};
@@ -31,6 +31,9 @@ fn installer_finalization_rejects_fabricated_observations_without_offline_verifi
         "../../catalog-core/tests/fixtures/catalog/pi-installer-v1/valid-wrapper-root.json"
     ))
     .unwrap();
+    p["schema_version"] = json!(2);
+    p.as_object_mut().unwrap().remove("required_contracts");
+    p.as_object_mut().unwrap().remove("consumer_requirement");
     let prefix = "https://github.com/Devalch/Fluxsemble-runtime-catalog/releases/download/catalog-v1-sequence-2";
     let mut object_bytes = Vec::new();
     for (key, role, bytes) in [
@@ -63,28 +66,13 @@ fn installer_finalization_rejects_fabricated_observations_without_offline_verifi
     p["locked_packages"][0]["archive_sha256"] =
         p["components"][1]["artifacts"][0]["sha256"].clone();
     let profile =
-        catalog_core::PiReleaseProfileV1::from_json(&serde_jcs::to_vec(&p).unwrap()).unwrap();
-    let subject = catalog_core::pi_release_subject_sha256(&profile)
+        catalog_core::PiReleaseProfileV2::from_json(&serde_jcs::to_vec(&p).unwrap()).unwrap();
+    let subject = catalog_core::pi_release_subject_v2_sha256(&profile)
         .unwrap()
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect::<String>();
-    let mut q: Value = serde_json::from_slice(include_bytes!(
-        "../../catalog-core/tests/fixtures/catalog/pi-installer-v1/valid-qualification.json"
-    ))
-    .unwrap();
-    q["release_subject_sha256"] = json!(subject);
-    q["verification_build"]["compatibility_profile_sha256"] = json!(
-        catalog_core::pi_required_contracts_profile_sha256(profile.required_contracts())
-            .unwrap()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>()
-    );
-    let qbytes = serde_jcs::to_vec(&q).unwrap();
-    let mut build = q["verification_build"].clone();
-    build.as_object_mut().unwrap().remove("consumer_version");
-    let source=CatalogSourceV2::from_json(&serde_jcs::to_vec(&json!({"schema_version":2,"intent":{"schema_version":2,"sequence":"2","tag":"catalog-v1-sequence-2","generated_at":"2026-10-15T00:00:00Z","expires_at":"2026-11-15T00:00:00Z","title":"Synthetic","notes":"Transfer binding test only; these are not executable archives.","profile":p},"build":build,"qualification":{"relative_path":"qualifications/current.json","sha256":sha(&qbytes)}})).unwrap()).unwrap();
+    let source=CatalogSourceV2::from_json(&serde_jcs::to_vec(&json!({"schema_version":2,"intent":{"schema_version":2,"sequence":"2","tag":"catalog-v1-sequence-2","generated_at":"2026-10-15T00:00:00Z","expires_at":"2026-11-15T00:00:00Z","title":"Synthetic","notes":"Transfer binding test only; these are not executable archives.","profile":p}})).unwrap()).unwrap();
     let package = &p["locked_packages"][0];
     let mut inputs = json!({"schema_version":2,"release_subject_sha256":subject,"installer_manifest_source":{"url":"https://github.com/earendil-works/pi/releases/download/v1.2.0/pi-coding-agent-install-package.json","size_bytes":p["installer_manifest"]["size_bytes"],"sha256":p["installer_manifest"]["sha256"]},"installer_lock_source":{"url":"https://github.com/earendil-works/pi/releases/download/v1.2.0/pi-coding-agent-install-package-lock.json","size_bytes":p["installer_lock"]["size_bytes"],"sha256":p["installer_lock"]["sha256"]},"locked_packages":[{"locator":package["locator"],"name":package["name"],"version":package["version"],"resolved_url":package["resolved_url"],"registry_integrity":package["registry_integrity"],"archive_size":10,"archive_sha256":package["archive_sha256"],"declaration_size":11,"declaration_sha256":p["pi_manifest"]["sha256"],"archive_member_count":2,"pruned_reasons":[]}],"pre_prune_package_count":2,"applicable_package_count":1});
     let checksum_url = "https://nodejs.org/dist/v22.19.0/SHASUMS256.txt";
@@ -127,25 +115,21 @@ fn installer_finalization_rejects_fabricated_observations_without_offline_verifi
                 .unwrap(),
             );
         }
-        write_verified_bundle(
-            VerifiedBundleWriteRequest {
+        write_verified_bundle_v2(
+            VerifiedBundleWriteRequestV2 {
                 source_kind: InputSourceKind::CatalogSource,
                 source_sha256: catalog_core::catalog_source_v2_digest(&source)
                     .unwrap()
                     .iter()
                     .map(|b| format!("{b:02x}"))
                     .collect(),
-                compatibility_input_sha256: subject.clone(),
+                release_subject_sha256: subject.clone(),
                 source_commit: Some("1".repeat(40)),
                 source_tree_sha256: Some("2".repeat(64)),
                 records: vec![
                     BundleRecord {
                         role: "catalog_source".into(),
                         bytes: serde_jcs::to_vec(&source).unwrap(),
-                    },
-                    BundleRecord {
-                        role: "qualification".into(),
-                        bytes: qbytes.clone(),
                     },
                     BundleRecord {
                         role: "package_inputs".into(),
@@ -171,36 +155,22 @@ mod installer_fixtures;
 #[test]
 fn production_finalization_requires_offline_graph_and_complete_auxiliary_objects() {
     use catalog_acquire::{
-        BundleRecord, PublicBundleObject, VerifiedBundleWriteRequest, write_verified_bundle,
+        BundleRecord, PublicBundleObject, VerifiedBundleWriteRequestV2, write_verified_bundle_v2,
     };
     use catalog_core::{CatalogSourceV2, InputSourceKind};
     use installer_fixtures::{sha256, transferred_fixture};
-    use serde_json::{Value, json};
+    use serde_json::json;
     use std::{fs, os::unix::fs::PermissionsExt};
     let (intent, inputs, objects) = transferred_fixture();
-    let subject = catalog_core::pi_release_subject_sha256(intent.profile())
+    let subject = catalog_core::pi_release_subject_v2_sha256(intent.profile())
         .unwrap()
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect::<String>();
-    let mut q: Value = serde_json::from_slice(include_bytes!(
-        "../../catalog-core/tests/fixtures/catalog/pi-installer-v1/valid-qualification.json"
-    ))
+    let source = CatalogSourceV2::from_json(
+        &serde_jcs::to_vec(&json!({"schema_version":2,"intent":intent})).unwrap(),
+    )
     .unwrap();
-    q["release_subject_sha256"] = json!(subject);
-    q["required_contracts"] = serde_json::to_value(intent.profile().required_contracts()).unwrap();
-    q["consumer_requirement"] = json!(intent.profile().consumer_requirement().as_str());
-    q["verification_build"]["compatibility_profile_sha256"] = json!(
-        catalog_core::pi_required_contracts_profile_sha256(intent.profile().required_contracts())
-            .unwrap()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>()
-    );
-    let qbytes = serde_jcs::to_vec(&q).unwrap();
-    let mut build = q["verification_build"].clone();
-    build.as_object_mut().unwrap().remove("consumer_version");
-    let source = CatalogSourceV2::from_json(&serde_jcs::to_vec(&json!({"schema_version":2,"intent":intent,"build":build,"qualification":{"relative_path":"qualifications/current.json","sha256":sha256(&qbytes)}})).unwrap()).unwrap();
     let root = std::env::temp_dir().join(format!(
         "pi-sign-owner-{}-{}",
         std::process::id(),
@@ -237,25 +207,21 @@ fn production_finalization_requires_offline_graph_and_complete_auxiliary_objects
             input_value["locked_packages"][0]["archive_member_count"] = json!(999);
         }
         let output = root.join(format!("bundle-{case_index}"));
-        write_verified_bundle(
-            VerifiedBundleWriteRequest {
+        write_verified_bundle_v2(
+            VerifiedBundleWriteRequestV2 {
                 source_kind: InputSourceKind::CatalogSource,
                 source_sha256: catalog_core::catalog_source_v2_digest(&source)
                     .unwrap()
                     .iter()
                     .map(|b| format!("{b:02x}"))
                     .collect(),
-                compatibility_input_sha256: subject.clone(),
+                release_subject_sha256: subject.clone(),
                 source_commit: Some("1".repeat(40)),
                 source_tree_sha256: Some("2".repeat(64)),
                 records: vec![
                     BundleRecord {
                         role: "catalog_source".into(),
                         bytes: serde_jcs::to_vec(&source).unwrap(),
-                    },
-                    BundleRecord {
-                        role: "qualification".into(),
-                        bytes: qbytes.clone(),
                     },
                     BundleRecord {
                         role: "package_inputs".into(),
@@ -269,7 +235,7 @@ fn production_finalization_requires_offline_graph_and_complete_auxiliary_objects
         .unwrap();
         let result = finalize_candidate_from_path(&output);
         if case == "matching" {
-            assert_eq!(result.unwrap().support_asset_names().len(), 4);
+            assert_eq!(result.unwrap().support_asset_names().len(), 3);
         } else {
             assert!(result.is_err(), "accepted {case}");
         }

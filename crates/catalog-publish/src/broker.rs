@@ -118,6 +118,8 @@ pub enum BrokerRequestV1 {
         schema_version: u16,
         repository: String,
         release_id: String,
+        #[serde(default)]
+        make_latest: bool,
     },
 }
 
@@ -219,6 +221,7 @@ impl BrokerRequestV1 {
                 schema_version,
                 repository,
                 release_id,
+                ..
             } => {
                 valid_schema(*schema_version)?;
                 valid_repository(repository)?;
@@ -891,12 +894,17 @@ fn command_plan(
         BrokerRequestV1::PublishDraft {
             repository,
             release_id,
+            make_latest,
             ..
         } => Ok(api_command_plan(
             "PATCH",
             format!("/repos/{repository}/releases/{release_id}"),
             "Accept: application/vnd.github+json",
-            Some(canonical_value(&serde_json::json!({"draft": false}))?),
+            Some(canonical_value(&if *make_latest {
+                serde_json::json!({"draft": false, "make_latest": "true"})
+            } else {
+                serde_json::json!({"draft": false})
+            })?),
         )),
     }
 }

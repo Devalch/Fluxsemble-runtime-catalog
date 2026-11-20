@@ -14,6 +14,60 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 #[test]
+fn v2_input_transfer_requires_no_consumer_qualification() {
+    use catalog_acquire::{
+        VerifiedBundleWriteRequestV2, verify_transferred_bundle_v2, write_verified_bundle_v2,
+    };
+    let root = TempRoot::new();
+    let source = root.path.join("v2-object");
+    fs::write(&source, b"object").unwrap();
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o400)).unwrap();
+    let object = PublicBundleObject::verified_file(
+        fs::File::open(&source).unwrap(),
+        "https://registry.npmjs.org/example/-/example-1.0.0.tgz".into(),
+        6,
+        sha256(b"object"),
+    )
+    .unwrap();
+    let output = root.path.join("v2-bundle");
+    let bundle = write_verified_bundle_v2(
+        VerifiedBundleWriteRequestV2 {
+            source_kind: InputSourceKind::CatalogSource,
+            source_sha256: "11".repeat(32),
+            release_subject_sha256: "22".repeat(32),
+            source_commit: Some("0123456789abcdef0123456789abcdef01234567".into()),
+            source_tree_sha256: Some("33".repeat(32)),
+            records: vec![
+                BundleRecord {
+                    role: "catalog_source".into(),
+                    bytes: b"source".to_vec(),
+                },
+                BundleRecord {
+                    role: "package_inputs".into(),
+                    bytes: b"inputs".to_vec(),
+                },
+            ],
+            objects: vec![object],
+        },
+        &output,
+    )
+    .unwrap();
+    assert_eq!(bundle.objects().len(), 1);
+    assert_eq!(
+        verify_transferred_bundle_v2(&output)
+            .unwrap()
+            .verified_input(),
+        &bundle
+    );
+    assert!(verify_transferred_bundle(&output).is_err());
+    let object = output.join("objects").join(sha256(b"object"));
+    fs::set_permissions(&object, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(&object, b"alter!").unwrap();
+    fs::set_permissions(&object, fs::Permissions::from_mode(0o400)).unwrap();
+    assert!(verify_transferred_bundle_v2(&output).is_err());
+}
+
+#[test]
 fn no_clobber_digest_addressed_bundle_is_reopened_before_success() {
     let root = TempRoot::new();
     let bundle = root.path.join("bundle");

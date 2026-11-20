@@ -233,6 +233,49 @@ pub fn verify_signed_catalog(bytes: &[u8]) -> Result<VerifiedCatalogV1, CatalogS
     verify_signed_catalog_with_identity(bytes, identity)
 }
 
+/// Verify a producer-only V2 catalog using the embedded production keyring.
+pub fn verify_signed_catalog_v2(
+    bytes: &[u8],
+) -> Result<crate::PiReleaseIntentV2, CatalogSignatureError> {
+    let spans = scan_signed_envelope(bytes)?;
+    let key_id: String = parse_scalar(bytes, &spans.key_id)?;
+    let identity = production_keyring()
+        .verification_identity(&key_id)
+        .map(VerificationIdentity::from)
+        .ok_or_else(invalid_catalog)?;
+    verify_signed_catalog_v2_with_identity(bytes, identity)
+}
+
+pub fn verify_signed_release_bundle_manifest_v2(
+    bytes: &[u8],
+) -> Result<crate::SignedReleaseBundleManifestV2, CatalogSignatureError> {
+    let manifest = crate::SignedReleaseBundleManifestV2::from_json(bytes)
+        .map_err(|_| invalid_release_bundle())?;
+    let identity = production_keyring()
+        .verification_identity(manifest.signature().key_id().as_str())
+        .map(VerificationIdentity::from)
+        .ok_or_else(invalid_release_bundle)?;
+    verify_release_manifest_v2_with_identity(&manifest, identity)?;
+    Ok(manifest)
+}
+
+fn verify_release_manifest_v2_with_identity(
+    manifest: &crate::SignedReleaseBundleManifestV2,
+    identity: VerificationIdentity,
+) -> Result<(), CatalogSignatureError> {
+    if manifest.signature().key_id().as_str() != identity.key_id {
+        return Err(invalid_release_bundle());
+    }
+    let bytes =
+        crate::release_bundle_signing_bytes_v2(manifest).map_err(|_| invalid_release_bundle())?;
+    verify_signature(
+        &identity.public_key,
+        &bytes,
+        manifest.signature().signature().as_str(),
+    )
+    .map_err(|_| invalid_release_bundle())
+}
+
 /// Verifies a release-bundle manifest using a matching embedded reviewed production key.
 pub fn verify_signed_release_bundle_manifest(
     bytes: &[u8],
@@ -264,6 +307,23 @@ pub fn verify_fixture_signed_release_bundle_manifest(
         SignedReleaseBundleManifestV1::from_json(bytes).map_err(|_| invalid_release_bundle())?;
     verify_release_manifest_with_identity(&manifest, fixture_identity())?;
     Ok(VerifiedReleaseBundleManifestV1 { manifest })
+}
+
+#[cfg(feature = "fixture-tools")]
+pub fn verify_fixture_signed_catalog_v2(
+    bytes: &[u8],
+) -> Result<crate::PiReleaseIntentV2, CatalogSignatureError> {
+    verify_signed_catalog_v2_with_identity(bytes, fixture_identity())
+}
+
+#[cfg(feature = "fixture-tools")]
+pub fn verify_fixture_signed_release_bundle_manifest_v2(
+    bytes: &[u8],
+) -> Result<crate::SignedReleaseBundleManifestV2, CatalogSignatureError> {
+    let manifest = crate::SignedReleaseBundleManifestV2::from_json(bytes)
+        .map_err(|_| invalid_release_bundle())?;
+    verify_release_manifest_v2_with_identity(&manifest, fixture_identity())?;
+    Ok(manifest)
 }
 
 #[cfg(feature = "fixture-tools")]
@@ -324,6 +384,35 @@ fn verify_signed_catalog_with_identity(
         payload_sha256,
         key_id,
     })
+}
+
+fn verify_signed_catalog_v2_with_identity(
+    bytes: &[u8],
+    identity: VerificationIdentity,
+) -> Result<crate::PiReleaseIntentV2, CatalogSignatureError> {
+    let spans = scan_signed_envelope(bytes)?;
+    reject_duplicate_json(bytes).map_err(|_| invalid_catalog())?;
+    let version: u16 = parse_scalar(bytes, &spans.envelope_version)?;
+    let algorithm: String = parse_scalar(bytes, &spans.signature_algorithm)?;
+    let key_id: String = parse_scalar(bytes, &spans.key_id)?;
+    let signature: String = parse_scalar(bytes, &spans.signature)?;
+    if version != 2
+        || algorithm != SIGNATURE_ALGORITHM
+        || key_id != identity.key_id
+        || key_id.len() > MAX_KEY_ID_BYTES
+        || signature.len() != ED25519_SIGNATURE_TEXT_BYTES
+    {
+        return Err(invalid_catalog());
+    }
+    let payload = crate::PiReleaseIntentV2::from_json(&bytes[spans.payload.clone()])
+        .map_err(|_| invalid_catalog())?;
+    let canonical = serde_jcs::to_vec(&payload).map_err(|_| invalid_catalog())?;
+    if canonical.as_slice() != &bytes[spans.payload] {
+        return Err(invalid_catalog());
+    }
+    let message = crate::catalog_signing_bytes_v2(&payload).map_err(|_| invalid_catalog())?;
+    verify_signature(&identity.public_key, &message, &signature).map_err(|_| invalid_catalog())?;
+    Ok(payload)
 }
 
 fn verify_release_manifest_with_identity(
@@ -675,6 +764,66 @@ mod tests {
                 .verifying_key()
                 .to_bytes(),
         }
+    }
+
+    #[test]
+    fn v2_catalog_and_release_signatures_do_not_claim_consumer_qualification() {
+        let mut profile: Value = serde_json::from_slice(include_bytes!(
+            "../tests/fixtures/catalog/pi-installer-v1/valid-wrapper-root.json"
+        ))
+        .unwrap();
+        profile["schema_version"] = json!(2);
+        profile
+            .as_object_mut()
+            .unwrap()
+            .remove("consumer_requirement");
+        profile
+            .as_object_mut()
+            .unwrap()
+            .remove("required_contracts");
+        for (field, role) in [
+            ("installer_manifest", "pi-installer-package"),
+            ("installer_lock", "pi-installer-lock"),
+            ("pi_manifest", "pi-package"),
+        ] {
+            let digest = profile[field]["sha256"].as_str().unwrap().to_owned();
+            profile[field]["url"] = json!(format!(
+                "https://github.com/Devalch/Fluxsemble-runtime-catalog/releases/download/catalog-v1-sequence-8/{role}-{digest}.json"
+            ));
+        }
+        let payload = json!({"schema_version":2,"sequence":"8","tag":"catalog-v1-sequence-8","generated_at":"2026-11-20T16:00:00Z","expires_at":"2026-12-20T16:00:00Z","title":"Pi","notes":"inputs","profile":profile});
+        let parsed =
+            crate::PiReleaseIntentV2::from_json(&serde_jcs::to_vec(&payload).unwrap()).unwrap();
+        let signature = SigningKey::from_bytes(&TEST_SEED)
+            .sign(&crate::catalog_signing_bytes_v2(&parsed).unwrap());
+        let envelope = serde_jcs::to_vec(&json!({"envelope_version":2,"signature_algorithm":"ed25519","key_id":TEST_ID,"payload":payload,"signature":encode_base64url_no_pad(&signature.to_bytes())})).unwrap();
+        assert!(verify_signed_catalog_v2_with_identity(&envelope, test_identity()).is_ok());
+        assert!(verify_signed_catalog_with_identity(&envelope, test_identity()).is_err());
+        let mut changed: Value = serde_json::from_slice(&envelope).unwrap();
+        changed["payload"]["title"] = json!("changed");
+        assert!(
+            verify_signed_catalog_v2_with_identity(
+                &serde_jcs::to_vec(&changed).unwrap(),
+                test_identity()
+            )
+            .is_err()
+        );
+        let mut release = json!({"schema_version":2,"source_commit":"0123456789abcdef0123456789abcdef01234567","source_tree_sha256":"1".repeat(64),"producer_input_sha256":"2".repeat(64),"tag":"catalog-v1-sequence-8","catalog_envelope":{"name":"catalog-v1.json","size":100,"sha256":"3".repeat(64)},"assets":[{"name":"pi-package.json","size":10,"sha256":"4".repeat(64)}],"signature":{"key_id":TEST_ID,"signature":"A".repeat(86)}});
+        let unsigned =
+            crate::SignedReleaseBundleManifestV2::from_json(&serde_jcs::to_vec(&release).unwrap())
+                .unwrap();
+        let signature = SigningKey::from_bytes(&TEST_SEED)
+            .sign(&crate::release_bundle_signing_bytes_v2(&unsigned).unwrap());
+        release["signature"]["signature"] = json!(encode_base64url_no_pad(&signature.to_bytes()));
+        let signed =
+            crate::SignedReleaseBundleManifestV2::from_json(&serde_jcs::to_vec(&release).unwrap())
+                .unwrap();
+        assert!(verify_release_manifest_v2_with_identity(&signed, test_identity()).is_ok());
+        release["producer_input_sha256"] = json!("9".repeat(64));
+        let changed =
+            crate::SignedReleaseBundleManifestV2::from_json(&serde_jcs::to_vec(&release).unwrap())
+                .unwrap();
+        assert!(verify_release_manifest_v2_with_identity(&changed, test_identity()).is_err());
     }
 
     fn envelope() -> Vec<u8> {

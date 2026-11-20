@@ -1274,7 +1274,7 @@ def round2_errors(source):
             "authorized_recovery_mode_combination(",
             "valid_bound_staging(&value[\"staging\"])",
             '"recover-sign",\n                "--input"',
-            "metadata.uid() == current_euid() && matches!(mode, 0o700 | 0o755)",
+            "metadata.uid() == current_euid() && mode & 0o7722 == 0o700",
         ],
         "signing": [
             "PublicationDurability::Uncertain",
@@ -1339,7 +1339,7 @@ def round2_errors(source):
             'recovered_value["isolation_attestation"]["original_operation_mode"]',
             "completed recovered-manifest retry failed",
             "recovery admitted a different launcher config/signer identity",
-            "launcher_owner_ancestors_accept_only_0700_or_0755",
+            "launcher_owner_ancestors_accept_non_writable_owner_directories",
         ],
     }
     for name, tokens in required.items():
@@ -1376,9 +1376,13 @@ def round2_errors(source):
         errors.append("absent recovery binding before stage bind is not rejected")
     if source["signing"].count(absent_binding_before_stage_cleanup) != 1:
         errors.append("absent recovery binding before stage cleanup is not rejected")
-    recover_region = source["signing"].split("fn recover_signed_output(", 1)[-1].split("fn catalog_payload_for_intent(", 1)[0]
-    if recover_region.find("verify_signed_bytes(&signed, verification_policy)?;") > recover_region.find("settle_bound_empty_staging(parent_path)?;"):
-        errors.append("recovery cleanup occurs before complete public output verification")
+    recover_region = source["signing"].split("fn recover_signed_output(", 1)[-1].split("fn recover_signed_output_v2(", 1)[0]
+    recover_v2_region = source["signing"].split("fn recover_signed_output_v2(", 1)[-1].split("fn settle_bound_empty_staging(", 1)[0]
+    for region, verify in [(recover_region, "verify_signed_bytes(&signed, verification_policy)?;"), (recover_v2_region, "verify_signed_bytes_v2(")]:
+        verify_at = region.find(verify)
+        settle_at = region.find("settle_bound_empty_staging(parent_path)?;")
+        if verify_at < 0 or settle_at < 0 or verify_at > settle_at:
+            errors.append("recovery cleanup occurs before complete public output verification")
     if source["signing"].count("FileIdentity::from_metadata(&metadata) != binding.identity") != 2:
         errors.append("both recovery and in-process bound stage identity checks are not enforced")
     if source["signing"].count("metadata.permissions().mode() & 0o7777 != binding.mode") != 2:
@@ -1410,7 +1414,7 @@ mutations = [
     ("launcher", "open_existing_output(path)", "create_fresh_output(path)", "closed recovery output"),
     ("launcher", "write_recovery_binding(", "removed_binding_write(", "persisted recovery binding"),
     ("launcher", "verify_recovery_binding(", "removed_binding_verify(", "recovery config/signer binding"),
-    ("launcher", "metadata.uid() == current_euid() && matches!(mode, 0o700 | 0o755)", "metadata.uid() == current_euid() && mode == 0o700", "owner ancestor exact modes"),
+    ("launcher", "metadata.uid() == current_euid() && mode & 0o7722 == 0o700", "metadata.uid() == current_euid() && mode == 0o700", "owner ancestor exact modes"),
     ("signing", "self.published = true;", "", "payload visibility state"),
     ("signing", "self.parent.sync_all().is_err()", "false", "first/final fsync uncertainty"),
     ("signing", "observed == 1 || observed == conventional", "observed == conventional", "portable signing directory links"),
@@ -1606,7 +1610,12 @@ policies = [
     ("retained all-file revalidation", "bundle.reverify_all().map_err(|_| prior_preserved())?;", 2),
     ("production catalog signature", "VerificationPolicy::Production => verify_signed_catalog(bytes).map_err(|_| rejected())", 1),
     ("production release signature", "verify_signed_release_bundle_manifest(bytes).map_err(|_| rejected())", 1),
-    ("signed release inventory", "verify_signed_release_inventory(&inventory, &release_manifest)", 1),
+    ("V2 production catalog signature", "catalog_core::verify_signed_catalog_v2(catalog_bytes)", 1),
+    ("V2 remote catalog signature", "catalog_core::verify_signed_catalog_v2(&catalog_bytes)", 1),
+    ("V2 production manifest signature", "catalog_core::verify_signed_release_bundle_manifest_v2(manifest_bytes)", 1),
+    ("signed release inventory", "verify_signed_release_inventory(&inventory, m)", 1),
+    ("V2 signed release inventory", "verify_signed_release_inventory_v2(&inventory, m)", 1),
+    ("V2 support binding", "verify_pi_release_bundle_assets_v2(c, m)", 1),
     ("exact release file set", "files.keys().cloned().collect::<BTreeSet<_>>() != expected_names", 1),
     ("catalog envelope binding", "manifest.catalog_envelope().sha256().as_str() != catalog.sha256", 1),
     ("support asset binding", "asset.sha256().as_str() != file.sha256", 1),
@@ -1683,15 +1692,16 @@ policies = [
     ("recovery isolation original binding", "manifest.isolation_attestation.original_operation_mode\n            != operation.isolation_original_mode", 1),
     ("recovery isolation completion binding", "manifest.isolation_attestation.mode != operation.isolation_completion_mode", 1),
     ("recovery reverse no-extra inventory", "manifest.entries.len() != retained.len()", 1),
-    ("recovery release inventory", "verify_signed_release_inventory(&inventory, release_manifest)", 1),
-    ("recovery signed checksums and assets", "verify_release_bindings(&retained, release_manifest, &checksums_bytes)?;", 1),
-    ("recovery catalog payload digest", "encode_hex(catalog.payload_sha256()) != operation.catalog_payload_sha256", 1),
-    ("recovery catalog sequence", "catalog.payload().sequence().get() != operation.catalog_sequence", 1),
-    ("recovery catalog provider target release", "catalog_release_bindings(catalog.payload())? != operation.catalog_releases", 1),
+    ("recovery shared signed pair verification", "let (catalog, release_manifest) = verify_publisher_pair(", 2),
+    ("signed checksums and assets", "verify_release_bindings(files, &manifest, checksums)?;", 1),
+    ("recovery catalog payload digest", "catalog.payload_sha256()? != operation.catalog_payload_sha256", 1),
+    ("recovery catalog sequence", "catalog.sequence() != operation.catalog_sequence", 1),
+    ("recovery catalog provider target release", "catalog.releases()? != operation.catalog_releases", 1),
     ("recovery release tag", "release_manifest.tag().as_str() != operation.release_tag", 1),
     ("recovery source commit", "release_manifest.source_commit().as_str() != operation.source_commit", 1),
     ("recovery source tree", "release_manifest.source_tree_sha256().as_str() != operation.source_tree_sha256", 1),
-    ("recovery qualification", "release_manifest.qualification_sha256().as_str() != operation.qualification_sha256", 1),
+    ("recovery qualification", "operation.qualification_sha256.as_deref() != Some(m.qualification_sha256().as_str())", 1),
+    ("recovery producer evidence", "operation.producer_input_sha256.as_deref()\n                    != Some(m.producer_input_sha256().as_str())", 1),
     ("recovery exact support assets", "actual_support_assets != operation.support_assets", 1),
     ("recovery retained object identity", "FileIdentity::from_metadata(&rebound_metadata) != file.identity", 1),
     ("completed reference named identity", "FileIdentity::from_metadata(&metadata) != reference.operation.latest_temporary_identity", 1),
@@ -1846,13 +1856,13 @@ semantic_mutations = [
     ("reverse input transfer", "manifest.input_transfer_sha256 != operation.input_transfer_sha256"),
     ("isolation original mode", "manifest.isolation_attestation.original_operation_mode\n            != operation.isolation_original_mode"),
     ("isolation completion mode", "manifest.isolation_attestation.mode != operation.isolation_completion_mode"),
-    ("catalog payload digest", "encode_hex(catalog.payload_sha256()) != operation.catalog_payload_sha256"),
-    ("catalog sequence", "catalog.payload().sequence().get() != operation.catalog_sequence"),
-    ("catalog provider target release", "catalog_release_bindings(catalog.payload())? != operation.catalog_releases"),
+    ("catalog payload digest", "catalog.payload_sha256()? != operation.catalog_payload_sha256"),
+    ("catalog sequence", "catalog.sequence() != operation.catalog_sequence"),
+    ("catalog provider target release", "catalog.releases()? != operation.catalog_releases"),
     ("release tag", "release_manifest.tag().as_str() != operation.release_tag"),
     ("source commit", "release_manifest.source_commit().as_str() != operation.source_commit"),
     ("source tree", "release_manifest.source_tree_sha256().as_str() != operation.source_tree_sha256"),
-    ("qualification", "release_manifest.qualification_sha256().as_str() != operation.qualification_sha256"),
+    ("qualification", "operation.qualification_sha256.as_deref() != Some(m.qualification_sha256().as_str())"),
     ("support assets", "actual_support_assets != operation.support_assets"),
     ("completed reference identity", "FileIdentity::from_metadata(&metadata) != reference.operation.latest_temporary_identity"),
     ("completed reference bytes", "read_descriptor(&file, metadata.len())? != expected"),
@@ -1936,7 +1946,9 @@ policies = [
     ("expected Task 9 digest before inner authority", "expected_sha256.is_some_and(|expected| expected != sha256)", 1),
     ("canonical request/config bytes", "serde_jcs::to_vec(&strict.0).map_err(|_| rejected())? != bytes", 1),
     ("duplicate JSON member rejection", "if values.contains_key(&key)", 1),
-    ("JSON depth and node bounds", "if depth > MAX_JSON_DEPTH || *nodes > MAX_JSON_NODES", 1),
+    ("JSON depth and node bounds", "if depth > MAX_JSON_DEPTH || *nodes > maximum_nodes", 1),
+    ("canonical JSON node limit", "parse_json_value(bytes, maximum, true, MAX_JSON_NODES)", 1),
+    ("GitHub response node limit", "const MAX_GITHUB_RESPONSE_JSON_NODES: usize = 8_192;", 1),
     ("JSON collection bounds", "if values.len() > MAX_COLLECTION_MEMBERS", 2),
     ("strict config schema", '#[serde(deny_unknown_fields)]\npub struct PublisherBrokerConfigV1', 1),
     ("config exact owner-private mode", "metadata.permissions().mode() & 0o7777 == 0o600", 1),
@@ -1950,8 +1962,8 @@ policies = [
     ("ELF x86-64 machine", 'u16::from_le_bytes([header[18], header[19]]) != 62', 1),
     ("ELF program-header bound", "program_count > MAX_ELF_PROGRAM_HEADERS", 1),
     ("ELF load segment required", "if !has_load || !has_executable_load", 1),
-    ("config directory exact modes", "matches!(metadata.permissions().mode() & 0o7777, 0o700 | 0o755)", 1),
-    ("user-owned ancestor exact modes", "metadata.uid() == current_euid() && matches!(mode, 0o700 | 0o755)", 1),
+    ("config directory secure modes", "metadata.permissions().mode() & 0o7722 == 0o700", 1),
+    ("user-owned ancestor exact modes", "metadata.uid() == current_euid() && mode & 0o7722 == 0o700", 1),
     ("fresh broker-private directory exact mode", "metadata.permissions().mode() & 0o7777 == 0o700", 1),
     ("portable broker-private directory links", "fn directory_nlink_matches(observed: u64, conventional: u64) -> bool {\n    observed == 1 || observed == conventional\n}", 1),
     ("portable fresh broker directory check", "!directory_nlink_matches(metadata.nlink(), 2)", 1),
@@ -2076,7 +2088,7 @@ test_policies = [
     ("real broker process client", "real_broker_client_process_returns_only_canonical_typed_public_response", 1),
     ("phase config swap matrix", "real_broker_process_rejects_task9_config_swaps_before_every_workflow_mutation", 1),
     ("broker expected digest boundary", "broker_expected_task9_digest_is_checked_before_gh_or_config_directory_authority", 1),
-    ("exact owner directory modes", "broker_and_client_ancestors_accept_only_owner_0700_or_0755_and_config_accepts_0755", 1),
+    ("exact owner directory modes", "broker_and_client_ancestors_accept_non_writable_owner_directories", 1),
 ]
 
 validator_predicates = [
@@ -2182,7 +2194,7 @@ def broker_errors(source, binary_source=binary, lib_source=lib, local_source=loc
         ("read_draft bounded-list method/route", '"GET",\n            format!("/repos/{repository}/releases?per_page=100")'),
         ("upload fixed release family", 'OsString::from("release"),\n                    OsString::from("upload"),\n                    OsString::from(tag),\n                    capability.path.as_os_str().to_owned(),\n                    OsString::from("--repo"),\n                    OsString::from(repository)'),
         ("download method/route/accept", '"GET",\n            format!("/repos/{repository}/releases/assets/{asset_id}"),\n            "Accept: application/octet-stream"'),
-        ("publish method/route/body", '"PATCH",\n            format!("/repos/{repository}/releases/{release_id}"),\n            "Accept: application/vnd.github+json",\n            Some(canonical_value(&serde_json::json!({"draft": false}))?)'),
+        ("publish method/route/body", '"PATCH",\n            format!("/repos/{repository}/releases/{release_id}"),\n            "Accept: application/vnd.github+json",\n            Some(canonical_value(&if *make_latest {\n                serde_json::json!({"draft": false, "make_latest": "true"})\n            } else {\n                serde_json::json!({"draft": false})\n            })?)'),
         ("fixed API version", 'OsString::from("X-GitHub-Api-Version: 2022-11-28")'),
     ]
     for label, required in command_matrix:
@@ -2331,6 +2343,8 @@ sources = {
 
 policies = [
     ("workflow", "fixed repository", 'const REPOSITORY: &str = "Devalch/Fluxsemble-runtime-catalog";', 1),
+    ("workflow", "production explicitly latest", 'broker.publish_draft(REPOSITORY, &receipt.body.release_id, true)', 1),
+    ("workflow", "transport does not become latest", 'broker.publish_draft(REPOSITORY, &release.release_id, false)', 1),
     ("workflow", "remote operation before first mutation", '.write_record_no_clobber(RemoteRecordKind::Operation, &initial_bytes)', 1),
     ("workflow", "atomic remote operation phase replacement", '.replace_operation_record(&handle.bytes, &bytes)', 1),
     ("local", "fixed workflow lock", 'const REMOTE_WORKFLOW_LOCK: &str = ".remote-workflow-v1.lock";', 1),
@@ -2347,7 +2361,8 @@ policies = [
     ("workflow", "settle schema-authorized next phase", 'schema_authorized_next(main, &temporary)', 1),
     ("workflow", "settle exact prior phase", 'schema_authorized_next(&temporary, main)', 1),
     ("workflow", "retained workflow lock spans", 'let lock = state.acquire_workflow_lock().map_err(local_error)?;', 6),
-    ("workflow", "lock rebind before tag mutation", 'lock.revalidate().map_err(local_error)?;\n    let _create_result = broker.create_tag(', 2),
+    ("workflow", "lock rebind before transport tag mutation", 'lock.revalidate().map_err(local_error)?;\n    let _create_result = broker.create_tag(', 1),
+    ("workflow", "lock rebind before production tag mutation", 'lock.revalidate().map_err(local_error)?;\n    if recovery.is_none() {\n        let _create_result = broker.create_tag(', 1),
     ("workflow", "lock rebind before draft mutation", 'lock.revalidate().map_err(local_error)?;\n        let _create_result = broker.create_draft(', 2),
     ("workflow", "lock rebind before publish mutation", 'lock.revalidate().map_err(local_error)?;\n        let _publish_result = broker.publish_draft(', 2),
     ("workflow", "no duplicate publish after receipt", 'if existing_publication.is_none() && before.draft {', 1),
@@ -2366,9 +2381,9 @@ policies = [
     ("local", "object fallback exact link policy", 'let expected_links = if unnamed { 0 } else { 1 };', 1),
     ("local", "latest unsupported unnamed fallback", 'open_exclusive_state_file(&state.latest, LATEST_TEMP, 0o600)?', 1),
     ("local", "latest fallback visibility policy", '!secure_file_allow_links(&metadata, u64::from(temporary.visible))', 1),
-    ("broker", "broker owner ancestor exact modes", 'metadata.uid() == current_euid() && matches!(mode, 0o700 | 0o755)', 1),
-    ("broker", "GitHub config exact modes", 'matches!(metadata.permissions().mode() & 0o7777, 0o700 | 0o755)', 1),
-    ("broker_client", "client owner ancestor exact modes", 'metadata.uid() == current_euid() && matches!(mode, 0o700 | 0o755)', 1),
+    ("broker", "broker owner ancestor exact modes", 'metadata.uid() == current_euid() && mode & 0o7722 == 0o700', 1),
+    ("broker", "GitHub config secure modes", 'metadata.permissions().mode() & 0o7722 == 0o700', 1),
+    ("broker_client", "client owner ancestor exact modes", 'metadata.uid() == current_euid() && mode & 0o7722 == 0o700', 1),
     ("workflow", "transport operation durable before mutation", '.write_record_no_clobber(TransportRecordKind::Operation, &transport_operation_bytes)', 1),
     ("workflow", "transport exact receipt retry", '.read_record(TransportRecordKind::Receipt)', 1),
     ("workflow", "transport receipt durable", '.write_record_no_clobber(TransportRecordKind::Receipt, &canonical(&receipt)?)', 1),
@@ -2455,7 +2470,7 @@ policies = [
     ("security", "production signed state preserved", 'continue to open and verify the production-signed Task 8 state without weakening', 1),
     ("security", "unsupported unnamed fallback boundary", 'Only `EOPNOTSUPP`/`ENOTSUP` or `EINVAL` indicating unsupported `O_TMPFILE`', 1),
     ("security", "local staging unsupported unnamed fallback", 'Digest-addressed local publication objects and the fixed latest-reference temporary use the same unsupported-`O_TMPFILE` allowlist', 1),
-    ("runbook", "owner directory mode policy", 'a user-owned ancestor must be exact mode `0700` or `0755`', 1),
+    ("runbook", "owner directory mode policy", 'a user-owned ancestor must have owner `rwx`, no group/world write, and no special mode bits', 1),
     ("runbook", "partial fallback recovery", 'transport operation identity is state-path-independent', 1),
 ]
 
@@ -2470,7 +2485,7 @@ test_policies = [
     ("github_tests", "fallback rejection evidence", 'unnamed_fallback_preserves_existing_names_and_unexpected_errors_do_not_fallback', 1),
     ("local_tests", "local staging fallback evidence", 'unsupported_unnamed_files_use_no_clobber_local_staging_fallback', 1),
     ("local_tests", "latest fallback preservation evidence", 'named_latest_fallback_failure_before_recovery_binding_is_preserved', 1),
-    ("broker_tests", "owner mode evidence", 'broker_and_client_ancestors_accept_only_owner_0700_or_0755_and_config_accepts_0755', 1),
+    ("broker_tests", "owner mode evidence", 'broker_and_client_ancestors_accept_non_writable_owner_directories', 1),
     ("recovery_tests", "complete per-asset timing evidence", 'complete_per_asset_before_after_retry_matrix_resumes_only_exact_state', 1),
     ("recovery_tests", "name-reordered exact resume evidence", 'name_reordered_remote_assets_resume_without_reupload', 1),
     ("recovery_tests", "every asset/release drift evidence", 'every_asset_and_release_identity_drift_is_rejected_without_new_mutation', 1),
@@ -2549,7 +2564,7 @@ def task10_errors(current):
         "broker.create_tag(",
         ".read_tag(REPOSITORY, &operation.record.operation.tag)",
         "ensure_exact_draft(state, &lock, broker, &mut operation, false)?",
-        "verify_and_upload_all(state, &lock, broker, &mut operation, &release_id)?",
+        "let receipt_assets = verify_and_upload_all(",
         "RemoteRecordKind::DraftReceipt",
     ]
     positions = [operation_region.find(item) for item in operation_order]
@@ -3211,7 +3226,7 @@ def task11_errors(source, names, regular_identities):
     for token in ["fn directory_nlink_matches(observed: u64, conventional: u64) -> bool", "observed == 1 || observed == conventional", "!directory_nlink_matches(container_metadata.nlink(), 2)", "!directory_nlink_matches(payload_metadata.nlink(), 2)", "!directory_nlink_matches(metadata.nlink(), 2)", "!directory_nlink_matches(before.nlink(), expected_nlink)"]:
         if token not in writer:
             errors.append(f"portable acquisition directory policy missing: {token}")
-    for token in ["verify_fixture_signed_catalog(ENVELOPE)", "2553", "a0eab9ad1e9741f8cf8cac9968d8d20cddcbee58e237ed7581202b2268488e5c", "pi_release_subject_sha256(intent.profile())"]:
+    for token in ["verify_fixture_signed_catalog(ENVELOPE)", "2553", "a0eab9ad1e9741f8cf8cac9968d8d20cddcbee58e237ed7581202b2268488e5c", "PiReleaseIntentV2::from_json(bytes).is_err()"]:
         if token not in vector_test:
             errors.append(f"fixture/production vector evidence missing: {token}")
     if vector_test.count("assert!(verify_signed_catalog(ENVELOPE).is_err())") != 2:
@@ -3328,6 +3343,7 @@ from pathlib import Path
 import base64
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -3371,6 +3387,16 @@ def digest(data):
 def arrays(source, name):
     pattern = re.compile(rf"const\s+{re.escape(name)}[^=]*=\s*\[(.*?)\];", re.DOTALL)
     return [bytes(int(value, 16) for value in re.findall(r"0x([0-9a-fA-F]{2})", body)) for body in pattern.findall(source)]
+
+
+def producer_source_files():
+    for root, directories, files in os.walk(".", followlinks=False):
+        if root == ".":
+            directories[:] = [name for name in directories if name not in {".git", ".release-work", ".worktrees", ".codex", "target"}]
+        for name in files:
+            path = Path(root) / name
+            if path.is_file() and not path.is_symlink():
+                yield path
 
 
 def fixture_identity_errors(source, tags, virtual_files=()):
@@ -3462,8 +3488,8 @@ def fixture_identity_errors(source, tags, virtual_files=()):
             base64.b64encode(seed),
             ", ".join(f"0x{byte:02x}" for byte in seed).encode(),
         )
-        for path in Path(".").rglob("*"):
-            if not path.is_file() or str(path).startswith(("target/", ".git/")) or str(path) == PEM_PATH:
+        for path in producer_source_files():
+            if str(path) == PEM_PATH:
                 continue
             data = path.read_bytes()
             if any(value in data for value in encoded_seed_forms):
@@ -3472,7 +3498,7 @@ def fixture_identity_errors(source, tags, virtual_files=()):
         for path, data in virtual_files:
             if any(value in data for value in encoded_seed_forms):
                 errors.append(f"fixture seed copied outside approved PKCS#8 boundary: {path}")
-    pem_paths = [str(path) for path in Path(".").rglob("*.pem") if not str(path).startswith(("target/", ".git/"))]
+    pem_paths = [str(path) for path in producer_source_files() if path.suffix == ".pem"]
     pem_paths.extend(path for path, _data in virtual_files if path.endswith(".pem"))
     if pem_paths != [PEM_PATH]:
         errors.append("fixture PEM copied outside its exact approved path")

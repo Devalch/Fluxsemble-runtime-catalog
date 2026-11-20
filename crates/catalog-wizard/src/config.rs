@@ -5,7 +5,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const V1_FLUXSEMBLE_REQUIREMENT: &str = "=0.1.0";
 const V1_TARGET: &str = "linux_x86_64";
 const PRIVATE_SIGNING_CONFIG_SCHEMA_VERSION: u32 = 1;
 const MAX_PRIVATE_KEY_PATH_BYTES: usize = 4096;
@@ -14,7 +13,6 @@ const MAX_PRIVATE_KEY_PATH_BYTES: usize = 4096;
 #[serde(deny_unknown_fields)]
 pub struct WizardConfig {
     pub repository: String,
-    pub fluxsemble_requirement: String,
     pub target: String,
     pub state_root: String,
     pub default_node_channel: String,
@@ -24,7 +22,6 @@ impl WizardConfig {
     pub fn default_for_repo() -> Self {
         Self {
             repository: "Devalch/Fluxsemble-runtime-catalog".to_owned(),
-            fluxsemble_requirement: V1_FLUXSEMBLE_REQUIREMENT.to_owned(),
             target: V1_TARGET.to_owned(),
             state_root: ".release-work".to_owned(),
             default_node_channel: "22".to_owned(),
@@ -39,7 +36,7 @@ impl WizardConfig {
     }
 
     fn validate(&self) -> Result<(), WizardError> {
-        if self.target != V1_TARGET || self.fluxsemble_requirement != V1_FLUXSEMBLE_REQUIREMENT {
+        if self.target != V1_TARGET {
             return Err(WizardError::Config);
         }
         Ok(())
@@ -127,7 +124,6 @@ mod tests {
     fn default_config_has_fixed_v1_values() {
         let config = WizardConfig::default_for_repo();
         assert_eq!(config.repository, "Devalch/Fluxsemble-runtime-catalog");
-        assert_eq!(config.fluxsemble_requirement, "=0.1.0");
         assert_eq!(config.target, "linux_x86_64");
         assert_eq!(config.state_root, ".release-work");
     }
@@ -138,7 +134,6 @@ mod tests {
         fs::write(
             &path,
             r#"repository = "Devalch/Fluxsemble-runtime-catalog"
-fluxsemble_requirement = "=0.1.0"
 target = "darwin_aarch64"
 state_root = ".release-work"
 default_node_channel = "22"

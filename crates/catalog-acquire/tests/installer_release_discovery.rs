@@ -1,7 +1,7 @@
 use catalog_acquire::{
     AcquireError, ReleaseDiscoveryTransport, discover_pi_installer_release_with_transport,
 };
-use catalog_core::pi_release_subject_sha256;
+use catalog_core::pi_release_subject_v2_sha256;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 #[path = "../../catalog-installer-verify/tests/support/mod.rs"]
@@ -35,7 +35,7 @@ fn installer_discovery_derives_wrapper_identity_graph_locator_and_cli() {
     );
     assert_eq!(
         candidate.release_subject_sha256().unwrap(),
-        pi_release_subject_sha256(&candidate.profile).unwrap()
+        pi_release_subject_v2_sha256(&candidate.profile).unwrap()
     );
     let bytes = candidate.inputs.canonical_bytes().unwrap();
     assert_eq!(
@@ -63,13 +63,23 @@ fn installer_discovery_fails_closed_on_bad_graph_or_archive() {
     }
 }
 #[test]
-fn installer_discovery_requires_explicit_policy_before_fetch() {
+fn installer_discovery_rejects_consumer_policy_before_fetch() {
     let mut r = request();
-    r.installer_policy = None;
+    let contracts: Value = serde_json::from_slice(include_bytes!(
+        "../../../resources/pi/supported-contracts-v1.json"
+    ))
+    .unwrap();
+    r.installer_policy = Some(catalog_acquire::PiInstallerDiscoveryPolicy {
+        consumer_requirement: ">=0.1.0".into(),
+        required_contracts: catalog_core::PiRequiredContractsV1::from_json(
+            &serde_json::to_vec(&contracts["required_contracts"]).unwrap(),
+        )
+        .unwrap(),
+    });
     struct NoFetch;
     impl ReleaseDiscoveryTransport for NoFetch {
         fn fetch(&self, _: &str, _: usize) -> Result<Vec<u8>, AcquireError> {
-            panic!("discovery fetched before rejecting absent explicit policy")
+            panic!("discovery fetched before rejecting consumer policy")
         }
     }
     assert_eq!(
@@ -422,7 +432,7 @@ fn acquisition_reverifies_original_support_sources_before_materialization() {
     std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
     let request = |name: &str| catalog_acquire::AcquireInstallerReleaseRequest {
         source: catalog_acquire::AcquireInstallerReleaseSource::Intent {
-            intent: intent.clone(),
+            intent: Box::new(intent.clone()),
         },
         package_inputs: candidate.inputs.clone(),
         cache_root: root.join(name),

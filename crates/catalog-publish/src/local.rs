@@ -26,6 +26,7 @@ const TRANSFER_MANIFEST: &str = "transfer-manifest-v1.json";
 const SIGNED_BUNDLE: &str = "signed-release-bundle";
 const CATALOG: &str = "catalog-v1.json";
 const RELEASE_MANIFEST: &str = "signed-release-bundle-manifest-v1.json";
+const RELEASE_MANIFEST_V2: &str = "signed-release-bundle-manifest-v2.json";
 const CHECKSUMS: &str = "checksums-sha256.txt";
 const RECOVERY_RECORD: &str = "recovery-v1.json";
 const RECOVERY_TEMP: &str = ".recovery-v1.tmp";
@@ -226,8 +227,12 @@ struct OperationBodyV1 {
     release_tag: String,
     source_commit: String,
     source_tree_sha256: String,
-    qualification_sha256: String,
-    qualification_reference: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    qualification_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    qualification_reference: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    producer_input_sha256: Option<String>,
     checksums: LocalObjectV1,
     support_assets: Vec<LocalObjectV1>,
     objects: Vec<LocalObjectV1>,
@@ -267,12 +272,87 @@ pub struct VerifiedTransferredSignedBundle {
     transfer_manifest: RetainedFile,
     files: BTreeMap<String, RetainedFile>,
     manifest: ReverseTransferManifestV1,
-    release_manifest: SignedReleaseBundleManifestV1,
+    release_manifest: PublisherManifest,
     signed_transfer_sha256: String,
     catalog_payload_sha256: String,
     catalog_releases: Vec<CatalogReleaseBindingV1>,
     sequence: u64,
     policy: VerificationPolicy,
+}
+
+#[derive(Debug, Clone)]
+enum PublisherManifest {
+    Legacy(SignedReleaseBundleManifestV1),
+    Producer(catalog_core::SignedReleaseBundleManifestV2),
+}
+
+impl PublisherManifest {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Legacy(_) => RELEASE_MANIFEST,
+            Self::Producer(_) => RELEASE_MANIFEST_V2,
+        }
+    }
+    fn tag(&self) -> &catalog_core::CatalogTag {
+        match self {
+            Self::Legacy(m) => m.tag(),
+            Self::Producer(m) => m.tag(),
+        }
+    }
+    fn source_commit(&self) -> &catalog_core::CommitSha {
+        match self {
+            Self::Legacy(m) => m.source_commit(),
+            Self::Producer(m) => m.source_commit(),
+        }
+    }
+    fn source_tree_sha256(&self) -> &catalog_core::Sha256Hex {
+        match self {
+            Self::Legacy(m) => m.source_tree_sha256(),
+            Self::Producer(m) => m.source_tree_sha256(),
+        }
+    }
+    fn assets(&self) -> &[catalog_core::ReleaseAssetV1] {
+        match self {
+            Self::Legacy(m) => m.assets(),
+            Self::Producer(m) => m.assets(),
+        }
+    }
+    fn catalog_envelope(&self) -> &catalog_core::ReleaseAssetV1 {
+        match self {
+            Self::Legacy(m) => m.catalog_envelope(),
+            Self::Producer(m) => m.catalog_envelope(),
+        }
+    }
+}
+
+enum PublisherCatalog {
+    Legacy(VerifiedCatalogV1),
+    Producer(Box<catalog_core::PiReleaseIntentV2>),
+}
+
+impl PublisherCatalog {
+    fn sequence(&self) -> u64 {
+        match self {
+            Self::Legacy(c) => c.payload().sequence().get(),
+            Self::Producer(c) => c.sequence(),
+        }
+    }
+    fn payload_sha256(&self) -> Result<String, PublishError> {
+        match self {
+            Self::Legacy(c) => Ok(encode_hex(c.payload_sha256())),
+            Self::Producer(c) => Ok(sha256(&serde_jcs::to_vec(c).map_err(|_| rejected())?)),
+        }
+    }
+    fn releases(&self) -> Result<Vec<CatalogReleaseBindingV1>, PublishError> {
+        match self {
+            Self::Legacy(c) => catalog_release_bindings(c.payload()),
+            Self::Producer(c) => Ok(vec![CatalogReleaseBindingV1 {
+                provider: "builtin:pi".to_owned(),
+                target: c.profile().target().as_str().to_owned(),
+                version: c.profile().pi_package().version().as_str().to_owned(),
+            }]),
+        }
+    }
 }
 
 impl fmt::Debug for VerifiedTransferredSignedBundle {
@@ -340,8 +420,22 @@ impl VerifiedTransferredSignedBundle {
                 .map(Self::object_from_retained)
                 .ok_or_else(rejected)
         };
-        let qualification_sha256 = self.release_manifest.qualification_sha256().as_str();
-        let qualification_reference = format!("qualification-{qualification_sha256}.json");
+        let (qualification_sha256, qualification_reference, producer_input_sha256) =
+            match &self.release_manifest {
+                PublisherManifest::Legacy(m) => {
+                    let digest = m.qualification_sha256().as_str().to_owned();
+                    (
+                        Some(digest.clone()),
+                        Some(format!("qualification-{digest}.json")),
+                        None,
+                    )
+                }
+                PublisherManifest::Producer(m) => (
+                    None,
+                    None,
+                    Some(m.producer_input_sha256().as_str().to_owned()),
+                ),
+            };
         let support_assets = self
             .release_manifest
             .assets()
@@ -349,7 +443,11 @@ impl VerifiedTransferredSignedBundle {
             .map(|asset| object(asset.name().as_str()))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(OperationBodyV1 {
-            schema_version: 1,
+            schema_version: if producer_input_sha256.is_some() {
+                2
+            } else {
+                1
+            },
             reverse_transfer_manifest: Self::object_from_retained(&self.transfer_manifest),
             input_transfer_sha256: self.manifest.input_transfer_sha256.clone(),
             isolation_original_mode: self
@@ -362,7 +460,7 @@ impl VerifiedTransferredSignedBundle {
             catalog_payload_sha256: self.catalog_payload_sha256.clone(),
             catalog_sequence: self.sequence,
             catalog_releases: self.catalog_releases.clone(),
-            release_manifest: object(RELEASE_MANIFEST)?,
+            release_manifest: object(self.release_manifest.name())?,
             release_tag: self.tag().to_owned(),
             source_commit: self.release_manifest.source_commit().as_str().to_owned(),
             source_tree_sha256: self
@@ -370,8 +468,9 @@ impl VerifiedTransferredSignedBundle {
                 .source_tree_sha256()
                 .as_str()
                 .to_owned(),
-            qualification_sha256: qualification_sha256.to_owned(),
+            qualification_sha256,
             qualification_reference,
+            producer_input_sha256,
             checksums: object(CHECKSUMS)?,
             support_assets,
             objects: self.objects(),
@@ -527,7 +626,15 @@ fn verify_transferred_signed_bundle_with(
     }
 
     let catalog_file = files.get(CATALOG).ok_or_else(rejected)?;
-    let release_file = files.get(RELEASE_MANIFEST).ok_or_else(rejected)?;
+    let manifest_name = match (
+        files.contains_key(RELEASE_MANIFEST),
+        files.contains_key(RELEASE_MANIFEST_V2),
+    ) {
+        (true, false) => RELEASE_MANIFEST,
+        (false, true) => RELEASE_MANIFEST_V2,
+        _ => return Err(rejected()),
+    };
+    let release_file = files.get(manifest_name).ok_or_else(rejected)?;
     let checksums_file = files.get(CHECKSUMS).ok_or_else(rejected)?;
     if catalog_file.size > MAX_TRANSFER_MANIFEST_BYTES
         || release_file.size > MAX_TRANSFER_MANIFEST_BYTES
@@ -539,39 +646,20 @@ fn verify_transferred_signed_bundle_with(
     let release_bytes = read_descriptor(&release_file.file, release_file.size)?;
     let checksums_bytes = read_descriptor(&checksums_file.file, checksums_file.size)?;
 
-    let catalog = verify_catalog_with_policy(&catalog_bytes, policy)?;
-    let release = verify_release_manifest_with_policy(&release_bytes, policy)?;
-    let sequence = catalog.payload().sequence().get();
-    let catalog_payload_sha256 = encode_hex(catalog.payload_sha256());
-    let catalog_releases = catalog_release_bindings(catalog.payload())?;
-    let release_manifest = release.manifest().clone();
+    let (catalog, release_manifest) = verify_publisher_pair(
+        &catalog_bytes,
+        &release_bytes,
+        &files,
+        &checksums_bytes,
+        manifest_name,
+        policy,
+    )?;
+    let sequence = catalog.sequence();
+    let catalog_payload_sha256 = catalog.payload_sha256()?;
+    let catalog_releases = catalog.releases()?;
     if release_manifest.tag().as_str() != format!("catalog-v1-sequence-{sequence}") {
         return Err(rejected());
     }
-
-    let inventory_entries = files
-        .values()
-        .map(|file| {
-            serde_json::json!({
-                "relative_path": file.name,
-                "mode": "0400",
-                "size": file.size,
-                "sha256": file.sha256,
-            })
-        })
-        .collect::<Vec<_>>();
-    let inventory = BundleInventoryV1::from_json(
-        &serde_jcs::to_vec(&serde_json::json!({
-            "schema_version": 1,
-            "kind": "signed_release",
-            "entries": inventory_entries,
-        }))
-        .map_err(|_| rejected())?,
-    )
-    .map_err(|_| rejected())?;
-    verify_signed_release_inventory(&inventory, &release_manifest).map_err(|_| rejected())?;
-    verify_release_bindings(&files, &release_manifest, &checksums_bytes)?;
-    verify_installer_support(catalog.payload(), &release_manifest, &files)?;
 
     let verified = VerifiedTransferredSignedBundle {
         root,
@@ -621,6 +709,79 @@ fn verify_release_manifest_with_policy(
                 .map_err(|_| rejected())
         }
     }
+}
+
+fn verify_publisher_pair(
+    catalog_bytes: &[u8],
+    manifest_bytes: &[u8],
+    files: &BTreeMap<String, RetainedFile>,
+    checksums: &[u8],
+    manifest_name: &str,
+    policy: VerificationPolicy,
+) -> Result<(PublisherCatalog, PublisherManifest), PublishError> {
+    let (catalog, manifest) = match manifest_name {
+        RELEASE_MANIFEST => {
+            let catalog = verify_catalog_with_policy(catalog_bytes, policy)?;
+            let manifest = verify_release_manifest_with_policy(manifest_bytes, policy)?
+                .manifest()
+                .clone();
+            (
+                PublisherCatalog::Legacy(catalog),
+                PublisherManifest::Legacy(manifest),
+            )
+        }
+        RELEASE_MANIFEST_V2 => {
+            let (catalog, manifest) = match policy {
+                VerificationPolicy::Production => (
+                    catalog_core::verify_signed_catalog_v2(catalog_bytes)
+                        .map_err(|_| rejected())?,
+                    catalog_core::verify_signed_release_bundle_manifest_v2(manifest_bytes)
+                        .map_err(|_| rejected())?,
+                ),
+                #[cfg(test)]
+                VerificationPolicy::Fixture => (
+                    catalog_core::verify_fixture_signed_catalog_v2(catalog_bytes)
+                        .map_err(|_| rejected())?,
+                    catalog_core::verify_fixture_signed_release_bundle_manifest_v2(manifest_bytes)
+                        .map_err(|_| rejected())?,
+                ),
+            };
+            (
+                PublisherCatalog::Producer(Box::new(catalog)),
+                PublisherManifest::Producer(manifest),
+            )
+        }
+        _ => return Err(rejected()),
+    };
+    let entries = files.values().map(|file| serde_json::json!({
+        "relative_path": file.name, "mode": "0400", "size": file.size, "sha256": file.sha256,
+    })).collect::<Vec<_>>();
+    let kind = if manifest_name == RELEASE_MANIFEST_V2 {
+        "signed_release_v2"
+    } else {
+        "signed_release"
+    };
+    let inventory = BundleInventoryV1::from_json(
+        &serde_jcs::to_vec(&serde_json::json!({
+            "schema_version": 1, "kind": kind, "entries": entries,
+        }))
+        .map_err(|_| rejected())?,
+    )
+    .map_err(|_| rejected())?;
+    match (&catalog, &manifest) {
+        (PublisherCatalog::Legacy(c), PublisherManifest::Legacy(m)) => {
+            verify_signed_release_inventory(&inventory, m).map_err(|_| rejected())?;
+            verify_installer_support(c.payload(), m, files)?;
+        }
+        (PublisherCatalog::Producer(c), PublisherManifest::Producer(m)) => {
+            catalog_core::verify_signed_release_inventory_v2(&inventory, m)
+                .map_err(|_| rejected())?;
+            catalog_core::verify_pi_release_bundle_assets_v2(c, m).map_err(|_| rejected())?;
+        }
+        _ => return Err(rejected()),
+    }
+    verify_release_bindings(files, &manifest, checksums)?;
+    Ok((catalog, manifest))
 }
 
 fn persistent_verification_policy() -> VerificationPolicy {
@@ -792,7 +953,7 @@ fn validate_attestation(
 
 fn verify_release_bindings(
     files: &BTreeMap<String, RetainedFile>,
-    manifest: &SignedReleaseBundleManifestV1,
+    manifest: &PublisherManifest,
     checksums: &[u8],
 ) -> Result<(), PublishError> {
     let expected_names = std::iter::once(CATALOG.to_owned())
@@ -802,7 +963,7 @@ fn verify_release_bindings(
                 .iter()
                 .map(|asset| asset.name().as_str().to_owned()),
         )
-        .chain([RELEASE_MANIFEST.to_owned(), CHECKSUMS.to_owned()])
+        .chain([manifest.name().to_owned(), CHECKSUMS.to_owned()])
         .collect::<BTreeSet<_>>();
     if files.keys().cloned().collect::<BTreeSet<_>>() != expected_names {
         return Err(rejected());
@@ -1621,18 +1782,34 @@ fn open_remote_workflow_state_with(
     let retained = verify_record_objects(&state, &reference.operation)?;
     let catalog = retained.get(CATALOG).ok_or_else(rejected)?;
     let catalog_bytes = read_descriptor(&catalog.file, catalog.size)?;
-    let verified_catalog = verify_catalog_with_policy(&catalog_bytes, policy)?;
-    let releases = verified_catalog
-        .payload()
-        .providers()
-        .iter()
-        .flat_map(|provider| provider.releases())
-        .collect::<Vec<_>>();
-    let [release] = releases.as_slice() else {
-        return Err(rejected());
+    let (title, notes) = if reference.operation.schema_version == 2 {
+        let verified = match policy {
+            VerificationPolicy::Production => {
+                catalog_core::verify_signed_catalog_v2(&catalog_bytes)
+            }
+            #[cfg(test)]
+            VerificationPolicy::Fixture => {
+                catalog_core::verify_fixture_signed_catalog_v2(&catalog_bytes)
+            }
+        }
+        .map_err(|_| rejected())?;
+        (verified.title().to_owned(), verified.notes().to_owned())
+    } else {
+        let verified_catalog = verify_catalog_with_policy(&catalog_bytes, policy)?;
+        let releases = verified_catalog
+            .payload()
+            .providers()
+            .iter()
+            .flat_map(|provider| provider.releases())
+            .collect::<Vec<_>>();
+        let [release] = releases.as_slice() else {
+            return Err(rejected());
+        };
+        (
+            release.release_metadata().title().as_str().to_owned(),
+            release.release_metadata().notes().as_str().to_owned(),
+        )
     };
-    let title = release.release_metadata().title().as_str().to_owned();
-    let notes = release.release_metadata().notes().as_str().to_owned();
 
     let mut ordered = retained
         .into_values()
@@ -2539,7 +2716,31 @@ fn validate_local_object(object: &LocalObjectV1) -> Result<(), PublishError> {
 }
 
 fn validate_operation(operation: &OperationBodyV1) -> Result<(), PublishError> {
-    if operation.schema_version != 1
+    let evidence_valid = match operation.schema_version {
+        1 => {
+            operation.producer_input_sha256.is_none()
+                && operation
+                    .qualification_sha256
+                    .as_ref()
+                    .is_some_and(|digest| {
+                        valid_sha256(digest)
+                            && operation.qualification_reference.as_deref()
+                                == Some(format!("qualification-{digest}.json").as_str())
+                    })
+                && operation.release_manifest.name == RELEASE_MANIFEST
+        }
+        2 => {
+            operation.qualification_sha256.is_none()
+                && operation.qualification_reference.is_none()
+                && operation
+                    .producer_input_sha256
+                    .as_ref()
+                    .is_some_and(|digest| valid_sha256(digest))
+                && operation.release_manifest.name == RELEASE_MANIFEST_V2
+        }
+        _ => false,
+    };
+    if !evidence_valid
         || operation.reverse_transfer_manifest.name != TRANSFER_MANIFEST
         || !valid_sha256(&operation.input_transfer_sha256)
         || operation.isolation_original_mode != IsolationMode::Sign
@@ -2551,13 +2752,9 @@ fn validate_operation(operation: &OperationBodyV1) -> Result<(), PublishError> {
         || !valid_sha256(&operation.catalog_payload_sha256)
         || operation.catalog_sequence == 0
         || operation.catalog_releases.is_empty()
-        || operation.release_manifest.name != RELEASE_MANIFEST
         || operation.release_tag != format!("catalog-v1-sequence-{}", operation.catalog_sequence)
         || !valid_commit(&operation.source_commit)
         || !valid_sha256(&operation.source_tree_sha256)
-        || !valid_sha256(&operation.qualification_sha256)
-        || operation.qualification_reference
-            != format!("qualification-{}.json", operation.qualification_sha256)
         || operation.checksums.name != CHECKSUMS
         || operation.support_assets.is_empty()
         || operation
@@ -2610,10 +2807,15 @@ fn validate_operation(operation: &OperationBodyV1) -> Result<(), PublishError> {
         .collect::<Vec<_>>();
     expected_objects.sort_by(|left, right| left.name.cmp(&right.name));
     if expected_objects != operation.objects
-        || !operation
-            .support_assets
-            .iter()
-            .any(|asset| asset.name == operation.qualification_reference)
+        || operation
+            .qualification_reference
+            .as_ref()
+            .is_some_and(|reference| {
+                !operation
+                    .support_assets
+                    .iter()
+                    .any(|asset| &asset.name == reference)
+            })
     {
         return Err(rejected());
     }
@@ -2718,37 +2920,21 @@ fn verify_operation(
     }
 
     let catalog_file = retained.get(CATALOG).ok_or_else(rejected)?;
-    let release_file = retained.get(RELEASE_MANIFEST).ok_or_else(rejected)?;
+    let release_file = retained
+        .get(&operation.release_manifest.name)
+        .ok_or_else(rejected)?;
     let checksums_file = retained.get(CHECKSUMS).ok_or_else(rejected)?;
     let catalog_bytes = read_descriptor(&catalog_file.file, catalog_file.size)?;
     let release_bytes = read_descriptor(&release_file.file, release_file.size)?;
     let checksums_bytes = read_descriptor(&checksums_file.file, checksums_file.size)?;
-    let catalog = verify_catalog_with_policy(&catalog_bytes, policy)?;
-    let release = verify_release_manifest_with_policy(&release_bytes, policy)?;
-    let release_manifest = release.manifest();
-    let inventory_entries = retained
-        .values()
-        .map(|file| {
-            serde_json::json!({
-                "relative_path": file.name,
-                "mode": "0400",
-                "size": file.size,
-                "sha256": file.sha256,
-            })
-        })
-        .collect::<Vec<_>>();
-    let inventory = BundleInventoryV1::from_json(
-        &serde_jcs::to_vec(&serde_json::json!({
-            "schema_version": 1,
-            "kind": "signed_release",
-            "entries": inventory_entries,
-        }))
-        .map_err(|_| rejected())?,
-    )
-    .map_err(|_| rejected())?;
-    verify_signed_release_inventory(&inventory, release_manifest).map_err(|_| rejected())?;
-    verify_release_bindings(&retained, release_manifest, &checksums_bytes)?;
-    verify_installer_support(catalog.payload(), release_manifest, &retained)?;
+    let (catalog, release_manifest) = verify_publisher_pair(
+        &catalog_bytes,
+        &release_bytes,
+        &retained,
+        &checksums_bytes,
+        &operation.release_manifest.name,
+        policy,
+    )?;
 
     let actual_support_assets = release_manifest
         .assets()
@@ -2760,9 +2946,9 @@ fn verify_operation(
                 .ok_or_else(rejected)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    if encode_hex(catalog.payload_sha256()) != operation.catalog_payload_sha256
-        || catalog.payload().sequence().get() != operation.catalog_sequence
-        || catalog_release_bindings(catalog.payload())? != operation.catalog_releases
+    if catalog.payload_sha256()? != operation.catalog_payload_sha256
+        || catalog.sequence() != operation.catalog_sequence
+        || catalog.releases()? != operation.catalog_releases
         || operation.catalog_envelope
             != VerifiedTransferredSignedBundle::object_from_retained(catalog_file)
         || operation.release_manifest
@@ -2772,7 +2958,15 @@ fn verify_operation(
         || release_manifest.tag().as_str() != operation.release_tag
         || release_manifest.source_commit().as_str() != operation.source_commit
         || release_manifest.source_tree_sha256().as_str() != operation.source_tree_sha256
-        || release_manifest.qualification_sha256().as_str() != operation.qualification_sha256
+        || match &release_manifest {
+            PublisherManifest::Legacy(m) => {
+                operation.qualification_sha256.as_deref() != Some(m.qualification_sha256().as_str())
+            }
+            PublisherManifest::Producer(m) => {
+                operation.producer_input_sha256.as_deref()
+                    != Some(m.producer_input_sha256().as_str())
+            }
+        }
         || actual_support_assets != operation.support_assets
     {
         return Err(rejected());

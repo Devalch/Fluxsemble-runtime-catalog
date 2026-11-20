@@ -2,14 +2,13 @@
 use std::num::NonZeroU64;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
+use serde_json::Value;
 
 use crate::{
-    CatalogPayloadV1, CatalogTag, CatalogTimestamp, CoreError, FluxsembleBuildBindingV1,
-    PiReleaseProfileV1, PiReleaseQualificationV1, QualificationRecordPath, Sha256Hex,
+    CatalogTag, CatalogTimestamp, CoreError, FluxsembleBuildBindingV1, MAX_RELEASE_NOTES_BYTES,
+    MAX_RELEASE_TITLE_BYTES, PiReleaseProfileV2, PiReleaseQualificationV1,
     source::{domain_digest, invalid, require, require_bounded_json},
-    verify_pi_release_qualification,
+    wire::valid_plain_text,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -21,7 +20,7 @@ pub struct PiReleaseIntentV2 {
     expires_at: CatalogTimestamp,
     title: String,
     notes: String,
-    profile: PiReleaseProfileV1,
+    profile: PiReleaseProfileV2,
 }
 
 impl PiReleaseIntentV2 {
@@ -40,30 +39,34 @@ impl PiReleaseIntentV2 {
             expires_at: CatalogTimestamp::parse(w.expires_at)?,
             title: w.title,
             notes: w.notes,
-            profile: PiReleaseProfileV1::from_json(
+            profile: PiReleaseProfileV2::from_json(
                 &serde_json::to_vec(&w.profile).map_err(|_| invalid())?,
             )?,
         };
         require(intent.generated_at < intent.expires_at)?;
         require(intent.profile.node_version().as_str() == "22.19.0")?;
-        for descriptor in [
-            intent.profile.installer_manifest(),
-            intent.profile.installer_lock(),
-            intent.profile.pi_manifest(),
+        for (descriptor, role) in [
+            (intent.profile.installer_manifest(), "pi-installer-package"),
+            (intent.profile.installer_lock(), "pi-installer-lock"),
+            (intent.profile.pi_manifest(), "pi-package"),
         ] {
-            pi_support_asset_name(
+            let name = pi_support_asset_name(
                 descriptor.url().as_str(),
                 descriptor.sha256().as_str(),
                 intent.tag.as_str(),
             )?;
+            require(name == format!("{role}-{}.json", descriptor.sha256().as_str()))?;
         }
-        // Validate publication metadata through its original catalog parser. This placeholder is
-        // structural only and never leaves the constructor or enters a subject projection.
-        intent.payload(&json!({
-            "url": format!("{}/qualification-{}.json", intent.support_prefix(), "0".repeat(64)),
-            "size_bytes": "1",
-            "sha256": "0".repeat(64),
-        }))?;
+        require(valid_plain_text(
+            &intent.title,
+            MAX_RELEASE_TITLE_BYTES,
+            false,
+        ))?;
+        require(valid_plain_text(
+            &intent.notes,
+            MAX_RELEASE_NOTES_BYTES,
+            true,
+        ))?;
         Ok(intent)
     }
     pub fn sequence(&self) -> u64 {
@@ -84,7 +87,7 @@ impl PiReleaseIntentV2 {
     pub fn notes(&self) -> &str {
         &self.notes
     }
-    pub fn profile(&self) -> &PiReleaseProfileV1 {
+    pub fn profile(&self) -> &PiReleaseProfileV2 {
         &self.profile
     }
     pub fn support_prefix(&self) -> String {
@@ -93,125 +96,32 @@ impl PiReleaseIntentV2 {
             self.tag.as_str()
         )
     }
-    fn payload(&self, qualification: &Value) -> Result<CatalogPayloadV1, CoreError> {
-        let mut origins = std::collections::BTreeSet::new();
-        let mut add = |value: &str| -> Result<(), CoreError> {
-            let url = url::Url::parse(value).map_err(|_| invalid())?;
-            origins.insert(url.origin().ascii_serialization());
-            Ok(())
-        };
-        for descriptor in [
-            self.profile.installer_manifest(),
-            self.profile.installer_lock(),
-            self.profile.pi_manifest(),
-        ] {
-            add(descriptor.url().as_str())?;
-        }
-        add(qualification["url"].as_str().ok_or_else(invalid)?)?;
-        for component in self.profile.components() {
-            for artifact in component.artifacts() {
-                add(artifact.url().as_str())?;
-            }
-        }
-        for package in self.profile.locked_packages() {
-            add(package.resolved_url().as_str())?;
-        }
-        let value = json!({
-            "schema_version": 1,
-            "sequence": self.sequence,
-            "generated_at": self.generated_at,
-            "expires_at": self.expires_at,
-            "compatibility_ranges": [self.profile.consumer_requirement()],
-            "providers": [{
-                "provider_id": "builtin:pi",
-                "allowed_origins": origins,
-                "releases": [{
-                    "version": self.profile.pi_package().version(),
-                    "target": self.profile.target(),
-                    "compatibility_ranges": [self.profile.consumer_requirement()],
-                    "release_metadata": {"title": self.title, "notes": self.notes},
-                    "components": self.profile.components(),
-                    "provider_extension": {
-                        "kind": "pi_installer_lock_v1",
-                        "metadata": {"profile": self.profile, "qualification": qualification},
-                    },
-                }],
-            }],
-        });
-        CatalogPayloadV1::from_json(&serde_json::to_vec(&value).map_err(|_| invalid())?)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CatalogSourceV2 {
     schema_version: u16,
     intent: PiReleaseIntentV2,
-    build: FluxsembleBuildBindingV1,
-    qualification: QualificationRefV2,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct QualificationRefV2 {
-    relative_path: QualificationRecordPath,
-    sha256: Sha256Hex,
-}
-impl QualificationRefV2 {
-    pub fn relative_path(&self) -> &QualificationRecordPath {
-        &self.relative_path
-    }
-    pub fn sha256(&self) -> &Sha256Hex {
-        &self.sha256
-    }
 }
 
 impl CatalogSourceV2 {
     pub fn from_json(bytes: &[u8]) -> Result<Self, CoreError> {
         require_bounded_json(bytes)?;
-        let w: SourceWire = serde_json::from_slice(bytes).map_err(|_| invalid())?;
-        require(w.schema_version == 2)?;
-        let relative_path = QualificationRecordPath::parse(w.qualification.relative_path)?;
-        require(
-            relative_path.as_str().starts_with("qualifications/")
-                && relative_path.as_str().ends_with(".json"),
-        )?;
+        let wire: SourceWire = serde_json::from_slice(bytes).map_err(|_| invalid())?;
+        require(wire.schema_version == 2)?;
         Ok(Self {
             schema_version: 2,
             intent: PiReleaseIntentV2::from_json(
-                &serde_json::to_vec(&w.intent).map_err(|_| invalid())?,
+                &serde_json::to_vec(&wire.intent).map_err(|_| invalid())?,
             )?,
-            build: FluxsembleBuildBindingV1::from_json(
-                &serde_json::to_vec(&w.build).map_err(|_| invalid())?,
-            )?,
-            qualification: QualificationRefV2 {
-                relative_path,
-                sha256: Sha256Hex::parse(w.qualification.sha256)?,
-            },
         })
     }
     pub fn intent(&self) -> &PiReleaseIntentV2 {
         &self.intent
     }
-    pub fn build(&self) -> &FluxsembleBuildBindingV1 {
-        &self.build
-    }
-    pub fn qualification(&self) -> &QualificationRefV2 {
-        &self.qualification
-    }
-
-    /// Final catalog assembly binds the exact canonical record bytes; never rewrite after hashing.
-    pub fn finalize(&self, qualification_bytes: &[u8]) -> Result<CatalogPayloadV1, CoreError> {
-        let q = PiReleaseQualificationV1::from_json(qualification_bytes)?;
-        require(serde_jcs::to_vec(&q).map_err(|_| invalid())? == qualification_bytes)?;
-        require(
-            format!("{:x}", Sha256::digest(qualification_bytes))
-                == self.qualification.sha256.as_str(),
-        )?;
-        verify_pi_release_qualification(self.intent.profile(), &q)?;
-        verify_pi_verification_build(&self.build, &q)?;
-        self.intent.payload(&json!({
-            "url":format!("{}/qualification-{}.json", self.intent.support_prefix(), self.qualification.sha256),
-            "size_bytes":qualification_bytes.len().to_string(),"sha256":self.qualification.sha256,
-        }))
+    /// Construct producer facts without consumer build or qualification assertions.
+    pub fn finalize(&self) -> Result<PiReleaseIntentV2, CoreError> {
+        Ok(self.intent.clone())
     }
 }
 
@@ -231,10 +141,19 @@ pub fn verify_pi_verification_build(
 }
 
 pub fn pi_release_intent_v2_digest(intent: &PiReleaseIntentV2) -> Result<[u8; 32], CoreError> {
-    domain_digest(b"fluxsemble:runtime-catalog-release-intent:v2\0", intent)
+    domain_digest(b"fluxsemble:runtime-catalog-producer-intent:v2\0", intent)
+}
+
+/// Signature bytes for a producer-only V2 catalog.
+pub fn catalog_signing_bytes_v2(intent: &PiReleaseIntentV2) -> Result<Vec<u8>, CoreError> {
+    let canonical = serde_jcs::to_vec(intent).map_err(|_| invalid())?;
+    let mut result = b"fluxsemble:runtime-catalog:v2\0".to_vec();
+    result.extend_from_slice(&(canonical.len() as u64).to_be_bytes());
+    result.extend_from_slice(&canonical);
+    Ok(result)
 }
 pub fn catalog_source_v2_digest(source: &CatalogSourceV2) -> Result<[u8; 32], CoreError> {
-    domain_digest(b"fluxsemble:runtime-catalog-source:v2\0", source)
+    domain_digest(b"fluxsemble:runtime-catalog-producer-source:v2\0", source)
 }
 
 /// Resolve an exact publisher support URL to its bounded digest-bearing release asset name.
@@ -272,12 +191,4 @@ struct IntentWire {
 struct SourceWire {
     schema_version: u16,
     intent: Value,
-    build: Value,
-    qualification: QualificationRefWire,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct QualificationRefWire {
-    relative_path: String,
-    sha256: String,
 }

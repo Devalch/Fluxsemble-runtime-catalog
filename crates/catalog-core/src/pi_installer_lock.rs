@@ -91,6 +91,96 @@ pub struct PiReleaseProfileV1 {
     locked_packages: Vec<LockedPackageRecord>,
 }
 
+macro_rules! validate_pi_profile_facts {
+    ($profile:expr) => {{
+        let profile = $profile;
+        require(profile.pi_package.name.as_str() == PI_ROOT_PACKAGE_NAME)?;
+        require(profile.installer_root.name != profile.pi_package.name)?;
+        require(
+            profile.pi_package_locator.as_str()
+                == format!("node_modules/{}", profile.pi_package.name.as_str()),
+        )?;
+        require(profile.pi_component_id != profile.node_component_id)?;
+        require_unique(profile.components.iter().map(|c| &c.component_id))?;
+        require_unique(
+            profile
+                .components
+                .iter()
+                .flat_map(|c| &c.artifacts)
+                .map(|a| &a.artifact_id),
+        )?;
+        require(
+            profile
+                .components
+                .windows(2)
+                .all(|p| p[0].component_id.as_str() < p[1].component_id.as_str()),
+        )?;
+        for c in &profile.components {
+            require(
+                c.artifacts
+                    .windows(2)
+                    .all(|p| p[0].artifact_id.as_str() < p[1].artifact_id.as_str()),
+            )?;
+        }
+        require(
+            profile
+                .locked_packages
+                .windows(2)
+                .all(|p| p[0].locator.as_str() < p[1].locator.as_str()),
+        )?;
+        require_coherent_package_identities(&profile.locked_packages)?;
+        for package in &profile.locked_packages {
+            validate_locator(package.locator.as_str(), package.name.as_str())?;
+            require(package.name != profile.installer_root.name)?;
+        }
+        let package = profile
+            .locked_packages
+            .iter()
+            .find(|p| p.locator == profile.pi_package_locator)
+            .ok_or(CoreError::InvalidCatalog)?;
+        require(
+            package.name == profile.pi_package.name
+                && package.version == profile.pi_package.version,
+        )?;
+        let pi = profile
+            .components
+            .iter()
+            .find(|c| c.component_id == profile.pi_component_id)
+            .ok_or(CoreError::InvalidCatalog)?;
+        require(pi.version == profile.pi_package.version)?;
+        let archive = pi
+            .artifacts
+            .iter()
+            .find(|a| a.artifact_id == profile.pi_artifact_id)
+            .ok_or(CoreError::InvalidCatalog)?;
+        require(
+            archive.sha256 == package.archive_sha256
+                && archive.url == package.resolved_url
+                && profile.registry_integrity == package.registry_integrity,
+        )?;
+        require(
+            archive
+                .inventory
+                .iter()
+                .filter(|i| i.path == profile.cli_entrypoint)
+                .count()
+                == 1,
+        )?;
+        let node = profile
+            .components
+            .iter()
+            .find(|c| c.component_id == profile.node_component_id)
+            .ok_or(CoreError::InvalidCatalog)?;
+        require(node.version == profile.node_version)?;
+        require(
+            node.artifacts
+                .iter()
+                .any(|a| a.artifact_id == profile.node_artifact_id),
+        )?;
+        Ok(())
+    }};
+}
+
 impl PiReleaseProfileV1 {
     pub fn from_json(bytes: &[u8]) -> Result<Self, CoreError> {
         require(bytes.len() <= MAX_PI_RELEASE_PROFILE_BYTES)?;
@@ -144,86 +234,84 @@ impl PiReleaseProfileV1 {
     }
 
     fn validate(&self) -> Result<(), CoreError> {
-        require(self.pi_package.name.as_str() == PI_ROOT_PACKAGE_NAME)?;
-        require(self.installer_root.name != self.pi_package.name)?;
+        validate_pi_profile_facts!(self)
+    }
+}
+
+/// Producer-observed release inputs with no consumer compatibility claim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PiReleaseProfileV2 {
+    schema_version: u16,
+    pi_package: ExactPackageIdentity,
+    node_version: ExactVersion,
+    target: CatalogTarget,
+    installer_root: ExactPackageIdentity,
+    pi_package_locator: InventoryPath,
+    cli_entrypoint: InventoryPath,
+    installer_manifest: ImmutableFileDescriptor,
+    installer_lock: ImmutableFileDescriptor,
+    pi_manifest: ImmutableFileDescriptor,
+    components: Vec<CatalogComponentRecord>,
+    pi_component_id: CatalogId,
+    pi_artifact_id: CatalogId,
+    node_component_id: CatalogId,
+    node_artifact_id: CatalogId,
+    registry_integrity: RegistryIntegrity,
+    locked_packages: Vec<LockedPackageRecord>,
+}
+
+impl PiReleaseProfileV2 {
+    pub fn from_json(bytes: &[u8]) -> Result<Self, CoreError> {
+        require(bytes.len() <= MAX_PI_RELEASE_PROFILE_BYTES)?;
+        let w: PiReleaseProfileV2Wire = serde_json::from_slice(bytes).map_err(|_| invalid())?;
+        let origins = w.origins()?;
+        Self::from_wire(w, &origins)
+    }
+
+    fn from_wire(w: PiReleaseProfileV2Wire, origins: &[AllowedOrigin]) -> Result<Self, CoreError> {
+        require(w.schema_version == 2)?;
+        require_bounded_nonempty(&w.components, MAX_COMPONENTS_PER_RELEASE)?;
+        require_bounded_nonempty(&w.locked_packages, MAX_LOCKED_PACKAGES)?;
+        let result = Self {
+            schema_version: w.schema_version,
+            pi_package: ExactPackageIdentity::try_from_wire(w.pi_package)?,
+            node_version: ExactVersion::parse(w.node_version)?,
+            target: CatalogTarget::parse(&w.target)?,
+            installer_root: ExactPackageIdentity::try_from_wire(w.installer_root)?,
+            pi_package_locator: InventoryPath::parse(w.pi_package_locator)?,
+            cli_entrypoint: InventoryPath::parse(w.cli_entrypoint)?,
+            installer_manifest: ImmutableFileDescriptor::try_from_wire(
+                w.installer_manifest,
+                origins,
+            )?,
+            installer_lock: ImmutableFileDescriptor::try_from_wire(w.installer_lock, origins)?,
+            pi_manifest: ImmutableFileDescriptor::try_from_wire(w.pi_manifest, origins)?,
+            components: w
+                .components
+                .into_iter()
+                .map(|c| CatalogComponentRecord::try_from_wire(c, origins))
+                .collect::<Result<_, _>>()?,
+            pi_component_id: CatalogId::parse(w.pi_component_id)?,
+            pi_artifact_id: CatalogId::parse(w.pi_artifact_id)?,
+            node_component_id: CatalogId::parse(w.node_component_id)?,
+            node_artifact_id: CatalogId::parse(w.node_artifact_id)?,
+            registry_integrity: RegistryIntegrity::parse(w.registry_integrity)?,
+            locked_packages: w
+                .locked_packages
+                .into_iter()
+                .map(|p| LockedPackageRecord::try_from_wire(p, origins))
+                .collect::<Result<_, _>>()?,
+        };
+        result.validate()?;
         require(
-            self.pi_package_locator.as_str()
-                == format!("node_modules/{}", self.pi_package.name.as_str()),
+            serde_jcs::to_vec(&result).map_err(|_| invalid())?.len()
+                <= MAX_PI_RELEASE_PROFILE_BYTES,
         )?;
-        require(self.pi_component_id != self.node_component_id)?;
-        require_unique(self.components.iter().map(|c| &c.component_id))?;
-        require_unique(
-            self.components
-                .iter()
-                .flat_map(|c| &c.artifacts)
-                .map(|a| &a.artifact_id),
-        )?;
-        require(
-            self.components
-                .windows(2)
-                .all(|p| p[0].component_id.as_str() < p[1].component_id.as_str()),
-        )?;
-        for c in &self.components {
-            require(
-                c.artifacts
-                    .windows(2)
-                    .all(|p| p[0].artifact_id.as_str() < p[1].artifact_id.as_str()),
-            )?;
-        }
-        require(
-            self.locked_packages
-                .windows(2)
-                .all(|p| p[0].locator.as_str() < p[1].locator.as_str()),
-        )?;
-        require_coherent_package_identities(&self.locked_packages)?;
-        for package in &self.locked_packages {
-            validate_locator(package.locator.as_str(), package.name.as_str())?;
-            require(package.name != self.installer_root.name)?;
-        }
-        let package = self
-            .locked_packages
-            .iter()
-            .find(|p| p.locator == self.pi_package_locator)
-            .ok_or(CoreError::InvalidCatalog)?;
-        require(
-            package.name == self.pi_package.name && package.version == self.pi_package.version,
-        )?;
-        let pi = self
-            .components
-            .iter()
-            .find(|c| c.component_id == self.pi_component_id)
-            .ok_or(CoreError::InvalidCatalog)?;
-        require(pi.version == self.pi_package.version)?;
-        let archive = pi
-            .artifacts
-            .iter()
-            .find(|a| a.artifact_id == self.pi_artifact_id)
-            .ok_or(CoreError::InvalidCatalog)?;
-        require(
-            archive.sha256 == package.archive_sha256
-                && archive.url == package.resolved_url
-                && self.registry_integrity == package.registry_integrity,
-        )?;
-        require(
-            archive
-                .inventory
-                .iter()
-                .filter(|i| i.path == self.cli_entrypoint)
-                .count()
-                == 1,
-        )?;
-        let node = self
-            .components
-            .iter()
-            .find(|c| c.component_id == self.node_component_id)
-            .ok_or(CoreError::InvalidCatalog)?;
-        require(node.version == self.node_version)?;
-        require(
-            node.artifacts
-                .iter()
-                .any(|a| a.artifact_id == self.node_artifact_id),
-        )?;
-        Ok(())
+        Ok(result)
+    }
+
+    fn validate(&self) -> Result<(), CoreError> {
+        validate_pi_profile_facts!(self)
     }
 }
 
@@ -286,6 +374,16 @@ pub fn pi_release_subject_sha256(profile: &PiReleaseProfileV1) -> Result<[u8; 32
     let bytes = serde_jcs::to_vec(profile).map_err(|_| invalid())?;
     let mut hash = Sha256::new();
     hash.update(b"fluxsemble:pi-release-subject:v1\0");
+    hash.update((bytes.len() as u64).to_be_bytes());
+    hash.update(bytes);
+    Ok(hash.finalize().into())
+}
+
+/// Domain-separated identity for producer-only V2 release inputs.
+pub fn pi_release_subject_v2_sha256(profile: &PiReleaseProfileV2) -> Result<[u8; 32], CoreError> {
+    let bytes = serde_jcs::to_vec(profile).map_err(|_| invalid())?;
+    let mut hash = Sha256::new();
+    hash.update(b"fluxsemble:pi-release-subject:v2\0");
     hash.update((bytes.len() as u64).to_be_bytes());
     hash.update(bytes);
     Ok(hash.finalize().into())
@@ -430,6 +528,50 @@ impl PiReleaseProfileWire {
         Ok(origins)
     }
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PiReleaseProfileV2Wire {
+    schema_version: u16,
+    pi_package: ExactPackageIdentityWire,
+    node_version: String,
+    target: String,
+    installer_root: ExactPackageIdentityWire,
+    pi_package_locator: String,
+    cli_entrypoint: String,
+    installer_manifest: ImmutableFileDescriptorWire,
+    installer_lock: ImmutableFileDescriptorWire,
+    pi_manifest: ImmutableFileDescriptorWire,
+    components: Vec<CatalogComponentWire>,
+    pi_component_id: String,
+    pi_artifact_id: String,
+    node_component_id: String,
+    node_artifact_id: String,
+    registry_integrity: String,
+    locked_packages: Vec<LockedPackageWire>,
+}
+impl PiReleaseProfileV2Wire {
+    fn origins(&self) -> Result<Vec<AllowedOrigin>, CoreError> {
+        let mut origins = Vec::new();
+        for url in [
+            &self.installer_manifest.url,
+            &self.installer_lock.url,
+            &self.pi_manifest.url,
+        ]
+        .into_iter()
+        .chain(
+            self.components
+                .iter()
+                .flat_map(|c| &c.artifacts)
+                .map(|a| &a.url),
+        )
+        .chain(self.locked_packages.iter().map(|p| &p.resolved_url))
+        {
+            add_origin(&mut origins, url)?;
+        }
+        Ok(origins)
+    }
+}
+
 fn add_origin(origins: &mut Vec<AllowedOrigin>, value: &str) -> Result<(), CoreError> {
     let url = HttpsArtifactUrl::parse(value.to_owned())?;
     let parsed = Url::parse(url.as_str()).map_err(|_| invalid())?;
@@ -537,6 +679,77 @@ impl PiReleaseProfileV1 {
     #[must_use]
     pub fn required_contracts(&self) -> &PiRequiredContractsV1 {
         &self.required_contracts
+    }
+    #[must_use]
+    pub fn installer_root(&self) -> &ExactPackageIdentity {
+        &self.installer_root
+    }
+    #[must_use]
+    pub fn pi_package_locator(&self) -> &InventoryPath {
+        &self.pi_package_locator
+    }
+    #[must_use]
+    pub fn cli_entrypoint(&self) -> &InventoryPath {
+        &self.cli_entrypoint
+    }
+    #[must_use]
+    pub fn installer_manifest(&self) -> &ImmutableFileDescriptor {
+        &self.installer_manifest
+    }
+    #[must_use]
+    pub fn installer_lock(&self) -> &ImmutableFileDescriptor {
+        &self.installer_lock
+    }
+    #[must_use]
+    pub fn pi_manifest(&self) -> &ImmutableFileDescriptor {
+        &self.pi_manifest
+    }
+    #[must_use]
+    pub fn components(&self) -> &Vec<CatalogComponentRecord> {
+        &self.components
+    }
+    #[must_use]
+    pub fn pi_component_id(&self) -> &CatalogId {
+        &self.pi_component_id
+    }
+    #[must_use]
+    pub fn pi_artifact_id(&self) -> &CatalogId {
+        &self.pi_artifact_id
+    }
+    #[must_use]
+    pub fn node_component_id(&self) -> &CatalogId {
+        &self.node_component_id
+    }
+    #[must_use]
+    pub fn node_artifact_id(&self) -> &CatalogId {
+        &self.node_artifact_id
+    }
+    #[must_use]
+    pub fn registry_integrity(&self) -> &RegistryIntegrity {
+        &self.registry_integrity
+    }
+    #[must_use]
+    pub fn locked_packages(&self) -> &Vec<LockedPackageRecord> {
+        &self.locked_packages
+    }
+}
+
+impl PiReleaseProfileV2 {
+    #[must_use]
+    pub fn schema_version(&self) -> &u16 {
+        &self.schema_version
+    }
+    #[must_use]
+    pub fn pi_package(&self) -> &ExactPackageIdentity {
+        &self.pi_package
+    }
+    #[must_use]
+    pub fn node_version(&self) -> &ExactVersion {
+        &self.node_version
+    }
+    #[must_use]
+    pub fn target(&self) -> &CatalogTarget {
+        &self.target
     }
     #[must_use]
     pub fn installer_root(&self) -> &ExactPackageIdentity {

@@ -110,6 +110,57 @@ fn verified_bundle_value() -> Value {
     })
 }
 
+#[test]
+fn v2_release_manifest_binds_producer_evidence_without_qualification() {
+    use catalog_core::{SignedReleaseBundleManifestV2, verify_signed_release_inventory_v2};
+    let value = json!({
+        "schema_version":2,"source_commit":COMMIT_A,"source_tree_sha256":SHA_A,
+        "producer_input_sha256":SHA_B,"tag":"catalog-v1-sequence-42",
+        "catalog_envelope":{"name":"catalog-v1.json","size":1024,"sha256":SHA_C},
+        "assets":[{"name":"pi-package.json","size":512,"sha256":SHA_A}],
+        "signature":{"key_id":"test-key","signature":"A".repeat(86)}
+    });
+    let manifest =
+        SignedReleaseBundleManifestV2::from_json(&serde_json::to_vec(&value).unwrap()).unwrap();
+    assert!(
+        SignedReleaseBundleManifestV1::from_json(&serde_json::to_vec(&value).unwrap()).is_err()
+    );
+    let inventory = json!({"schema_version":1,"kind":"signed_release_v2","entries":[
+        {"relative_path":"catalog-v1.json","mode":"0400","size":1024,"sha256":SHA_C},
+        {"relative_path":"checksums-sha256.txt","mode":"0400","size":10,"sha256":SHA_D},
+        {"relative_path":"pi-package.json","mode":"0400","size":512,"sha256":SHA_A},
+        {"relative_path":"signed-release-bundle-manifest-v2.json","mode":"0400","size":100,"sha256":SHA_D}
+    ]});
+    let parse = |v: &Value| BundleInventoryV1::from_json(&serde_json::to_vec(v).unwrap()).unwrap();
+    assert!(verify_signed_release_inventory_v2(&parse(&inventory), &manifest).is_ok());
+    let mut changed = inventory;
+    changed["entries"][2]["sha256"] = json!(SHA_B);
+    assert!(verify_signed_release_inventory_v2(&parse(&changed), &manifest).is_err());
+    let mut mixed = value;
+    mixed["qualification_sha256"] = json!(SHA_D);
+    assert!(
+        SignedReleaseBundleManifestV2::from_json(&serde_json::to_vec(&mixed).unwrap()).is_err()
+    );
+}
+
+#[test]
+fn v2_verified_input_bundle_binds_release_subject_not_consumer_qualification() {
+    let value = json!({"schema_version":2,"source_kind":"catalog_source","source_sha256":SHA_A,
+        "release_subject_sha256":SHA_B,"objects":[{"relative_path":format!("objects/{SHA_C}"),
+        "source_url":"https://registry.npmjs.org/example/-/example-1.0.0.tgz","size":7,"sha256":SHA_C}]});
+    let parsed =
+        catalog_core::VerifiedInputBundleV2::from_json(&serde_json::to_vec(&value).unwrap())
+            .unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), value);
+    assert!(VerifiedInputBundleV1::from_json(&serde_json::to_vec(&value).unwrap()).is_err());
+    let mut mixed = value;
+    mixed["compatibility_input_sha256"] = json!(SHA_D);
+    assert!(
+        catalog_core::VerifiedInputBundleV2::from_json(&serde_json::to_vec(&mixed).unwrap())
+            .is_err()
+    );
+}
+
 fn manifest_value() -> Value {
     json!({
         "schema_version": 1,

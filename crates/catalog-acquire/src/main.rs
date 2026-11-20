@@ -51,7 +51,12 @@ fn run() -> Result<Summary, AcquireError> {
     match command {
         "verify-bundle" => {
             let bundle = exact_flags(&args[1..], &["--bundle"])?;
-            summary(verify_transferred_bundle(Path::new(&bundle[0]))?)
+            match verify_transferred_bundle(Path::new(&bundle[0])) {
+                Ok(verified) => summary(verified),
+                Err(_) => summary_v2(catalog_acquire::verify_transferred_bundle_v2(Path::new(
+                    &bundle[0],
+                ))?),
+            }
         }
         "export-transfer" => {
             let values = exact_flags(&args[1..], &["--bundle", "--output"])?;
@@ -102,7 +107,9 @@ fn run() -> Result<Summary, AcquireError> {
                 let intent = catalog_core::PiReleaseIntentV2::from_json(&intent_bytes)
                     .map_err(|_| AcquireError::Input)?;
                 return run_acquire_installer(
-                    catalog_acquire::AcquireInstallerReleaseSource::Intent { intent },
+                    catalog_acquire::AcquireInstallerReleaseSource::Intent {
+                        intent: Box::new(intent),
+                    },
                     catalog_acquire::PackageInputManifestV2::from_json(&read_input(Path::new(
                         &values[1],
                     ))?)?,
@@ -139,12 +146,9 @@ fn run() -> Result<Summary, AcquireError> {
             {
                 let source = catalog_core::CatalogSourceV2::from_json(&source_bytes)
                     .map_err(|_| AcquireError::Input)?;
-                let qualification_bytes =
-                    source_root.read_relative(source.qualification().relative_path().as_str())?;
                 return run_acquire_installer(
                     catalog_acquire::AcquireInstallerReleaseSource::Final {
                         source: Box::new(source),
-                        qualification_bytes,
                         source_commit: values[2].clone(),
                         source_tree_sha256: values[3].clone(),
                     },
@@ -196,6 +200,16 @@ fn run_acquire(
 fn summary(bundle: catalog_acquire::VerifiedTransferredBundle) -> Result<Summary, AcquireError> {
     Ok(Summary {
         digest: bundle.bundle_sha256().to_owned(),
+        objects: bundle.object_count(),
+        bytes: bundle.total_bytes(),
+    })
+}
+
+fn summary_v2(
+    bundle: catalog_acquire::VerifiedTransferredBundleV2,
+) -> Result<Summary, AcquireError> {
+    Ok(Summary {
+        digest: bundle.bundle_sha256(),
         objects: bundle.object_count(),
         bytes: bundle.total_bytes(),
     })
@@ -428,6 +442,24 @@ impl Drop for TemporaryCache {
     }
 }
 
+fn run_acquire_installer(
+    source: catalog_acquire::AcquireInstallerReleaseSource,
+    package_inputs: catalog_acquire::PackageInputManifestV2,
+    output: PathBuf,
+) -> Result<Summary, AcquireError> {
+    let cache = TemporaryCache::new()?;
+    runtime()?.block_on(catalog_acquire::acquire_installer_release(
+        catalog_acquire::AcquireInstallerReleaseRequest {
+            source,
+            package_inputs,
+            cache_root: cache.path().to_owned(),
+            output: output.clone(),
+            cancellation: AcquisitionCancellation::new(),
+        },
+    ))?;
+    summary_v2(catalog_acquire::verify_transferred_bundle_v2(&output)?)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -580,22 +612,4 @@ mod tests {
             let _ = fs::remove_dir_all(&self.path);
         }
     }
-}
-
-fn run_acquire_installer(
-    source: catalog_acquire::AcquireInstallerReleaseSource,
-    package_inputs: catalog_acquire::PackageInputManifestV2,
-    output: PathBuf,
-) -> Result<Summary, AcquireError> {
-    let cache = TemporaryCache::new()?;
-    runtime()?.block_on(catalog_acquire::acquire_installer_release(
-        catalog_acquire::AcquireInstallerReleaseRequest {
-            source,
-            package_inputs,
-            cache_root: cache.path().to_owned(),
-            output: output.clone(),
-            cancellation: AcquisitionCancellation::new(),
-        },
-    ))?;
-    summary(verify_transferred_bundle(&output)?)
 }

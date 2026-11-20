@@ -6,7 +6,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use catalog_core::{SignedReleaseBundleManifestV1, production_keyring};
+use catalog_core::production_keyring;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -155,7 +155,14 @@ pub fn verify_signed_bundle_key(
     bundle_dir: &Path,
     expected: &ActiveSigningKey,
 ) -> Result<(), WizardError> {
-    let path = bundle_dir.join(RELEASE_MANIFEST_NAME);
+    let nested = bundle_dir.join("signed-release-bundle");
+    let v1 = nested.join(RELEASE_MANIFEST_NAME);
+    let v2 = nested.join("signed-release-bundle-manifest-v2.json");
+    let (path, version) = match (v1.exists(), v2.exists()) {
+        (true, false) => (v1, 1),
+        (false, true) => (v2, 2),
+        _ => return Err(WizardError::Config),
+    };
     let metadata = fs::symlink_metadata(&path).map_err(|_| WizardError::Io)?;
     if !metadata.is_file()
         || metadata.file_type().is_symlink()
@@ -165,9 +172,23 @@ pub fn verify_signed_bundle_key(
         return Err(WizardError::Config);
     }
     let bytes = fs::read(path).map_err(|_| WizardError::Io)?;
-    let manifest =
-        SignedReleaseBundleManifestV1::from_json(&bytes).map_err(|_| WizardError::Config)?;
-    if manifest.signature().key_id().as_str() != expected.key_id {
+    let key_id = if version == 2 {
+        catalog_core::verify_signed_release_bundle_manifest_v2(&bytes)
+            .map_err(|_| WizardError::Config)?
+            .signature()
+            .key_id()
+            .as_str()
+            .to_owned()
+    } else {
+        catalog_core::verify_signed_release_bundle_manifest(&bytes)
+            .map_err(|_| WizardError::Config)?
+            .manifest()
+            .signature()
+            .key_id()
+            .as_str()
+            .to_owned()
+    };
+    if key_id != expected.key_id {
         return Err(WizardError::Config);
     }
     Ok(())

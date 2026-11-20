@@ -347,6 +347,7 @@ impl BrokerTransport for FakeBroker {
         &mut self,
         _repository: &str,
         release_id: &str,
+        _make_latest: bool,
     ) -> Result<(), RemoteBoundaryError> {
         let timing = self.record("publish_draft")?;
         let release = self

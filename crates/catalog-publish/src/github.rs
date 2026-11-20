@@ -153,6 +153,7 @@ pub(crate) trait BrokerTransport {
         &mut self,
         repository: &str,
         release_id: &str,
+        make_latest: bool,
     ) -> Result<(), RemoteBoundaryError>;
 }
 
@@ -356,11 +357,13 @@ impl BrokerTransport for GitHubBroker {
         &mut self,
         repository: &str,
         release_id: &str,
+        make_latest: bool,
     ) -> Result<(), RemoteBoundaryError> {
         match self.execute(BrokerRequestV1::PublishDraft {
             schema_version: 1,
             repository: repository.to_owned(),
             release_id: release_id.to_owned(),
+            make_latest,
         })? {
             BrokerResponseV1::Published {
                 release_id: actual,

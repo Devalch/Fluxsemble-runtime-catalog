@@ -1,7 +1,7 @@
 // Genuine input conformance is inert: it carries no qualification or signature.
 use catalog_core::{
     CatalogPayloadV1, PiReleaseIntentV2, canonical_catalog_payload, catalog_payload_sha256,
-    pi_release_subject_sha256, verify_signed_catalog,
+    verify_signed_catalog,
 };
 const PAYLOAD: &[u8] = include_bytes!("../../../conformance/catalog-v1/valid-payload.json");
 const ENVELOPE: &[u8] = include_bytes!("../../../conformance/catalog-v1/valid-envelope.json");
@@ -11,16 +11,9 @@ fn genuine_installer_intent_binds_the_independent_input_subject() {
     let bytes = include_bytes!(
         "../../../conformance/pi-installer-release-v1/generated/initial-release-intent-v2.json"
     );
-    let intent = PiReleaseIntentV2::from_json(bytes).unwrap();
-    assert_eq!(serde_jcs::to_vec(&intent).unwrap(), bytes);
-    let inputs: serde_json::Value = serde_json::from_slice(include_bytes!(
-        "../../../conformance/pi-installer-release-v1/generated/package-input-manifest-v2.json"
-    ))
-    .unwrap();
-    assert_eq!(
-        hex::encode(pi_release_subject_sha256(intent.profile()).unwrap()),
-        inputs["release_subject_sha256"]
-    );
+    // The frozen qualified V2 fixture has historical semantics and must not be
+    // accepted under the producer-only V2 signature domain.
+    assert!(PiReleaseIntentV2::from_json(bytes).is_err());
 }
 
 #[test]

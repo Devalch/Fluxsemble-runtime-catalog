@@ -13,6 +13,33 @@ use local::{
 use support::{TempTree, fixture_transfer, private_directory, set_mode};
 
 #[test]
+fn producer_v2_stages_and_reopens_without_qualification() {
+    let temp = TempTree::new("producer-v2");
+    let transfer = temp.path("transfer");
+    let state = temp.path("state");
+    support::fixture_producer_transfer(&transfer, 42);
+    let verified = local::verify_transferred_fixture_signed_bundle(&transfer).unwrap();
+    assert_eq!(verified.sequence(), 42);
+    assert_eq!(
+        local::stage_local(&verified, &state).unwrap(),
+        PublishOutcome::Staged
+    );
+    let reference: serde_json::Value =
+        serde_json::from_slice(&fs::read(state.join("latest/catalog-v1.ref")).unwrap()).unwrap();
+    assert_eq!(reference["operation"]["schema_version"], 2);
+    assert!(reference["operation"].get("qualification_sha256").is_none());
+    assert_eq!(
+        reference["operation"]["producer_input_sha256"],
+        "44".repeat(32)
+    );
+    assert_eq!(
+        local::stage_local(&verified, &state).unwrap(),
+        PublishOutcome::Staged
+    );
+    assert!(catalog_publish::verify_transferred_signed_bundle(&transfer).is_err());
+}
+
+#[test]
 fn reverse_transfer_and_both_signatures_are_verified_before_state_mutation() {
     let temp = TempTree::new("verify");
     let transfer = temp.path("transfer");

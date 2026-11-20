@@ -1,0 +1,9 @@
+# Independent V2 Pi catalog production
+
+The catalog producer acquires, verifies, signs and publishes Pi release inputs. Fluxsemble compatibility is assessed after publication by a separate consumer agent. No consumer source checkout, build binding, behavior contract or qualification result is required or asserted by the producer.
+
+Use the existing V2 producer source and intent; do not build a parallel V1 workflow. The V2 release profile carries exact Pi, Node, target, installer manifest and lock, archive identities, graph and inventory but no consumer requirement, consumer contract hashes or compatibility qualification. V2 subjects and evidence use distinct domains so old qualified identities cannot be confused with producer-only identities. Verify exact upstream bytes, graph closure, Node support, support asset URLs and inventory again in the isolated signer before production signing. Preserve source identity and sequence protections.
+
+The existing public release endpoint uses `catalog-v1.json`; the producer source and intent are V2. The independent producer payload needs an explicit V2 representation with no false compatibility claim; older consumers may reject it until updated by their owners. Pi 1.6.0 should become the latest GitHub catalog release immediately when published. The existing sequence-8 preparation is retained evidence from a prior qualified-source design and must not be silently relabeled as the new source; prepare fresh V2 input evidence tied to the final committed producer source.
+
+No compatibility test or build from another repository is run. Tests in this repository must cover producer-only acquisition, graph and archive tampering, source binding, isolated signing, signed inventory and publication/resume, and must prove no fake or missing consumer evidence is treated as a successful compatibility check.

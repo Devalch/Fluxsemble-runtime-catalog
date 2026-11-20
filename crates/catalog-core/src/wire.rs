@@ -1091,7 +1091,7 @@ fn valid_version_identifiers(identifiers: &str, reject_numeric_leading_zero: boo
         })
 }
 
-fn valid_plain_text(value: &str, maximum_bytes: usize, allow_lines: bool) -> bool {
+pub(crate) fn valid_plain_text(value: &str, maximum_bytes: usize, allow_lines: bool) -> bool {
     !value.is_empty()
         && value.len() <= maximum_bytes
         && value.chars().all(|character| {

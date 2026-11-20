@@ -1035,6 +1035,7 @@ fn exact_seven_command_families_have_fixed_argv_body_environment_and_projection(
                 schema_version: 1,
                 repository: REPOSITORY.to_owned(),
                 release_id: "7".to_owned(),
+                make_latest: false,
             },
             br#"{"draft":false,"id":7,"secret":"child-token-canary"}"#.to_vec(),
             vec![
@@ -1051,12 +1052,35 @@ fn exact_seven_command_families_have_fixed_argv_body_environment_and_projection(
             ],
             "{\"draft\":false}".to_owned(),
         ),
+        (
+            BrokerRequestV1::PublishDraft {
+                schema_version: 1,
+                repository: REPOSITORY.to_owned(),
+                release_id: "7".to_owned(),
+                make_latest: true,
+            },
+            br#"{"draft":false,"id":7,"secret":"child-token-canary"}"#.to_vec(),
+            vec![
+                "api",
+                "--method",
+                "PATCH",
+                "/repos/owner/name/releases/7",
+                "--header",
+                "Accept: application/vnd.github+json",
+                "--header",
+                "X-GitHub-Api-Version: 2022-11-28",
+                "--input",
+                "-",
+            ],
+            "{\"draft\":false,\"make_latest\":\"true\"}".to_owned(),
+        ),
     ];
 
     for (index, (request, response, expected_args, expected_body)) in cases.into_iter().enumerate()
     {
         let fixture = Fixture::new(&format!("matrix-{index}"), FakeBehavior::Success, &response);
-        let projected = execute(&fixture, &request).unwrap();
+        let projected = execute(&fixture, &request)
+            .unwrap_or_else(|error| panic!("command case {index} failed: {error}"));
         let safe = String::from_utf8(projected.to_canonical_bytes().unwrap()).unwrap();
         assert!(!safe.contains("child-token-canary"));
         assert!(!safe.contains("child-path-canary"));
@@ -1874,6 +1898,7 @@ fn real_broker_process_rejects_task9_config_swaps_before_every_workflow_mutation
                 schema_version: 1,
                 repository: REPOSITORY.to_owned(),
                 release_id: "7".to_owned(),
+                make_latest: false,
             },
             _ => unreachable!(),
         };

@@ -19,6 +19,7 @@ const VERIFIED_INPUT_RECORD_NAME: &str = "verified-input-bundle-v1.json";
 const CATALOG_ENVELOPE_NAME: &str = "catalog-v1.json";
 const RELEASE_CHECKSUMS_NAME: &str = "checksums-sha256.txt";
 const RELEASE_MANIFEST_NAME: &str = "signed-release-bundle-manifest-v1.json";
+const RELEASE_MANIFEST_V2_NAME: &str = "signed-release-bundle-manifest-v2.json";
 
 const INVENTORY_DOMAIN: &[u8] = b"fluxsemble:runtime-catalog-bundle-inventory:v1\0";
 const VERIFIED_INPUT_DOMAIN: &[u8] = b"fluxsemble:runtime-catalog-verified-input:v1\0";
@@ -124,6 +125,7 @@ impl BundleEntryV1 {
 pub enum BundleKind {
     VerifiedInput,
     SignedRelease,
+    SignedReleaseV2,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -162,6 +164,70 @@ pub struct VerifiedInputBundleV1 {
     source_sha256: Sha256Hex,
     compatibility_input_sha256: Sha256Hex,
     objects: Vec<VerifiedInputObjectV1>,
+}
+
+/// Producer-verified V2 inputs, bound to a release subject rather than a consumer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VerifiedInputBundleV2 {
+    schema_version: u16,
+    source_kind: InputSourceKind,
+    source_sha256: Sha256Hex,
+    release_subject_sha256: Sha256Hex,
+    objects: Vec<VerifiedInputObjectV1>,
+}
+
+impl VerifiedInputBundleV2 {
+    pub fn from_json(bytes: &[u8]) -> Result<Self, CoreError> {
+        require_bounded_json(bytes)?;
+        let wire: VerifiedInputBundleV2Wire =
+            serde_json::from_slice(bytes).map_err(|_| invalid())?;
+        require(wire.schema_version == 2)?;
+        require(!wire.objects.is_empty() && wire.objects.len() <= MAX_BUNDLE_ENTRIES)?;
+        let objects = wire
+            .objects
+            .into_iter()
+            .map(VerifiedInputObjectV1::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        require(
+            objects
+                .windows(2)
+                .all(|pair| pair[0].relative_path.as_str() < pair[1].relative_path.as_str()),
+        )?;
+        require_bounded_total(objects.iter().map(|object| object.size))?;
+        Ok(Self {
+            schema_version: 2,
+            source_kind: wire.source_kind,
+            source_sha256: Sha256Hex::parse(wire.source_sha256)?,
+            release_subject_sha256: Sha256Hex::parse(wire.release_subject_sha256)?,
+            objects,
+        })
+    }
+    #[must_use]
+    pub fn source_kind(&self) -> InputSourceKind {
+        self.source_kind
+    }
+    #[must_use]
+    pub fn source_sha256(&self) -> &Sha256Hex {
+        &self.source_sha256
+    }
+    #[must_use]
+    pub fn release_subject_sha256(&self) -> &Sha256Hex {
+        &self.release_subject_sha256
+    }
+    #[must_use]
+    pub fn objects(&self) -> &[VerifiedInputObjectV1] {
+        &self.objects
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerifiedInputBundleV2Wire {
+    schema_version: u16,
+    source_kind: InputSourceKind,
+    source_sha256: String,
+    release_subject_sha256: String,
+    objects: Vec<VerifiedInputObjectWire>,
 }
 
 impl VerifiedInputBundleV1 {
@@ -284,6 +350,105 @@ pub struct SignedReleaseBundleManifestV1 {
     catalog_envelope: ReleaseAssetV1,
     assets: Vec<ReleaseAssetV1>,
     signature: ReleaseBundleSignatureV1,
+}
+
+/// Signed V2 producer evidence. It carries no consumer qualification claim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SignedReleaseBundleManifestV2 {
+    schema_version: u16,
+    source_commit: CommitSha,
+    source_tree_sha256: Sha256Hex,
+    producer_input_sha256: Sha256Hex,
+    tag: CatalogTag,
+    catalog_envelope: ReleaseAssetV1,
+    assets: Vec<ReleaseAssetV1>,
+    signature: ReleaseBundleSignatureV1,
+}
+
+impl SignedReleaseBundleManifestV2 {
+    pub fn from_json(bytes: &[u8]) -> Result<Self, CoreError> {
+        require_bounded_json(bytes)?;
+        let wire: SignedReleaseBundleManifestV2Wire =
+            serde_json::from_slice(bytes).map_err(|_| invalid())?;
+        require(wire.schema_version == 2)?;
+        require(!wire.assets.is_empty() && wire.assets.len() <= MAX_BUNDLE_ENTRIES)?;
+        let catalog_envelope = ReleaseAssetV1::try_from(wire.catalog_envelope)?;
+        require(catalog_envelope.name.as_str() == CATALOG_ENVELOPE_NAME)?;
+        let assets = wire
+            .assets
+            .into_iter()
+            .map(ReleaseAssetV1::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        require(
+            assets
+                .windows(2)
+                .all(|pair| pair[0].name.as_str() < pair[1].name.as_str()),
+        )?;
+        require(!assets.iter().any(|asset| {
+            matches!(
+                asset.name.as_str(),
+                VERIFIED_INPUT_RECORD_NAME
+                    | CATALOG_ENVELOPE_NAME
+                    | RELEASE_CHECKSUMS_NAME
+                    | RELEASE_MANIFEST_NAME
+                    | RELEASE_MANIFEST_V2_NAME
+            )
+        }))?;
+        require_bounded_total(
+            std::iter::once(catalog_envelope.size).chain(assets.iter().map(|asset| asset.size)),
+        )?;
+        Ok(Self {
+            schema_version: 2,
+            source_commit: CommitSha::parse(wire.source_commit)?,
+            source_tree_sha256: Sha256Hex::parse(wire.source_tree_sha256)?,
+            producer_input_sha256: Sha256Hex::parse(wire.producer_input_sha256)?,
+            tag: CatalogTag::parse_without_sequence(wire.tag)?,
+            catalog_envelope,
+            assets,
+            signature: ReleaseBundleSignatureV1::try_from(wire.signature)?,
+        })
+    }
+    #[must_use]
+    pub fn source_commit(&self) -> &CommitSha {
+        &self.source_commit
+    }
+    #[must_use]
+    pub fn source_tree_sha256(&self) -> &Sha256Hex {
+        &self.source_tree_sha256
+    }
+    #[must_use]
+    pub fn producer_input_sha256(&self) -> &Sha256Hex {
+        &self.producer_input_sha256
+    }
+    #[must_use]
+    pub fn tag(&self) -> &CatalogTag {
+        &self.tag
+    }
+    #[must_use]
+    pub fn catalog_envelope(&self) -> &ReleaseAssetV1 {
+        &self.catalog_envelope
+    }
+    #[must_use]
+    pub fn assets(&self) -> &[ReleaseAssetV1] {
+        &self.assets
+    }
+    #[must_use]
+    pub fn signature(&self) -> &ReleaseBundleSignatureV1 {
+        &self.signature
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SignedReleaseBundleManifestV2Wire {
+    schema_version: u16,
+    source_commit: String,
+    source_tree_sha256: String,
+    producer_input_sha256: String,
+    tag: String,
+    catalog_envelope: ReleaseAssetWire,
+    assets: Vec<ReleaseAssetWire>,
+    signature: ReleaseBundleSignatureWire,
 }
 
 impl SignedReleaseBundleManifestV1 {
@@ -498,6 +663,52 @@ pub fn verify_signed_release_inventory(
     Ok(())
 }
 
+pub fn verify_signed_release_inventory_v2(
+    inventory: &BundleInventoryV1,
+    manifest: &SignedReleaseBundleManifestV2,
+) -> Result<(), CoreError> {
+    require(inventory.kind == BundleKind::SignedReleaseV2)?;
+    require(inventory.entries.len() == manifest.assets.len() + 3)?;
+    let catalog = find_entry(&inventory.entries, CATALOG_ENVELOPE_NAME)?;
+    require(
+        catalog.size == manifest.catalog_envelope.size
+            && catalog.sha256 == manifest.catalog_envelope.sha256,
+    )?;
+    for asset in &manifest.assets {
+        let entry = find_entry(&inventory.entries, asset.name.as_str())?;
+        require(entry.size == asset.size && entry.sha256 == asset.sha256)?;
+    }
+    Ok(())
+}
+
+pub fn release_bundle_signing_bytes_v2(
+    manifest: &SignedReleaseBundleManifestV2,
+) -> Result<Vec<u8>, CoreError> {
+    #[derive(Serialize)]
+    struct Unsigned<'a> {
+        schema_version: u16,
+        source_commit: &'a CommitSha,
+        source_tree_sha256: &'a Sha256Hex,
+        producer_input_sha256: &'a Sha256Hex,
+        tag: &'a CatalogTag,
+        catalog_envelope: &'a ReleaseAssetV1,
+        assets: &'a [ReleaseAssetV1],
+    }
+    let value = Unsigned {
+        schema_version: 2,
+        source_commit: &manifest.source_commit,
+        source_tree_sha256: &manifest.source_tree_sha256,
+        producer_input_sha256: &manifest.producer_input_sha256,
+        tag: &manifest.tag,
+        catalog_envelope: &manifest.catalog_envelope,
+        assets: &manifest.assets,
+    };
+    let canonical = serde_jcs::to_vec(&value).map_err(|_| invalid())?;
+    let mut bytes = b"fluxsemble:runtime-catalog-release-bundle:v2\0".to_vec();
+    bytes.extend_from_slice(&canonical);
+    Ok(bytes)
+}
+
 /// Bytes signed by the release-bundle signature. The signature field is intentionally absent.
 pub fn release_bundle_signing_bytes(
     manifest: &SignedReleaseBundleManifestV1,
@@ -558,6 +769,15 @@ fn require_kind_objects(kind: BundleKind, entries: &[BundleEntryV1]) -> Result<(
             has(CATALOG_ENVELOPE_NAME)
                 && has(RELEASE_CHECKSUMS_NAME)
                 && has(RELEASE_MANIFEST_NAME)
+                && entries.iter().all(|entry| {
+                    let path = entry.relative_path.as_str();
+                    path != VERIFIED_INPUT_RECORD_NAME && valid_release_asset_name(path)
+                }),
+        ),
+        BundleKind::SignedReleaseV2 => require(
+            has(CATALOG_ENVELOPE_NAME)
+                && has(RELEASE_CHECKSUMS_NAME)
+                && has(RELEASE_MANIFEST_V2_NAME)
                 && entries.iter().all(|entry| {
                     let path = entry.relative_path.as_str();
                     path != VERIFIED_INPUT_RECORD_NAME && valid_release_asset_name(path)
@@ -720,6 +940,35 @@ pub fn verify_pi_release_bundle_assets(
                 require(asset.sha256().as_str() == descriptor.sha256().as_str())?;
             }
         }
+    }
+    Ok(())
+}
+
+/// Bind the V2 producer catalog's support files to its signed release inventory.
+pub fn verify_pi_release_bundle_assets_v2(
+    payload: &crate::PiReleaseIntentV2,
+    manifest: &SignedReleaseBundleManifestV2,
+) -> Result<(), CoreError> {
+    require(manifest.tag() == payload.tag())?;
+    require(manifest.assets().len() == 3)?;
+    let profile = payload.profile();
+    for descriptor in [
+        profile.installer_manifest(),
+        profile.installer_lock(),
+        profile.pi_manifest(),
+    ] {
+        let name = crate::pi_support_asset_name(
+            descriptor.url().as_str(),
+            descriptor.sha256().as_str(),
+            manifest.tag().as_str(),
+        )?;
+        let asset = manifest
+            .assets()
+            .iter()
+            .find(|asset| asset.name().as_str() == name)
+            .ok_or_else(invalid)?;
+        require(asset.size() == descriptor.size_bytes().get())?;
+        require(asset.sha256().as_str() == descriptor.sha256().as_str())?;
     }
     Ok(())
 }

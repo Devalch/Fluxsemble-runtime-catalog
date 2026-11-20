@@ -596,7 +596,7 @@ fn publish_broker_inner(
         .map_err(local_error)?;
     if existing_publication.is_none() && before.draft {
         lock.revalidate().map_err(local_error)?;
-        let _publish_result = broker.publish_draft(REPOSITORY, &receipt.body.release_id);
+        let _publish_result = broker.publish_draft(REPOSITORY, &receipt.body.release_id, true);
     }
     let after = broker
         .read_draft(REPOSITORY, &receipt.body.tag)
@@ -889,7 +889,7 @@ fn publish_transport_fixture_inner(
     require_exact_tag(&verified_tag, &manifest.tag, source_commit)?;
     if release.draft {
         lock.revalidate().map_err(local_error)?;
-        let _publish_result = broker.publish_draft(REPOSITORY, &release.release_id);
+        let _publish_result = broker.publish_draft(REPOSITORY, &release.release_id, false);
     }
     let published = broker
         .read_draft(REPOSITORY, &manifest.tag)

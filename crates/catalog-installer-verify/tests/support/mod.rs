@@ -1,8 +1,7 @@
 #![allow(dead_code)]
 // Shared bounded synthetic archive fixtures; no verification logic is duplicated here.
 use base64::Engine as _;
-use catalog_core::PiRequiredContractsV1;
-use catalog_installer_verify::{DiscoverPiReleaseRequest, PiInstallerDiscoveryPolicy};
+use catalog_installer_verify::DiscoverPiReleaseRequest;
 use flate2::{Compression, write::GzEncoder};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256, Sha512};
@@ -11,10 +10,6 @@ use xz2::write::XzEncoder;
 const PI: &str = "@earendil-works/pi-coding-agent";
 const DEP_URL: &str = "https://registry.npmjs.org/dep/-/dep-1.0.0.tgz";
 pub fn request() -> DiscoverPiReleaseRequest {
-    let contracts: Value = serde_json::from_slice(include_bytes!(
-        "../../../../resources/pi/supported-contracts-v1.json"
-    ))
-    .unwrap();
     DiscoverPiReleaseRequest {
         sequence: 9,
         generated_at: "2026-10-01T00:00:00Z".into(),
@@ -24,13 +19,7 @@ pub fn request() -> DiscoverPiReleaseRequest {
         title: "candidate".into(),
         notes: "inputs only".into(),
         target: "linux_x86_64".into(),
-        installer_policy: Some(PiInstallerDiscoveryPolicy {
-            consumer_requirement: ">=0.1.0".into(),
-            required_contracts: PiRequiredContractsV1::from_json(
-                &serde_json::to_vec(&contracts["required_contracts"]).unwrap(),
-            )
-            .unwrap(),
-        }),
+        installer_policy: None,
     }
 }
 pub fn fixture_bytes(mutation: &str, pi_version: &str) -> BTreeMap<String, Vec<u8>> {
@@ -306,7 +295,7 @@ pub fn fixture_bytes(mutation: &str, pi_version: &str) -> BTreeMap<String, Vec<u
             format!("{upstream}/pi-coding-agent-install-package-lock.json"),
             serde_json::to_vec(&lock).unwrap(),
         ),
-        (pi_url.into(), pi_archive),
+        (pi_url, pi_archive),
         (DEP_URL.into(), dep_archive),
         (
             "https://registry.npmjs.org/dep/1.0.0".into(),

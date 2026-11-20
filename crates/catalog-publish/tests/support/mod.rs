@@ -50,6 +50,83 @@ impl Drop for TempTree {
 pub fn fixture_transfer(root: &Path, sequence: u64, support: &[u8]) {
     fixture_transfer_custom(root, sequence, support, None, BTreeMap::new(), None)
 }
+
+#[allow(dead_code)]
+pub fn fixture_producer_transfer(root: &Path, sequence: u64) {
+    fixture_transfer(root, sequence, b"replace fixture");
+    let bundle = root.join("signed-release-bundle");
+    for entry in fs::read_dir(&bundle).unwrap() {
+        fs::remove_file(entry.unwrap().path()).unwrap();
+    }
+    let mut profile: Value = serde_json::from_slice(include_bytes!(
+        "../../../catalog-core/tests/fixtures/catalog/pi-installer-v1/valid-wrapper-root.json"
+    ))
+    .unwrap();
+    profile["schema_version"] = json!(2);
+    profile
+        .as_object_mut()
+        .unwrap()
+        .remove("required_contracts");
+    profile
+        .as_object_mut()
+        .unwrap()
+        .remove("consumer_requirement");
+    let mut files = BTreeMap::new();
+    let mut assets = Vec::new();
+    for (field, role, bytes) in [
+        (
+            "installer_manifest",
+            "pi-installer-package",
+            b"installer".as_slice(),
+        ),
+        ("installer_lock", "pi-installer-lock", b"lock".as_slice()),
+        ("pi_manifest", "pi-package", b"manifest".as_slice()),
+    ] {
+        let digest = sha256(bytes);
+        let name = format!("{role}-{digest}.json");
+        profile[field] = json!({"url":format!("https://github.com/Devalch/Fluxsemble-runtime-catalog/releases/download/catalog-v1-sequence-{sequence}/{name}"),"size_bytes":bytes.len().to_string(),"sha256":digest});
+        assets.push(json!({"name":name,"size":bytes.len(),"sha256":digest}));
+        files.insert(name, bytes.to_vec());
+    }
+    assets.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    let intent_value = json!({"schema_version":2,"sequence":sequence.to_string(),"tag":format!("catalog-v1-sequence-{sequence}"),"generated_at":"2026-11-20T16:00:00Z","expires_at":"2026-12-20T16:00:00Z","title":"Pi 1.2.0","notes":"Producer fixture","profile":profile});
+    let intent =
+        catalog_core::PiReleaseIntentV2::from_json(&serde_jcs::to_vec(&intent_value).unwrap())
+            .unwrap();
+    let key = fixture_signing_key();
+    let signature = key.sign(&catalog_core::catalog_signing_bytes_v2(&intent).unwrap());
+    let catalog = serde_jcs::to_vec(&json!({"envelope_version":2,"signature_algorithm":"ed25519","key_id":FIXTURE_KEY_ID,"payload":intent,"signature":base64url(&signature.to_bytes())})).unwrap();
+    let mut value = json!({"schema_version":2,"source_commit":"0123456789abcdef0123456789abcdef01234567","source_tree_sha256":"11".repeat(32),"producer_input_sha256":"44".repeat(32),"tag":format!("catalog-v1-sequence-{sequence}"),"catalog_envelope":{"name":"catalog-v1.json","size":catalog.len(),"sha256":sha256(&catalog)},"assets":assets,"signature":{"key_id":FIXTURE_KEY_ID,"signature":"A".repeat(86)}});
+    let unsigned =
+        catalog_core::SignedReleaseBundleManifestV2::from_json(&serde_jcs::to_vec(&value).unwrap())
+            .unwrap();
+    let signature = key.sign(&catalog_core::release_bundle_signing_bytes_v2(&unsigned).unwrap());
+    value["signature"]["signature"] = json!(base64url(&signature.to_bytes()));
+    files.insert("catalog-v1.json".into(), catalog);
+    files.insert(
+        "signed-release-bundle-manifest-v2.json".into(),
+        serde_jcs::to_vec(&value).unwrap(),
+    );
+    let checksums = files
+        .iter()
+        .map(|(name, bytes)| format!("{}  {name}\n", sha256(bytes)))
+        .collect::<String>()
+        .into_bytes();
+    files.insert("checksums-sha256.txt".into(), checksums);
+    let mut entries = Vec::new();
+    for (name, bytes) in &files {
+        let path = bundle.join(name);
+        fs::write(&path, bytes).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o400)).unwrap();
+        entries.push(json!({"relative_path":format!("signed-release-bundle/{name}"),"mode":"0400","size":bytes.len(),"sha256":sha256(bytes)}));
+    }
+    let transfer_path = root.join("transfer-manifest-v1.json");
+    let mut transfer: Value = serde_json::from_slice(&fs::read(&transfer_path).unwrap()).unwrap();
+    transfer["entries"] = json!(entries);
+    fs::set_permissions(&transfer_path, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(&transfer_path, serde_jcs::to_vec(&transfer).unwrap()).unwrap();
+    fs::set_permissions(transfer_path, fs::Permissions::from_mode(0o400)).unwrap();
+}
 fn fixture_transfer_custom(
     root: &Path,
     sequence: u64,
@@ -330,18 +407,10 @@ pub fn fixture_installer_transfer(root: &Path, sequence: u64, omitted: Option<&s
             .collect::<String>()
     );
     let bytes = serde_jcs::to_vec(&q).unwrap();
-    let mut build = q["verification_build"].clone();
-    build.as_object_mut().unwrap().remove("consumer_version");
-    let source=catalog_core::CatalogSourceV2::from_json(&serde_jcs::to_vec(&json!({"schema_version":2,"intent":{"schema_version":2,"sequence":sequence.to_string(),"tag":format!("catalog-v1-sequence-{sequence}"),"generated_at":"2026-10-15T00:00:00Z","expires_at":"2026-11-15T00:00:00Z","title":"Synthetic","notes":"Fixture","profile":profile},"build":build,"qualification":{"relative_path":"qualifications/current.json","sha256":sha256(&bytes)}})).unwrap()).unwrap();
+    let qualification = json!({"url":format!("https://github.com/Devalch/Fluxsemble-runtime-catalog/releases/download/catalog-v1-sequence-{sequence}/qualification-{}.json", sha256(&bytes)),"size_bytes":bytes.len().to_string(),"sha256":sha256(&bytes)});
+    let payload = json!({"schema_version":1,"sequence":sequence.to_string(),"generated_at":"2026-10-15T00:00:00Z","expires_at":"2026-11-15T00:00:00Z","compatibility_ranges":[p.consumer_requirement()],"providers":[{"provider_id":"builtin:pi","allowed_origins":["https://example.com","https://github.com"],"releases":[{"version":p.pi_package().version(),"target":p.target(),"compatibility_ranges":[p.consumer_requirement()],"release_metadata":{"title":"Synthetic","notes":"Fixture"},"components":p.components(),"provider_extension":{"kind":"pi_installer_lock_v1","metadata":{"profile":p,"qualification":qualification}}}]}]});
     if omitted == Some("qualification") {
         omitted_name = Some(format!("qualification-{}.json", sha256(&bytes)));
     }
-    fixture_transfer_custom(
-        root,
-        sequence,
-        &bytes,
-        Some(serde_json::to_value(source.finalize(&bytes).unwrap()).unwrap()),
-        extra,
-        omitted_name,
-    );
+    fixture_transfer_custom(root, sequence, &bytes, Some(payload), extra, omitted_name);
 }

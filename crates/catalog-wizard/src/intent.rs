@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 
 use crate::WizardError;
 
-const DEFAULT_NOTES: &str = "Approved managed Pi release.";
+const DEFAULT_NOTES: &str = "Pi installer inputs verified by the catalog producer. Consumer compatibility is assessed separately.";
 const MAX_INPUT_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -691,17 +691,11 @@ fn parse_pi_discovery_policy(
 
 pub fn generate_installer_release_inputs(
     request: GenerateReleaseInputsRequest,
-    policy: catalog_acquire::PiInstallerDiscoveryPolicy,
 ) -> Result<GeneratedReleaseInputs, WizardError> {
-    generate_installer_release_inputs_with(
-        request,
-        policy,
-        catalog_acquire::discover_pi_installer_release,
-    )
+    generate_installer_release_inputs_with(request, catalog_acquire::discover_pi_installer_release)
 }
 fn generate_installer_release_inputs_with(
     request: GenerateReleaseInputsRequest,
-    policy: catalog_acquire::PiInstallerDiscoveryPolicy,
     discover: impl FnOnce(
         DiscoverPiReleaseRequest,
     ) -> Result<
@@ -737,15 +731,13 @@ fn generate_installer_release_inputs_with(
         title: format!("Pi {}", request.pi_version),
         notes: DEFAULT_NOTES.into(),
         target: request.target.clone(),
-        installer_policy: Some(policy.clone()),
+        installer_policy: None,
     })
     .map_err(|_| WizardError::Discovery)?;
     let profile = &discovered.profile;
     if profile.pi_package().version().as_str() != request.pi_version
         || profile.node_version().as_str() != request.node_version
         || profile.target().as_str() != request.target
-        || profile.consumer_requirement().as_str() != policy.consumer_requirement
-        || profile.required_contracts() != &policy.required_contracts
     {
         return Err(WizardError::Discovery);
     }
@@ -804,20 +796,26 @@ mod installer_generation_tests {
             "../../catalog-core/tests/fixtures/catalog/pi-installer-v1/valid-wrapper-root.json"
         ))
         .unwrap();
-        p["required_contracts"] = serde_json::to_value(&policy.required_contracts).unwrap();
-        p["consumer_requirement"] = json!(policy.consumer_requirement);
+        let _ = policy;
+        p["schema_version"] = json!(2);
+        p.as_object_mut().unwrap().remove("required_contracts");
+        p.as_object_mut().unwrap().remove("consumer_requirement");
         let url = "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/pi-coding-agent-1.2.0.tgz";
         p["components"][1]["artifacts"][0]["url"] = json!(url);
         p["locked_packages"][0]["resolved_url"] = json!(url);
-        for role in ["installer_manifest", "installer_lock", "pi_manifest"] {
+        for (role, label) in [
+            ("installer_manifest", "pi-installer-package"),
+            ("installer_lock", "pi-installer-lock"),
+            ("pi_manifest", "pi-package"),
+        ] {
             p[role]["url"] = json!(format!(
-                "https://github.com/Devalch/Fluxsemble-runtime-catalog/releases/download/catalog-v1-sequence-2/{role}-{}.json",
+                "https://github.com/Devalch/Fluxsemble-runtime-catalog/releases/download/catalog-v1-sequence-2/{label}-{}.json",
                 p[role]["sha256"].as_str().unwrap()
             ));
         }
         let profile =
-            catalog_core::PiReleaseProfileV1::from_json(&serde_jcs::to_vec(&p).unwrap()).unwrap();
-        let subject = catalog_core::pi_release_subject_sha256(&profile)
+            catalog_core::PiReleaseProfileV2::from_json(&serde_jcs::to_vec(&p).unwrap()).unwrap();
+        let subject = catalog_core::pi_release_subject_v2_sha256(&profile)
             .unwrap()
             .iter()
             .map(|b| format!("{b:02x}"))
@@ -856,15 +854,15 @@ mod installer_generation_tests {
             generated_at: DateTime::<Utc>::from(std::time::SystemTime::now()),
             validity_window: Duration::days(31),
         };
-        let result = generate_installer_release_inputs_with(request.clone(), policy.clone(), |r| {
-            assert_eq!(r.installer_policy, Some(policy.clone()));
+        let result = generate_installer_release_inputs_with(request.clone(), |r| {
+            assert_eq!(r.installer_policy, None);
             Ok(observed)
         })
         .unwrap();
         let selected = fs::read(&result.intent_path).unwrap();
         let mut changed = policy;
         changed.consumer_requirement = ">=0.2.0".into();
-        let resumed = generate_installer_release_inputs_with(request, changed, |_| {
+        let resumed = generate_installer_release_inputs_with(request, |_| {
             panic!("resumed intent must not rediscover using current policy")
         })
         .unwrap();
@@ -917,10 +915,8 @@ mod installer_generation_tests {
                 validity_window: Duration::days(31),
             };
             let generated =
-                generate_installer_release_inputs_with(request.clone(), policy.clone(), |_| {
-                    Ok(candidate(&policy))
-                })
-                .unwrap();
+                generate_installer_release_inputs_with(request.clone(), |_| Ok(candidate(&policy)))
+                    .unwrap();
             let intent = fs::read(&generated.intent_path).unwrap();
             let inputs = fs::read(&generated.package_inputs_path).unwrap();
             fs::remove_file(&generated.package_inputs_path).unwrap();
@@ -939,7 +935,7 @@ mod installer_generation_tests {
             changed.consumer_requirement = ">=0.2.0".into();
             let mut resumed_request = request;
             resumed_request.generated_at += Duration::days(1);
-            let resumed = generate_installer_release_inputs_with(resumed_request, changed, |_| {
+            let resumed = generate_installer_release_inputs_with(resumed_request, |_| {
                 panic!("interrupted pair must recover its exact retained selection")
             })
             .unwrap();
@@ -977,9 +973,7 @@ mod installer_generation_tests {
             };
             GENERATION_INTERRUPTION.with(|selected| selected.set(Some(fault)));
             assert_eq!(
-                generate_installer_release_inputs_with(request.clone(), policy.clone(), |_| Ok(
-                    candidate(&policy)
-                )),
+                generate_installer_release_inputs_with(request.clone(), |_| Ok(candidate(&policy))),
                 Err(WizardError::Io)
             );
             let release = root.join(".release-work/sequence-2");
@@ -1000,11 +994,10 @@ mod installer_generation_tests {
             changed.consumer_requirement = ">=0.2.0".into();
             let mut resumed_request = request.clone();
             resumed_request.generated_at += Duration::days(1);
-            let resumed =
-                generate_installer_release_inputs_with(resumed_request, changed.clone(), |_| {
-                    panic!("journal recovery must not rediscover")
-                })
-                .unwrap();
+            let resumed = generate_installer_release_inputs_with(resumed_request, |_| {
+                panic!("journal recovery must not rediscover")
+            })
+            .unwrap();
             assert_eq!(fs::read(&resumed.intent_path).unwrap(), expected_intent);
             assert_eq!(
                 fs::read(&resumed.package_inputs_path).unwrap(),
@@ -1017,7 +1010,7 @@ mod installer_generation_tests {
             // A complete but replaced final file is rejected, never overwritten from the journal.
             fs::write(&resumed.intent_path, b"replaced").unwrap();
             assert!(
-                generate_installer_release_inputs_with(request, changed, |_| panic!(
+                generate_installer_release_inputs_with(request, |_| panic!(
                     "tampering cannot trigger discovery"
                 ))
                 .is_err()

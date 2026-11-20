@@ -16,10 +16,11 @@ use std::{
 use catalog_core::{
     BundleInventoryV1, CatalogPayloadV1, CatalogSourceV1, CompatibilityQualificationV1,
     InitialPiReleaseIntentV1, InputSourceKind, ProviderExtensionV1, SignedReleaseBundleManifestV1,
-    VerifiedInputBundleV1, active_production_key_identity, canonical_catalog_payload,
-    catalog_source_digest, compatibility_input_digest, initial_release_intent_digest,
-    qualification_record_digest, release_bundle_signing_bytes, verify_qualification,
-    verify_signed_catalog, verify_signed_release_bundle_manifest, verify_signed_release_inventory,
+    VerifiedInputBundleV1, VerifiedInputBundleV2, active_production_key_identity,
+    canonical_catalog_payload, catalog_source_digest, compatibility_input_digest,
+    initial_release_intent_digest, qualification_record_digest, release_bundle_signing_bytes,
+    verify_qualification, verify_signed_catalog, verify_signed_release_bundle_manifest,
+    verify_signed_release_inventory,
 };
 use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
@@ -29,10 +30,12 @@ use sha2::{Digest, Sha256};
 use crate::{SignError, is_absolute_bounded_path, key::read_production_signing_key};
 
 const VERIFIED_INPUT_NAME: &str = "verified-input-bundle-v1.json";
+const VERIFIED_INPUT_V2_NAME: &str = "verified-input-bundle-v2.json";
 const TRANSFER_MANIFEST_NAME: &str = "transfer-manifest-v1.json";
 const CATALOG_NAME: &str = "catalog-v1.json";
 const CHECKSUMS_NAME: &str = "checksums-sha256.txt";
 const RELEASE_MANIFEST_NAME: &str = "signed-release-bundle-manifest-v1.json";
+const RELEASE_MANIFEST_V2_NAME: &str = "signed-release-bundle-manifest-v2.json";
 const RECOVERY_BINDING_NAME: &str = "sign-recovery-binding-v1.json";
 const MAX_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_ENTRY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
@@ -181,7 +184,45 @@ pub struct VerifiedTransferredBundle {
     directories: BTreeMap<String, RetainedDirectory>,
     files: BTreeMap<String, RetainedFile>,
     manifest: TransferManifestV1,
-    inventory: VerifiedInputBundleV1,
+    inventory: TransferredInput,
+}
+
+enum TransferredInput {
+    Legacy(VerifiedInputBundleV1),
+    V2(VerifiedInputBundleV2),
+}
+
+impl TransferredInput {
+    fn source_kind(&self) -> InputSourceKind {
+        match self {
+            Self::Legacy(v) => v.source_kind(),
+            Self::V2(v) => v.source_kind(),
+        }
+    }
+    fn source_sha256(&self) -> &catalog_core::Sha256Hex {
+        match self {
+            Self::Legacy(v) => v.source_sha256(),
+            Self::V2(v) => v.source_sha256(),
+        }
+    }
+    fn objects(&self) -> &[catalog_core::VerifiedInputObjectV1] {
+        match self {
+            Self::Legacy(v) => v.objects(),
+            Self::V2(v) => v.objects(),
+        }
+    }
+    fn legacy(&self) -> Result<&VerifiedInputBundleV1, SignError> {
+        match self {
+            Self::Legacy(v) => Ok(v),
+            Self::V2(_) => Err(bundle_rejected()),
+        }
+    }
+    fn v2(&self) -> Result<&VerifiedInputBundleV2, SignError> {
+        match self {
+            Self::V2(v) => Ok(v),
+            Self::Legacy(_) => Err(bundle_rejected()),
+        }
+    }
 }
 
 impl std::fmt::Debug for VerifiedTransferredBundle {
@@ -196,8 +237,12 @@ impl std::fmt::Debug for VerifiedTransferredBundle {
 
 impl VerifiedTransferredBundle {
     #[must_use]
-    pub fn inventory(&self) -> &VerifiedInputBundleV1 {
-        &self.inventory
+    pub fn inventory(&self) -> Option<&VerifiedInputBundleV1> {
+        self.inventory.legacy().ok()
+    }
+    #[must_use]
+    pub fn inventory_v2(&self) -> Option<&VerifiedInputBundleV2> {
+        self.inventory.v2().ok()
     }
 
     #[must_use]
@@ -293,6 +338,7 @@ struct FinalBindings {
     source_commit: String,
     source_tree_sha256: String,
     qualification_sha256: String,
+    producer_input_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -423,12 +469,17 @@ pub fn verify_transferred_bundle(path: &Path) -> Result<VerifiedTransferredBundl
     }
     let root_identity = FileIdentity::from_metadata(&root_metadata);
     let root_names = enumerate_names(&root)?;
+    let input_name = if root_names.contains(VERIFIED_INPUT_V2_NAME) {
+        VERIFIED_INPUT_V2_NAME
+    } else {
+        VERIFIED_INPUT_NAME
+    };
     if root_names
         != BTreeSet::from([
             "objects".to_owned(),
             "records".to_owned(),
             TRANSFER_MANIFEST_NAME.to_owned(),
-            VERIFIED_INPUT_NAME.to_owned(),
+            input_name.to_owned(),
         ])
     {
         return Err(bundle_rejected());
@@ -513,14 +564,31 @@ pub fn verify_transferred_bundle(path: &Path) -> Result<VerifiedTransferredBundl
         },
     );
 
-    let inventory_file = files.get(VERIFIED_INPUT_NAME).ok_or_else(bundle_rejected)?;
+    let inventory_file = files.get(input_name).ok_or_else(bundle_rejected)?;
     let inventory_bytes = read_small_retained(inventory_file)?;
-    let inventory =
-        VerifiedInputBundleV1::from_json(&inventory_bytes).map_err(|_| bundle_rejected())?;
-    if serde_jcs::to_vec(&inventory).map_err(|_| bundle_rejected())? != inventory_bytes {
-        return Err(bundle_rejected());
-    }
-    cross_bind_transfer(&manifest, &inventory)?;
+    let inventory = if input_name == VERIFIED_INPUT_V2_NAME {
+        if manifest.kind != "verified_input_v2" {
+            return Err(bundle_rejected());
+        }
+        let inventory =
+            VerifiedInputBundleV2::from_json(&inventory_bytes).map_err(|_| bundle_rejected())?;
+        if serde_jcs::to_vec(&inventory).map_err(|_| bundle_rejected())? != inventory_bytes {
+            return Err(bundle_rejected());
+        }
+        cross_bind_transfer_v2(&manifest, &inventory)?;
+        TransferredInput::V2(inventory)
+    } else {
+        if manifest.kind != "verified_input" {
+            return Err(bundle_rejected());
+        }
+        let inventory =
+            VerifiedInputBundleV1::from_json(&inventory_bytes).map_err(|_| bundle_rejected())?;
+        if serde_jcs::to_vec(&inventory).map_err(|_| bundle_rejected())? != inventory_bytes {
+            return Err(bundle_rejected());
+        }
+        cross_bind_transfer(&manifest, &inventory)?;
+        TransferredInput::Legacy(inventory)
+    };
 
     let verified = VerifiedTransferredBundle {
         root,
@@ -632,7 +700,13 @@ fn assemble_release_intent_with_policy(
         return Err(candidate_rejected());
     }
     let semantic = intent_semantic_digest(intent)?;
-    if bundle.inventory.compatibility_input_sha256().as_str() != semantic {
+    if bundle
+        .inventory
+        .legacy()?
+        .compatibility_input_sha256()
+        .as_str()
+        != semantic
+    {
         return Err(candidate_rejected());
     }
     assemble_common(bundle, intent, semantic, None, policy)
@@ -696,7 +770,13 @@ fn finalize_candidate_with_policy(
         mark_finalization_stage(FinalizationStage::SourceDigestRejected);
         return Err(candidate_rejected());
     }
-    if bundle.inventory.compatibility_input_sha256().as_str() != encode_hex(&compatibility) {
+    if bundle
+        .inventory
+        .legacy()?
+        .compatibility_input_sha256()
+        .as_str()
+        != encode_hex(&compatibility)
+    {
         #[cfg(test)]
         mark_finalization_stage(FinalizationStage::CompatibilityDigestRejected);
         return Err(candidate_rejected());
@@ -733,6 +813,7 @@ fn finalize_candidate_with_policy(
         source_commit,
         source_tree_sha256,
         qualification_sha256: qualification_sha256.clone(),
+        producer_input_sha256: None,
     };
     let mut candidate = assemble_common(
         bundle,
@@ -839,6 +920,191 @@ struct SignedBytes {
     manifest: SignedReleaseBundleManifestV1,
 }
 
+struct SignedBytesV2 {
+    files: BTreeMap<String, Vec<u8>>,
+    inventory: BundleInventoryV1,
+    manifest: catalog_core::SignedReleaseBundleManifestV2,
+}
+
+fn sign_candidate_v2(
+    candidate: &UnsignedReleaseCandidateV1,
+    signing_key: &SigningKey,
+    key_id: &str,
+) -> Result<SignedBytesV2, SignError> {
+    let bindings = candidate
+        .final_bindings
+        .as_ref()
+        .ok_or_else(candidate_rejected)?;
+    let input_digest = bindings
+        .producer_input_sha256
+        .as_ref()
+        .ok_or_else(candidate_rejected)?;
+    let payload = catalog_core::PiReleaseIntentV2::from_json(&candidate.canonical_payload)
+        .map_err(|_| candidate_rejected())?;
+    if serde_jcs::to_vec(&payload).map_err(|_| candidate_rejected())? != candidate.canonical_payload
+        || payload.tag().as_str() != candidate.tag
+    {
+        return Err(candidate_rejected());
+    }
+    let catalog_signature = signing_key
+        .sign(&catalog_core::catalog_signing_bytes_v2(&payload).map_err(|_| candidate_rejected())?);
+    let catalog_bytes = serde_jcs::to_vec(&json!({
+        "envelope_version": 2,
+        "signature_algorithm": "ed25519",
+        "key_id": key_id,
+        "payload": payload,
+        "signature": encode_base64url_no_pad(&catalog_signature.to_bytes()),
+    }))
+    .map_err(|_| candidate_rejected())?;
+    let mut assets = candidate.support_assets.clone();
+    assets.sort_by(|a, b| a.name.cmp(&b.name));
+    if assets.windows(2).any(|pair| pair[0].name == pair[1].name) {
+        return Err(candidate_rejected());
+    }
+    let asset_values = assets
+        .iter()
+        .map(|asset| {
+            json!({
+                "name": asset.name, "size": asset.bytes.len() as u64, "sha256": asset.sha256,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut value = json!({
+        "schema_version": 2,
+        "source_commit": bindings.source_commit,
+        "source_tree_sha256": bindings.source_tree_sha256,
+        "producer_input_sha256": input_digest,
+        "tag": candidate.tag,
+        "catalog_envelope": {"name": CATALOG_NAME, "size": catalog_bytes.len() as u64, "sha256": sha256(&catalog_bytes)},
+        "assets": asset_values,
+        "signature": {"key_id": key_id, "signature": "A".repeat(86)},
+    });
+    let unsigned = catalog_core::SignedReleaseBundleManifestV2::from_json(
+        &serde_jcs::to_vec(&value).map_err(|_| candidate_rejected())?,
+    )
+    .map_err(|_| candidate_rejected())?;
+    catalog_core::verify_pi_release_bundle_assets_v2(&payload, &unsigned)
+        .map_err(|_| candidate_rejected())?;
+    let signature = signing_key.sign(
+        &catalog_core::release_bundle_signing_bytes_v2(&unsigned)
+            .map_err(|_| candidate_rejected())?,
+    );
+    value["signature"]["signature"] = Value::String(encode_base64url_no_pad(&signature.to_bytes()));
+    let manifest_bytes = serde_jcs::to_vec(&value).map_err(|_| candidate_rejected())?;
+    let manifest = catalog_core::SignedReleaseBundleManifestV2::from_json(&manifest_bytes)
+        .map_err(|_| candidate_rejected())?;
+    let mut files = BTreeMap::new();
+    files.insert(CATALOG_NAME.to_owned(), catalog_bytes);
+    for asset in assets {
+        if sha256(&asset.bytes) != asset.sha256 {
+            return Err(candidate_rejected());
+        }
+        files.insert(asset.name, asset.bytes);
+    }
+    files.insert(RELEASE_MANIFEST_V2_NAME.to_owned(), manifest_bytes);
+    let checksums = files
+        .iter()
+        .map(|(name, bytes)| format!("{}  {name}\n", sha256(bytes)))
+        .collect::<String>()
+        .into_bytes();
+    files.insert(CHECKSUMS_NAME.to_owned(), checksums);
+    let inventory = inventory_for_files_v2(&files)?;
+    catalog_core::verify_signed_release_inventory_v2(&inventory, &manifest)
+        .map_err(|_| candidate_rejected())?;
+    Ok(SignedBytesV2 {
+        files,
+        inventory,
+        manifest,
+    })
+}
+
+fn inventory_for_files_v2(
+    files: &BTreeMap<String, Vec<u8>>,
+) -> Result<BundleInventoryV1, SignError> {
+    let entries = files.iter().map(|(name, bytes)| json!({
+        "relative_path": name, "mode": "0400", "size": bytes.len() as u64, "sha256": sha256(bytes),
+    })).collect::<Vec<_>>();
+    BundleInventoryV1::from_json(
+        &serde_jcs::to_vec(&json!({
+            "schema_version": 1, "kind": "signed_release_v2", "entries": entries,
+        }))
+        .map_err(|_| candidate_rejected())?,
+    )
+    .map_err(|_| candidate_rejected())
+}
+
+fn verify_signed_bytes_v2(
+    bytes: &SignedBytesV2,
+    policy: SignatureVerificationPolicy,
+) -> Result<(), SignError> {
+    catalog_core::verify_signed_release_inventory_v2(&bytes.inventory, &bytes.manifest)
+        .map_err(|_| verification_failed())?;
+    let catalog = bytes
+        .files
+        .get(CATALOG_NAME)
+        .ok_or_else(verification_failed)?;
+    let manifest = bytes
+        .files
+        .get(RELEASE_MANIFEST_V2_NAME)
+        .ok_or_else(verification_failed)?;
+    match policy {
+        SignatureVerificationPolicy::Production => {
+            let payload = catalog_core::verify_signed_catalog_v2(catalog)
+                .map_err(|_| verification_failed())?;
+            let verified = catalog_core::verify_signed_release_bundle_manifest_v2(manifest)
+                .map_err(|_| verification_failed())?;
+            if verified != bytes.manifest {
+                return Err(verification_failed());
+            }
+            catalog_core::verify_pi_release_bundle_assets_v2(&payload, &verified)
+                .map_err(|_| verification_failed())?;
+        }
+        #[cfg(any(test, feature = "fixture-tools"))]
+        SignatureVerificationPolicy::Fixture => {
+            verify_fixture_signatures_v2(catalog, manifest, &bytes.manifest)?
+        }
+    }
+    for entry in bytes.inventory.entries() {
+        let file = bytes
+            .files
+            .get(entry.relative_path().as_str())
+            .ok_or_else(verification_failed)?;
+        if file.len() as u64 != entry.size() || sha256(file) != entry.sha256().as_str() {
+            return Err(verification_failed());
+        }
+    }
+    Ok(())
+}
+
+fn write_signed_output_v2(
+    preflight: OutputPreflight,
+    bytes: SignedBytesV2,
+) -> Result<(), SignError> {
+    let mut output = StagedOutput::create(preflight)?;
+    for (name, contents) in &bytes.files {
+        output.write_file(name, contents)?;
+    }
+    output.verify_files(&bytes.files)?;
+    verify_signed_bytes_v2(&bytes, SignatureVerificationPolicy::Production)?;
+    let publication = output.publish();
+    let mut cleanup = Ok(PublicationDurability::Durable);
+    if output.published {
+        if reopen_signed_output(&output.final_path, &bytes.files)? != bytes.files {
+            return Err(verification_failed());
+        }
+        verify_signed_bytes_v2(&bytes, SignatureVerificationPolicy::Production)?;
+        if publication.is_ok() {
+            cleanup = output.settle_verified_staging();
+        }
+    }
+    if publication? == PublicationDurability::Uncertain
+        || cleanup? == PublicationDurability::Uncertain
+    {
+        return Err(SignError::OutputDurabilityUncertain);
+    }
+    Ok(())
+}
+
 fn sign_candidate(
     candidate: &UnsignedReleaseCandidateV1,
     signing_key: &SigningKey,
@@ -848,6 +1114,10 @@ fn sign_candidate(
         .final_bindings
         .as_ref()
         .ok_or_else(candidate_rejected)?;
+    // The legacy signing domain must never sign a V2 producer payload.
+    if bindings.producer_input_sha256.is_some() {
+        return Err(candidate_rejected());
+    }
     let catalog_signature = signing_key.sign(&candidate.canonical_payload);
     let payload_value: Value =
         serde_json::from_slice(&candidate.canonical_payload).map_err(|_| candidate_rejected())?;
@@ -1011,14 +1281,63 @@ fn verify_signed_bytes(
 }
 
 #[cfg(any(test, feature = "fixture-tools"))]
+const FIXTURE_PUBLIC_KEY: [u8; 32] = [
+    0x03, 0xa1, 0x07, 0xbf, 0xf3, 0xce, 0x10, 0xbe, 0x1d, 0x70, 0xdd, 0x18, 0xe7, 0x4b, 0xc0, 0x99,
+    0x67, 0xe4, 0xd6, 0x30, 0x9b, 0xa5, 0x0d, 0x5f, 0x1d, 0xdc, 0x86, 0x64, 0x12, 0x55, 0x31, 0xb8,
+];
+
+#[cfg(any(test, feature = "fixture-tools"))]
+fn verify_fixture_signatures_v2(
+    catalog_bytes: &[u8],
+    manifest_bytes: &[u8],
+    expected: &catalog_core::SignedReleaseBundleManifestV2,
+) -> Result<(), SignError> {
+    use ed25519_dalek::{Signature, VerifyingKey};
+    let key = VerifyingKey::from_bytes(&FIXTURE_PUBLIC_KEY).map_err(|_| verification_failed())?;
+    let envelope: Value =
+        serde_json::from_slice(catalog_bytes).map_err(|_| verification_failed())?;
+    if envelope.as_object().is_none_or(|o| o.len() != 5)
+        || envelope["envelope_version"] != 2
+        || envelope["signature_algorithm"] != "ed25519"
+        || envelope["key_id"] != "catalog-test-key-v1"
+        || serde_jcs::to_vec(&envelope).map_err(|_| verification_failed())? != catalog_bytes
+    {
+        return Err(verification_failed());
+    }
+    let payload = catalog_core::PiReleaseIntentV2::from_json(
+        &serde_json::to_vec(&envelope["payload"]).map_err(|_| verification_failed())?,
+    )
+    .map_err(|_| verification_failed())?;
+    let sig = envelope["signature"]
+        .as_str()
+        .and_then(decode_fixture_signature_for_test)
+        .ok_or_else(verification_failed)?;
+    key.verify_strict(
+        &catalog_core::catalog_signing_bytes_v2(&payload).map_err(|_| verification_failed())?,
+        &Signature::from_bytes(&sig),
+    )
+    .map_err(|_| verification_failed())?;
+    let manifest = catalog_core::SignedReleaseBundleManifestV2::from_json(manifest_bytes)
+        .map_err(|_| verification_failed())?;
+    if &manifest != expected || manifest.signature().key_id().as_str() != "catalog-test-key-v1" {
+        return Err(verification_failed());
+    }
+    let sig = decode_fixture_signature_for_test(manifest.signature().signature().as_str())
+        .ok_or_else(verification_failed)?;
+    key.verify_strict(
+        &catalog_core::release_bundle_signing_bytes_v2(&manifest)
+            .map_err(|_| verification_failed())?,
+        &Signature::from_bytes(&sig),
+    )
+    .map_err(|_| verification_failed())?;
+    catalog_core::verify_pi_release_bundle_assets_v2(&payload, &manifest)
+        .map_err(|_| verification_failed())
+}
+
+#[cfg(any(test, feature = "fixture-tools"))]
 fn verify_fixture_signatures(catalog_bytes: &[u8], manifest_bytes: &[u8]) -> Result<(), SignError> {
     use ed25519_dalek::{Signature, VerifyingKey};
 
-    const FIXTURE_PUBLIC_KEY: [u8; 32] = [
-        0x03, 0xa1, 0x07, 0xbf, 0xf3, 0xce, 0x10, 0xbe, 0x1d, 0x70, 0xdd, 0x18, 0xe7, 0x4b, 0xc0,
-        0x99, 0x67, 0xe4, 0xd6, 0x30, 0x9b, 0xa5, 0x0d, 0x5f, 0x1d, 0xdc, 0x86, 0x64, 0x12, 0x55,
-        0x31, 0xb8,
-    ];
     const FIXTURE_KEY_ID: &str = "catalog-test-key-v1";
 
     let verifying_key =
@@ -1263,6 +1582,97 @@ fn recover_signed_output(
         inventory,
         manifest,
     })
+}
+
+fn recover_signed_output_v2(
+    path: &Path,
+    candidate: &UnsignedReleaseCandidateV1,
+) -> Result<(), SignError> {
+    let parent_path = path.parent().ok_or_else(verification_failed)?;
+    let root = open_absolute_directory(path).map_err(|_| verification_failed())?;
+    let metadata = root.metadata().map_err(|_| verification_failed())?;
+    if !secure_directory(&metadata) || !directory_nlink_matches(metadata.nlink(), 2) {
+        return Err(verification_failed());
+    }
+    let names = enumerate_names(&root).map_err(|_| verification_failed())?;
+    if names.len() < 3 || names.len() > MAX_ENTRIES {
+        return Err(verification_failed());
+    }
+    let mut files = BTreeMap::new();
+    for name in names {
+        if !safe_component(&name) {
+            return Err(verification_failed());
+        }
+        let file = open_regular_at(&root, &name).map_err(|_| verification_failed())?;
+        let metadata = file.metadata().map_err(|_| verification_failed())?;
+        if !secure_file(&metadata) || metadata.len() == 0 || metadata.len() > MAX_ENTRY_BYTES {
+            return Err(verification_failed());
+        }
+        files.insert(
+            name,
+            read_small_descriptor(&file, metadata.len()).map_err(|_| verification_failed())?,
+        );
+    }
+    let envelope: Value =
+        serde_json::from_slice(files.get(CATALOG_NAME).ok_or_else(verification_failed)?)
+            .map_err(|_| verification_failed())?;
+    let payload = catalog_core::PiReleaseIntentV2::from_json(
+        &serde_json::to_vec(&envelope["payload"]).map_err(|_| verification_failed())?,
+    )
+    .map_err(|_| verification_failed())?;
+    if serde_jcs::to_vec(&payload).map_err(|_| verification_failed())?
+        != candidate.canonical_payload
+    {
+        return Err(verification_failed());
+    }
+    let manifest = catalog_core::SignedReleaseBundleManifestV2::from_json(
+        files
+            .get(RELEASE_MANIFEST_V2_NAME)
+            .ok_or_else(verification_failed)?,
+    )
+    .map_err(|_| verification_failed())?;
+    let bindings = candidate
+        .final_bindings
+        .as_ref()
+        .ok_or_else(verification_failed)?;
+    if manifest.tag().as_str() != candidate.tag
+        || manifest.source_commit().as_str() != bindings.source_commit
+        || manifest.source_tree_sha256().as_str() != bindings.source_tree_sha256
+        || Some(manifest.producer_input_sha256().as_str())
+            != bindings.producer_input_sha256.as_deref()
+        || manifest.assets().len() != candidate.support_assets.len()
+    {
+        return Err(verification_failed());
+    }
+    for (asset, expected) in manifest.assets().iter().zip(&candidate.support_assets) {
+        if asset.name().as_str() != expected.name
+            || asset.size() != expected.bytes.len() as u64
+            || asset.sha256().as_str() != expected.sha256
+            || files.get(&expected.name) != Some(&expected.bytes)
+        {
+            return Err(verification_failed());
+        }
+    }
+    let checksums = files
+        .iter()
+        .filter(|(name, _)| name.as_str() != CHECKSUMS_NAME)
+        .map(|(name, bytes)| format!("{}  {name}\n", sha256(bytes)))
+        .collect::<String>()
+        .into_bytes();
+    if files.get(CHECKSUMS_NAME) != Some(&checksums) {
+        return Err(verification_failed());
+    }
+    let inventory = inventory_for_files_v2(&files)?;
+    verify_signed_bytes_v2(
+        &SignedBytesV2 {
+            files,
+            inventory,
+            manifest,
+        },
+        SignatureVerificationPolicy::Production,
+    )?;
+    settle_bound_empty_staging(parent_path)?;
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -1886,7 +2296,10 @@ fn release_semantic_digest(
 
 fn validate_transfer_manifest(manifest: &TransferManifestV1) -> Result<(), SignError> {
     if manifest.schema_version != 1
-        || manifest.kind != "verified_input"
+        || !matches!(
+            manifest.kind.as_str(),
+            "verified_input" | "verified_input_v2"
+        )
         || manifest.entries.is_empty()
         || manifest.entries.len() > MAX_ENTRIES
         || manifest.records.is_empty()
@@ -1989,6 +2402,57 @@ fn cross_bind_transfer(
     let expected = match inventory.source_kind() {
         InputSourceKind::ReleaseIntent => vec!["package_inputs", "release_intent"],
         InputSourceKind::CatalogSource => vec!["catalog_source", "package_inputs", "qualification"],
+    };
+    if roles != expected
+        || (inventory.source_kind() == InputSourceKind::CatalogSource)
+            != manifest.source_commit.is_some()
+    {
+        return Err(bundle_rejected());
+    }
+    Ok(())
+}
+
+fn cross_bind_transfer_v2(
+    manifest: &TransferManifestV1,
+    inventory: &VerifiedInputBundleV2,
+) -> Result<(), SignError> {
+    let manifested = manifest
+        .entries
+        .iter()
+        .filter(|entry| entry.relative_path.starts_with("objects/"))
+        .map(|entry| (&entry.relative_path, entry.size, &entry.sha256))
+        .collect::<BTreeSet<_>>();
+    let inventoried = inventory
+        .objects()
+        .iter()
+        .map(|entry| {
+            (
+                entry.relative_path().as_str().to_owned(),
+                entry.size(),
+                entry.sha256().as_str().to_owned(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let manifested_owned = manifested
+        .into_iter()
+        .map(|(path, size, digest)| (path.clone(), size, digest.clone()))
+        .collect::<BTreeSet<_>>();
+    if manifested_owned != inventoried
+        || !manifest
+            .entries
+            .iter()
+            .any(|entry| entry.relative_path == VERIFIED_INPUT_V2_NAME)
+    {
+        return Err(bundle_rejected());
+    }
+    let roles = manifest
+        .records
+        .iter()
+        .map(|record| record.role.as_str())
+        .collect::<Vec<_>>();
+    let expected = match inventory.source_kind() {
+        InputSourceKind::ReleaseIntent => vec!["package_inputs", "release_intent"],
+        InputSourceKind::CatalogSource => vec!["catalog_source", "package_inputs"],
     };
     if roles != expected
         || (inventory.source_kind() == InputSourceKind::CatalogSource)
@@ -3019,6 +3483,23 @@ pub(crate) fn run_isolated_cli(
             let candidate = finalize_versioned_candidate(bundle)?;
             let output = OutputPreflight::new(Path::new(&values[2]))?;
             let signing_key = read_production_signing_key(Path::new(&values[1]))?;
+            if candidate
+                .final_bindings
+                .as_ref()
+                .is_some_and(|b| b.producer_input_sha256.is_some())
+            {
+                let signed = sign_candidate_v2(
+                    &candidate,
+                    signing_key.as_dalek(),
+                    active_production_key_identity().key_id(),
+                )?;
+                drop(signing_key);
+                verify_signed_bytes_v2(&signed, SignatureVerificationPolicy::Production)?;
+                let key_id = signed.manifest.signature().key_id().as_str().to_owned();
+                let tag = signed.manifest.tag().as_str().to_owned();
+                write_signed_output_v2(output, signed)?;
+                return Ok(format!("signed key_id={key_id} tag={tag}"));
+            }
             let signed_bytes = sign_candidate(
                 &candidate,
                 signing_key.as_dalek(),
@@ -3050,6 +3531,13 @@ pub(crate) fn recover_production_isolated_output(
     bundle: &VerifiedTransferredBundle,
 ) -> Result<(), SignError> {
     let candidate = finalize_versioned_candidate(bundle)?;
+    if candidate
+        .final_bindings
+        .as_ref()
+        .is_some_and(|b| b.producer_input_sha256.is_some())
+    {
+        return recover_signed_output_v2(Path::new("/output/signed-release-bundle"), &candidate);
+    }
     recover_signed_output(
         Path::new("/output/signed-release-bundle"),
         &candidate,
@@ -3155,6 +3643,7 @@ fn fixture_candidate(
             source_commit,
             source_tree_sha256,
             qualification_sha256: sha256(&qualification),
+            producer_input_sha256: None,
         }),
     };
     require_candidate_bounds(&candidate)?;
@@ -3323,6 +3812,177 @@ const fn verification_failed() -> SignError {
     SignError::VerificationFailed
 }
 
+fn finalize_versioned_candidate(
+    bundle: &VerifiedTransferredBundle,
+) -> Result<UnsignedReleaseCandidateV1, SignError> {
+    let bytes = bundle.record_bytes("catalog_source")?;
+    let value: Value = serde_json::from_slice(&bytes).map_err(|_| candidate_rejected())?;
+    if value["schema_version"] == 2 {
+        return finalize_installer_candidate(bundle, &bytes);
+    }
+    let source = CatalogSourceV1::from_json(&bytes).map_err(|_| candidate_rejected())?;
+    let qualification =
+        CompatibilityQualificationV1::from_json(&bundle.record_bytes("qualification")?)
+            .map_err(|_| candidate_rejected())?;
+    finalize_candidate(bundle, &source, &qualification)
+}
+
+fn finalize_installer_candidate(
+    bundle: &VerifiedTransferredBundle,
+    source_bytes: &[u8],
+) -> Result<UnsignedReleaseCandidateV1, SignError> {
+    bundle.reverify_all()?;
+    let source =
+        catalog_core::CatalogSourceV2::from_json(source_bytes).map_err(|_| candidate_rejected())?;
+    let payload = source.finalize().map_err(|_| candidate_rejected())?;
+    let subject = encode_hex(
+        &catalog_core::pi_release_subject_v2_sha256(source.intent().profile())
+            .map_err(|_| candidate_rejected())?,
+    );
+    if bundle.inventory.source_kind() != InputSourceKind::CatalogSource
+        || serde_jcs::to_vec(&source).map_err(|_| candidate_rejected())? != source_bytes
+        || bundle.inventory.source_sha256().as_str()
+            != encode_hex(
+                &catalog_core::catalog_source_v2_digest(&source)
+                    .map_err(|_| candidate_rejected())?,
+            )
+        || bundle.inventory.v2()?.release_subject_sha256().as_str() != subject
+    {
+        return Err(candidate_rejected());
+    }
+    let source_commit = bundle
+        .source_commit()
+        .filter(|s| valid_commit(s))
+        .ok_or_else(candidate_rejected)?
+        .to_owned();
+    let source_tree_sha256 = bundle
+        .source_tree_sha256()
+        .filter(|s| valid_sha256(s))
+        .ok_or_else(candidate_rejected)?
+        .to_owned();
+    let profile = source.intent().profile();
+    let input_bytes = bundle.record_bytes("package_inputs")?;
+    let inputs = catalog_installer_verify::PackageInputManifestV2::from_json(&input_bytes)
+        .map_err(|_| candidate_rejected())?;
+    if inputs.canonical_bytes().map_err(|_| candidate_rejected())? != input_bytes {
+        return Err(candidate_rejected());
+    }
+    inputs
+        .validate_for_profile(profile)
+        .map_err(|_| candidate_rejected())?;
+    let mut expected = BTreeMap::new();
+    for component in profile.components() {
+        for artifact in component.artifacts() {
+            insert_expected(
+                &mut expected,
+                artifact.url().as_str(),
+                artifact.size_bytes().get(),
+                artifact.sha256().as_str(),
+            )?;
+        }
+    }
+    for descriptor in [
+        profile.installer_manifest(),
+        profile.installer_lock(),
+        profile.pi_manifest(),
+    ] {
+        insert_expected(
+            &mut expected,
+            descriptor.url().as_str(),
+            descriptor.size_bytes().get(),
+            descriptor.sha256().as_str(),
+        )?;
+    }
+    for auxiliary in inputs.auxiliary_inputs() {
+        insert_expected(
+            &mut expected,
+            auxiliary.url(),
+            auxiliary.size_bytes(),
+            auxiliary.sha256(),
+        )?;
+    }
+    for locked in profile.locked_packages() {
+        insert_expected(
+            &mut expected,
+            locked.resolved_url().as_str(),
+            inputs
+                .archive_size_for(locked.locator().as_str())
+                .ok_or_else(candidate_rejected)?,
+            locked.archive_sha256().as_str(),
+        )?;
+    }
+    let actual = bundle
+        .inventory
+        .objects()
+        .iter()
+        .map(|o| {
+            (
+                o.sha256().as_str().to_owned(),
+                (o.source_url().as_str().to_owned(), o.size()),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    if actual != expected {
+        return Err(candidate_rejected());
+    }
+    // Inventory consistency is not verification authority: independently replay the original
+    // pure archive/graph policy over retained exact bytes before minting a signing candidate.
+    catalog_installer_verify::verify_installer_release(source.intent(), &inputs, |url, maximum| {
+        let object = bundle
+            .inventory
+            .objects()
+            .iter()
+            .find(|o| o.source_url().as_str() == url)
+            .ok_or(catalog_installer_verify::AcquireError::Graph)?;
+        bundle
+            .read_bounded_file(&format!("objects/{}", object.sha256()), maximum as u64)
+            .map_err(|_| catalog_installer_verify::AcquireError::Archive)
+    })
+    .map_err(|_| candidate_rejected())?;
+    let mut support_assets = Vec::new();
+    for descriptor in [
+        profile.installer_manifest(),
+        profile.installer_lock(),
+        profile.pi_manifest(),
+    ] {
+        let name = catalog_core::pi_support_asset_name(
+            descriptor.url().as_str(),
+            descriptor.sha256().as_str(),
+            source.intent().tag().as_str(),
+        )
+        .map_err(|_| candidate_rejected())?;
+        let bytes = bundle.read_small_file(&format!("objects/{}", descriptor.sha256().as_str()))?;
+        if bytes.len() as u64 != descriptor.size_bytes().get()
+            || sha256(&bytes) != descriptor.sha256().as_str()
+        {
+            return Err(candidate_rejected());
+        }
+        support_assets.push(CandidateAsset {
+            name,
+            sha256: sha256(&bytes),
+            bytes,
+        });
+    }
+    support_assets.sort_by(|a, b| a.name.cmp(&b.name));
+    if support_assets.windows(2).any(|p| p[0].name == p[1].name) {
+        return Err(candidate_rejected());
+    }
+    let candidate = UnsignedReleaseCandidateV1 {
+        canonical_payload: serde_jcs::to_vec(&payload).map_err(|_| candidate_rejected())?,
+        runtime_semantic_sha256: subject,
+        tag: source.intent().tag().as_str().into(),
+        support_assets,
+        final_bindings: Some(FinalBindings {
+            source_commit,
+            source_tree_sha256,
+            qualification_sha256: String::new(),
+            producer_input_sha256: Some(sha256(&input_bytes)),
+        }),
+    };
+    require_candidate_bounds(&candidate)?;
+    Ok(candidate)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -3344,6 +4004,76 @@ mod tests {
 
     const SRI: &str = "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
     const MAX_AUTHENTIC_CORPUS_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
+
+    #[test]
+    fn producer_candidate_uses_v2_signatures_and_rejects_changed_evidence() {
+        let mut profile: Value = serde_json::from_slice(include_bytes!(
+            "../../catalog-core/tests/fixtures/catalog/pi-installer-v1/valid-wrapper-root.json"
+        ))
+        .unwrap();
+        profile["schema_version"] = json!(2);
+        profile
+            .as_object_mut()
+            .unwrap()
+            .remove("required_contracts");
+        profile
+            .as_object_mut()
+            .unwrap()
+            .remove("consumer_requirement");
+        let mut assets = Vec::new();
+        for (field, role, contents) in [
+            (
+                "installer_manifest",
+                "pi-installer-package",
+                b"installer".as_slice(),
+            ),
+            ("installer_lock", "pi-installer-lock", b"lock".as_slice()),
+            ("pi_manifest", "pi-package", b"manifest".as_slice()),
+        ] {
+            let digest = sha256(contents);
+            let name = format!("{role}-{digest}.json");
+            profile[field] = json!({"url":format!("https://github.com/Devalch/Fluxsemble-runtime-catalog/releases/download/catalog-v1-sequence-8/{name}"),"size_bytes":contents.len().to_string(),"sha256":digest});
+            assets.push(CandidateAsset {
+                name,
+                bytes: contents.to_vec(),
+                sha256: sha256(contents),
+            });
+        }
+        assets.sort_by(|a, b| a.name.cmp(&b.name));
+        let intent = json!({"schema_version":2,"sequence":"8","tag":"catalog-v1-sequence-8","generated_at":"2026-11-20T16:00:00Z","expires_at":"2026-12-20T16:00:00Z","title":"Pi","notes":"Verified inputs","profile":profile});
+        let candidate = UnsignedReleaseCandidateV1 {
+            canonical_payload: serde_jcs::to_vec(&intent).unwrap(),
+            runtime_semantic_sha256: "1".repeat(64),
+            tag: "catalog-v1-sequence-8".into(),
+            support_assets: assets,
+            final_bindings: Some(FinalBindings {
+                source_commit: "2".repeat(40),
+                source_tree_sha256: "3".repeat(64),
+                qualification_sha256: String::new(),
+                producer_input_sha256: Some("4".repeat(64)),
+            }),
+        };
+        let key = fixture_signing_key_for_test();
+        assert!(sign_candidate(&candidate, key.as_dalek(), "catalog-test-key-v1").is_err());
+        let mut signed =
+            sign_candidate_v2(&candidate, key.as_dalek(), "catalog-test-key-v1").unwrap();
+        verify_signed_bytes_v2(&signed, SignatureVerificationPolicy::Fixture).unwrap();
+        assert!(verify_signed_bytes_v2(&signed, SignatureVerificationPolicy::Production).is_err());
+        let mut manifest: Value =
+            serde_json::from_slice(signed.files.get(RELEASE_MANIFEST_V2_NAME).unwrap()).unwrap();
+        manifest["producer_input_sha256"] = json!("5".repeat(64));
+        let changed = serde_jcs::to_vec(&manifest).unwrap();
+        assert!(
+            verify_fixture_signatures_v2(
+                signed.files.get(CATALOG_NAME).unwrap(),
+                &changed,
+                &signed.manifest
+            )
+            .is_err()
+        );
+        signed.files.get_mut(CATALOG_NAME).unwrap().push(b' ');
+        assert!(verify_signed_bytes_v2(&signed, SignatureVerificationPolicy::Fixture).is_err());
+    }
 
     // Dormant V1 parser/security cases use the existing synthetic builder. These
     // records carry no authenticated package, qualification or signing evidence.
@@ -4450,12 +5180,13 @@ mod tests {
         verify_qualification(&source_fixture.source, &source_fixture.qualification).unwrap();
         let source_digest = encode_hex(&catalog_source_digest(&source_fixture.source).unwrap());
         assert_ne!(
-            source_bundle.inventory().source_sha256().as_str(),
+            source_bundle.inventory().unwrap().source_sha256().as_str(),
             source_digest
         );
         assert_eq!(
             source_bundle
                 .inventory()
+                .unwrap()
                 .compatibility_input_sha256()
                 .as_str(),
             encode_hex(
@@ -4496,7 +5227,7 @@ mod tests {
             let bundle = verify_transferred_bundle(&fixture.final_bundle).unwrap();
             assert_transferred_finalization_arguments_match(&bundle, &fixture);
             assert_eq!(
-                bundle.inventory().source_sha256().as_str(),
+                bundle.inventory().unwrap().source_sha256().as_str(),
                 encode_hex(&catalog_source_digest(&fixture.source).unwrap()),
                 "{name} mutation did not receive its matching transferred source digest"
             );
@@ -4535,7 +5266,11 @@ mod tests {
             &qualification_fixture,
         );
         assert_eq!(
-            qualification_bundle.inventory().source_sha256().as_str(),
+            qualification_bundle
+                .inventory()
+                .unwrap()
+                .source_sha256()
+                .as_str(),
             encode_hex(&catalog_source_digest(&qualification_fixture.source).unwrap())
         );
         assert_eq!(
@@ -5081,7 +5816,9 @@ mod tests {
     fn object_substitution_is_rejected_before_key_open() {
         let fixture = CandidateFixture::new();
         let bundle = verify_transferred_bundle(&fixture.final_bundle).unwrap();
-        let relative = bundle.inventory().objects()[0].relative_path().as_str();
+        let relative = bundle.inventory().unwrap().objects()[0]
+            .relative_path()
+            .as_str();
         let path = fixture.final_bundle.join(relative);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         fs::write(&path, b"substituted-object").unwrap();
@@ -6179,183 +6916,4 @@ mod tests {
             let _ = fs::remove_dir_all(&self.path);
         }
     }
-}
-
-fn finalize_versioned_candidate(
-    bundle: &VerifiedTransferredBundle,
-) -> Result<UnsignedReleaseCandidateV1, SignError> {
-    let bytes = bundle.record_bytes("catalog_source")?;
-    let value: Value = serde_json::from_slice(&bytes).map_err(|_| candidate_rejected())?;
-    if value["schema_version"] == 2 {
-        return finalize_installer_candidate(bundle, &bytes);
-    }
-    let source = CatalogSourceV1::from_json(&bytes).map_err(|_| candidate_rejected())?;
-    let qualification =
-        CompatibilityQualificationV1::from_json(&bundle.record_bytes("qualification")?)
-            .map_err(|_| candidate_rejected())?;
-    finalize_candidate(bundle, &source, &qualification)
-}
-
-fn finalize_installer_candidate(
-    bundle: &VerifiedTransferredBundle,
-    source_bytes: &[u8],
-) -> Result<UnsignedReleaseCandidateV1, SignError> {
-    bundle.reverify_all()?;
-    let source =
-        catalog_core::CatalogSourceV2::from_json(source_bytes).map_err(|_| candidate_rejected())?;
-    let qualification = bundle.record_bytes("qualification")?;
-    let payload = source
-        .finalize(&qualification)
-        .map_err(|_| candidate_rejected())?;
-    let subject = encode_hex(
-        &catalog_core::pi_release_subject_sha256(source.intent().profile())
-            .map_err(|_| candidate_rejected())?,
-    );
-    if bundle.inventory.source_kind() != InputSourceKind::CatalogSource
-        || serde_jcs::to_vec(&source).map_err(|_| candidate_rejected())? != source_bytes
-        || bundle.inventory.source_sha256().as_str()
-            != encode_hex(
-                &catalog_core::catalog_source_v2_digest(&source)
-                    .map_err(|_| candidate_rejected())?,
-            )
-        || bundle.inventory.compatibility_input_sha256().as_str() != subject
-    {
-        return Err(candidate_rejected());
-    }
-    let source_commit = bundle
-        .source_commit()
-        .filter(|s| valid_commit(s))
-        .ok_or_else(candidate_rejected)?
-        .to_owned();
-    let source_tree_sha256 = bundle
-        .source_tree_sha256()
-        .filter(|s| valid_sha256(s))
-        .ok_or_else(candidate_rejected)?
-        .to_owned();
-    let profile = source.intent().profile();
-    let input_bytes = bundle.record_bytes("package_inputs")?;
-    let inputs = catalog_installer_verify::PackageInputManifestV2::from_json(&input_bytes)
-        .map_err(|_| candidate_rejected())?;
-    if inputs.canonical_bytes().map_err(|_| candidate_rejected())? != input_bytes {
-        return Err(candidate_rejected());
-    }
-    inputs
-        .validate_for_profile(profile)
-        .map_err(|_| candidate_rejected())?;
-    let mut expected = BTreeMap::new();
-    for component in profile.components() {
-        for artifact in component.artifacts() {
-            insert_expected(
-                &mut expected,
-                artifact.url().as_str(),
-                artifact.size_bytes().get(),
-                artifact.sha256().as_str(),
-            )?;
-        }
-    }
-    for descriptor in [
-        profile.installer_manifest(),
-        profile.installer_lock(),
-        profile.pi_manifest(),
-    ] {
-        insert_expected(
-            &mut expected,
-            descriptor.url().as_str(),
-            descriptor.size_bytes().get(),
-            descriptor.sha256().as_str(),
-        )?;
-    }
-    for auxiliary in inputs.auxiliary_inputs() {
-        insert_expected(
-            &mut expected,
-            auxiliary.url(),
-            auxiliary.size_bytes(),
-            auxiliary.sha256(),
-        )?;
-    }
-    for locked in profile.locked_packages() {
-        insert_expected(
-            &mut expected,
-            locked.resolved_url().as_str(),
-            inputs
-                .archive_size_for(locked.locator().as_str())
-                .ok_or_else(candidate_rejected)?,
-            locked.archive_sha256().as_str(),
-        )?;
-    }
-    let actual = bundle
-        .inventory
-        .objects()
-        .iter()
-        .map(|o| {
-            (
-                o.sha256().as_str().to_owned(),
-                (o.source_url().as_str().to_owned(), o.size()),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    if actual != expected {
-        return Err(candidate_rejected());
-    }
-    // Inventory consistency is not verification authority: independently replay the original
-    // pure archive/graph policy over retained exact bytes before minting a signing candidate.
-    catalog_installer_verify::verify_installer_release(source.intent(), &inputs, |url, maximum| {
-        let object = bundle
-            .inventory
-            .objects()
-            .iter()
-            .find(|o| o.source_url().as_str() == url)
-            .ok_or(catalog_installer_verify::AcquireError::Graph)?;
-        bundle
-            .read_bounded_file(&format!("objects/{}", object.sha256()), maximum as u64)
-            .map_err(|_| catalog_installer_verify::AcquireError::Archive)
-    })
-    .map_err(|_| candidate_rejected())?;
-    let mut support_assets = Vec::new();
-    for descriptor in [
-        profile.installer_manifest(),
-        profile.installer_lock(),
-        profile.pi_manifest(),
-    ] {
-        let name = catalog_core::pi_support_asset_name(
-            descriptor.url().as_str(),
-            descriptor.sha256().as_str(),
-            source.intent().tag().as_str(),
-        )
-        .map_err(|_| candidate_rejected())?;
-        let bytes = bundle.read_small_file(&format!("objects/{}", descriptor.sha256().as_str()))?;
-        if bytes.len() as u64 != descriptor.size_bytes().get()
-            || sha256(&bytes) != descriptor.sha256().as_str()
-        {
-            return Err(candidate_rejected());
-        }
-        support_assets.push(CandidateAsset {
-            name,
-            sha256: sha256(&bytes),
-            bytes,
-        });
-    }
-    let qualification_sha256 = sha256(&qualification);
-    support_assets.push(CandidateAsset {
-        name: format!("qualification-{qualification_sha256}.json"),
-        sha256: qualification_sha256.clone(),
-        bytes: qualification,
-    });
-    support_assets.sort_by(|a, b| a.name.cmp(&b.name));
-    if support_assets.windows(2).any(|p| p[0].name == p[1].name) {
-        return Err(candidate_rejected());
-    }
-    let candidate = UnsignedReleaseCandidateV1 {
-        canonical_payload: canonical_catalog_payload(&payload).map_err(|_| candidate_rejected())?,
-        runtime_semantic_sha256: subject,
-        tag: source.intent().tag().as_str().into(),
-        support_assets,
-        final_bindings: Some(FinalBindings {
-            source_commit,
-            source_tree_sha256,
-            qualification_sha256,
-        }),
-    };
-    require_candidate_bounds(&candidate)?;
-    Ok(candidate)
 }
